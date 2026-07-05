@@ -1,0 +1,9 @@
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files, to deal in the Software 
+with only one restriction specified later¹, including without limitation the rights
+to copy, modify, merge, publish, distribute, sublicense, and/or sell copies
+of the Software, but NOT including the right to run, execute or use the
+Software or any executable binaries built from the source code.
+
+1. Use of source code of Read and Write feature of .db and .ybb files has been
+explicitly permitted by Yaneurao, ONLY to the author of this Software.
