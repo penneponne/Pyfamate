@@ -16,8 +16,10 @@ import signal
 import hashlib
 import random
 import dataclasses
+import enum
 import collections
 import functools
+import itertools
 import socket
 import glob
 import unicodedata
@@ -76,6 +78,41 @@ _LOG_PATH   = os.path.join(_BASE_DIR, "diagnosis.txt")
 _SPSA_STATS_PATH_ENV = os.environ.get("SPSA_STATS_PATH", "")
 _STATS_PATH = _SPSA_STATS_PATH_ENV if _SPSA_STATS_PATH_ENV else os.path.join(_BASE_DIR, "stats.txt")
 _SPSA_MODE  = bool(_SPSA_STATS_PATH_ENV)
+
+class RunMode(enum.Enum):
+    USI          = "usi"
+    CSA          = "game"
+    SPSA_PARENT  = "spsa"
+    SPSA_WORKER  = "spsa_worker"
+    DLP_CAL      = "dlp_cal"
+    GRID         = "grid"
+    SPRT         = "sprt"
+    SETUP        = "setup"
+    TEACHER      = "teacher"
+    MAKEBOOK     = "makebook"
+    LEARN        = "learn"
+    TOURNAMENT   = "tournament"
+    OTHER        = "other"
+
+_ARGV1_TO_RUNMODE = {
+    "game": RunMode.CSA, "spsa": RunMode.SPSA_PARENT,
+    "grid": RunMode.GRID, "sprt": RunMode.SPRT,
+    "setup": RunMode.SETUP, "teacher": RunMode.TEACHER,
+    "makebook": RunMode.MAKEBOOK, "learn": RunMode.LEARN,
+    "tournament": RunMode.TOURNAMENT,
+}
+
+def _detect_run_mode() -> RunMode:
+    if os.environ.get("PYFAMATE_DLP_CAL"):
+        return RunMode.DLP_CAL
+    if _SPSA_MODE or "--spsa-worker" in sys.argv:
+        return RunMode.SPSA_WORKER
+    _a1 = sys.argv[1] if len(sys.argv) > 1 else ""
+    return _ARGV1_TO_RUNMODE.get(_a1, RunMode.USI if not _a1 else RunMode.OTHER)
+
+_RUN_MODE: RunMode = _detect_run_mode()
+_SPSA_MODE = (_RUN_MODE is RunMode.SPSA_WORKER)
+
 _SPSA_CONFIG_PATH     = os.path.join(_BASE_DIR, "spsa_config.txt")
 _SETUP_CONFIG_PATH    = os.path.join(_BASE_DIR, "setup_config.txt")
 
@@ -205,16 +242,46 @@ def _term_probe_widths(chars, timeout=0.30):
     try:
         if os.name == "nt":
             import ctypes, msvcrt
+
+            class _COORD(ctypes.Structure):
+                _fields_ = [("X", ctypes.c_short), ("Y", ctypes.c_short)]
+
+            class _CSBI(ctypes.Structure):
+                _fields_ = [("dwSize", _COORD), ("dwCursorPosition", _COORD),
+                            ("wAttributes", ctypes.c_ushort),
+                            ("srWindow", ctypes.c_short * 4),
+                            ("dwMaximumWindowSize", _COORD)]
+
             k32 = ctypes.windll.kernel32
             hout = msvcrt.get_osfhandle(fout.fileno())
-            hin = msvcrt.get_osfhandle(fin.fileno())
-            mo = ctypes.c_uint(0); mi = ctypes.c_uint(0)
-            if not (k32.GetConsoleMode(hout, ctypes.byref(mo))
-                    and k32.GetConsoleMode(hin, ctypes.byref(mi))):
+            csbi = _CSBI()
+            if not k32.GetConsoleScreenBufferInfo(hout, ctypes.byref(csbi)):
                 return None
-            restore = (k32, hout, mo.value, hin, mi.value)
-            k32.SetConsoleMode(hout, mo.value | 0x0004)
-            k32.SetConsoleMode(hin, (mi.value | 0x0200) & ~0x0006)
+
+            def _wc(s):
+                _n = ctypes.c_uint(0)
+                return bool(k32.WriteConsoleW(hout, s, len(s),
+                                              ctypes.byref(_n), None))
+
+            res = {}
+            for ch in chars:
+                if not _wc("\r"):
+                    return None
+                if not k32.GetConsoleScreenBufferInfo(hout, ctypes.byref(csbi)):
+                    return None
+                _x0 = csbi.dwCursorPosition.X
+                if not _wc(ch):
+                    return None
+                if not k32.GetConsoleScreenBufferInfo(hout, ctypes.byref(csbi)):
+                    return None
+                col = csbi.dwCursorPosition.X - _x0
+                _wc("\r        \r")
+                if col < 1 or col > 4:
+                    if 0xE000 <= ord(ch) <= 0xF8FF:
+                        continue
+                    return None
+                res[ch] = col
+            return res
         else:
             import termios, tty
             restore = termios.tcgetattr(fin.fileno())
@@ -227,18 +294,11 @@ def _term_probe_widths(chars, timeout=0.30):
             t0 = time.time()
             col = None
             while time.time() - t0 < timeout:
-                if os.name == "nt":
-                    import msvcrt as _m
-                    if not _m.kbhit():
-                        time.sleep(0.005)
-                        continue
-                    buf += fin.read(1) or b""
-                else:
-                    import select
-                    r, _, _ = select.select([fin.fileno()], [], [], timeout)
-                    if not r:
-                        break
-                    buf += os.read(fin.fileno(), 64)
+                import select
+                r, _, _ = select.select([fin.fileno()], [], [], timeout)
+                if not r:
+                    break
+                buf += os.read(fin.fileno(), 64)
                 m = re.search(rb"\x1b\[(\d+);(\d+)R", buf)
                 if m:
                     col = int(m.group(2)) - 1
@@ -255,13 +315,8 @@ def _term_probe_widths(chars, timeout=0.30):
     finally:
         try:
             if restore is not None:
-                if os.name == "nt":
-                    k32 = restore[0]
-                    k32.SetConsoleMode(restore[1], restore[2])
-                    k32.SetConsoleMode(restore[3], restore[4])
-                else:
-                    import termios
-                    termios.tcsetattr(fin.fileno(), termios.TCSADRAIN, restore)
+                import termios
+                termios.tcsetattr(fin.fileno(), termios.TCSADRAIN, restore)
             if fin is not None:
                 fin.close()
                 if fout is not fin and fout is not None:
@@ -274,8 +329,26 @@ _SR_MEASURED_W = {}
 _SR_FLIP_DECIDED = None
 _SR_PROBE_NOTE = ""
 
+_term_size_cache = (0.0, 120, 40)
+
+
+def _term_size():
+    global _term_size_cache
+    _now = time.monotonic()
+    if _now - _term_size_cache[0] < 0.5:
+        return _term_size_cache[1], _term_size_cache[2]
+    try:
+        import shutil
+        _ts = shutil.get_terminal_size((120, 40))
+        _c, _r = max(20, _ts.columns), max(10, _ts.lines)
+    except Exception:
+        _c, _r = 120, 40
+    _term_size_cache = (_now, _c, _r)
+    return _c, _r
+
 _SR_PROBE_CHARS = ["歩", chr(0xE000), chr(0xE010), chr(0xE020),
-                   "▲", "▽", "■", "□", "─"]
+                   "▲", "▽", "■", "□", "─",
+                   "₁", "₂", "₃", "→", "═", "…", "○", "※"]
 
 
 def _sr_configure_render(force=False):
@@ -284,6 +357,8 @@ def _sr_configure_render(force=False):
         return
     if force:
         _SR_MEASURED_W.clear()
+        _sr_cw_cache.clear()
+        _sr_vis_cache.clear()
         _SR_PROBE_NOTE = ""
     ev = os.environ.get("LIVE_FLIP_FONT", "")
     if ev in ("0", "false", "no", "off"):
@@ -335,25 +410,53 @@ _SR_JA_PIECE = {"P": "歩", "L": "香", "N": "桂", "S": "銀", "G": "金", "B":
                 "+P": "と", "+L": "杏", "+N": "圭", "+S": "全", "+B": "馬", "+R": "龍"}
 
 
+_sr_cw_cache: dict[str, int] = {}
+
+
 def _sr_cw(ch: str) -> int:
+    r = _sr_cw_cache.get(ch)
+    if r is not None:
+        return r
     w = _SR_MEASURED_W.get(ch)
     if w is not None:
+        _sr_cw_cache[ch] = w
         return w
     cp = ord(ch)
     if 0xE000 <= cp <= 0xE02F:
-        return _SR_MEASURED_W.get("歩", 2)
+        w = _SR_MEASURED_W.get("歩", 2)
+        _sr_cw_cache[ch] = w
+        return w
     if ch in _SR_WIDE_MARK:
-        return _SR_MEASURED_W.get("▲", 2)
+        w = _SR_MEASURED_W.get("▲", 2)
+        _sr_cw_cache[ch] = w
+        return w
     ea = unicodedata.east_asian_width(ch)
     if ea in ("W", "F"):
+        _sr_cw_cache[ch] = 2
         return 2
     if ea == "A":
-        return _SR_MEASURED_W.get("■", 1)
+        w = _SR_MEASURED_W.get("■", 1)
+        _sr_cw_cache[ch] = w
+        return w
+    _sr_cw_cache[ch] = 1
     return 1
 
 
+_sr_vis_cache: dict[str, int] = {}
+
+
 def _sr_vis(s: str) -> int:
-    return sum(_sr_cw(c) for c in s)
+    r = _sr_vis_cache.get(s)
+    if r is not None:
+        return r
+    r = sum(_sr_cw(c) for c in s)
+    if len(_sr_vis_cache) >= 256:
+        try:
+            _sr_vis_cache.pop(next(iter(_sr_vis_cache)))
+        except StopIteration:
+            pass
+    _sr_vis_cache[s] = r
+    return r
 
 
 def _sr_pad(s: str, width: int) -> str:
@@ -626,10 +729,28 @@ def _sr_csm_line(rec):
     return ""
 
 
+_sr_pv_ja_cache = {}
+_sr_pv_ja_cache_order = []
+_sr_pv_ja_cache_lock = threading.Lock()
+_sr_pv_ja_CACHE_MAX = 32
+
+
 def _sr_pv_ja(b, pv, n=999):
     if not pv:
         return []
     _seq = pv if isinstance(pv, list) else str(pv).split()
+    _bserial = getattr(b, "_pv_ja_serial", None) if b is not None else None
+    if _bserial is None and b is not None:
+        try:
+            _bserial = id(b)
+        except Exception:
+            pass
+    _cache_key = (_bserial, tuple(_seq[:n]), n) if _bserial is not None else None
+    if _cache_key is not None:
+        with _sr_pv_ja_cache_lock:
+            _hit = _sr_pv_ja_cache.get(_cache_key)
+            if _hit is not None:
+                return _hit
     try:
         _sb = b.clone() if b is not None else None
     except Exception:
@@ -654,6 +775,13 @@ def _sr_pv_ja(b, pv, n=999):
                 _sb.apply_usi(_mv)
             except Exception:
                 _sb = None
+    if _cache_key is not None:
+        with _sr_pv_ja_cache_lock:
+            _sr_pv_ja_cache[_cache_key] = _acc
+            _sr_pv_ja_cache_order.append(_cache_key)
+            while len(_sr_pv_ja_cache_order) > _sr_pv_ja_CACHE_MAX:
+                _old = _sr_pv_ja_cache_order.pop(0)
+                _sr_pv_ja_cache.pop(_old, None)
     return _acc
 
 
@@ -661,7 +789,7 @@ def _sv_leaf_winrate(sb):
     if not globals().get("_LIVE_PV_LEAF_MODEL_WR", False):
         return None
     try:
-        r = _sv_infer.infer_sfen(sb.sfen(), last_to=getattr(sb, "_last_to", None))
+        r = _sv_infer_get().infer_board(sb)
         if r and "gp" in r:
             _gp_xchk_report(sb, r["gp"])
         return r["value"] * 100.0 if r else None
@@ -672,7 +800,7 @@ def _sv_leaf_winrate(sb):
 def _model_wr_for_position(position_cmd):
     try:
         b = _board_for_position(position_cmd)
-        r = _sv_infer.infer_sfen(str(b.sfen()), last_to=getattr(b, "_last_to", None))
+        r = _sv_infer_get().infer_board(b)
         if not r:
             return None
         v = r["value"]
@@ -685,6 +813,8 @@ _GP_XCHK_LAST = [0.0]
 
 
 def _gp_xchk_report(board, model_gp, thresh=0.20, min_interval_s=30.0):
+    if not _GP_XCHK_ENABLE:
+        return
     now = time.time()
     if now - _GP_XCHK_LAST[0] < min_interval_s:
         return
@@ -705,12 +835,12 @@ def _gp_xchk_report(board, model_gp, thresh=0.20, min_interval_s=30.0):
 _LIVE_PV_LEAF_MIN_S = 0.1
 
 
-def _sr_render_pv_leaf(pos, pv):
+def _sr_render_pv_leaf(pos, pv, board=None):
     if not pos or not pv:
         return ""
     _seq = pv if isinstance(pv, list) else str(pv).split()
     try:
-        _sb = _board_for_position(pos).clone()
+        _sb = board.clone() if board is not None else _board_for_position(pos).clone()
     except Exception:
         return ""
     _n = 0
@@ -732,7 +862,7 @@ def _sr_render_pv_leaf(pos, pv):
         _n += 1
     if _n == 0:
         return ""
-    _hdr = "%d手先 %s" % (_n, _last)
+    _hdr = "%d手先 %sまで" % (_n, _last)
     _win_rate = _sv_leaf_winrate(_sb)
     try:
         return _sr_render_board(_sb, header=_hdr, winrate=_win_rate)
@@ -880,18 +1010,6 @@ def _sr_read_annot(rec, b, final, zenrei):
     return ""
 
 
-def _sr_append_dl1_pv(out, rec, b, nnue_pv_head, is_mate):
-    if is_mate:
-        return
-    _dl1_pv_raw = rec.get("dl_1_pv") if isinstance(rec, dict) else None
-    if not _dl1_pv_raw:
-        return
-    _dl1_pvja = _sr_pv_ja(b, _dl1_pv_raw)
-    _dl1_pv_head = _dl1_pvja[0] if _dl1_pvja else None
-    if _dl1_pvja and _dl1_pv_head != nnue_pv_head:
-        _sr_pv_fold(out, _dl1_pvja, "DL読")
-
-
 def _sr_pred_ease_lines(rec, b, policy, ja, multi_engine=True):
     out = []
     if not policy:
@@ -968,6 +1086,13 @@ def _sr_multipv_lines(policy, ja):
     if not policy:
         return out
     _circ = "①②③④⑤⑥⑦⑧⑨⑩"
+    _best_sc = None
+    try:
+        _b0 = policy[0][1]
+        if isinstance(_b0, (int, float)) and abs(_b0) < _MATE_CP:
+            _best_sc = _b0
+    except (IndexError, TypeError):
+        _best_sc = None
     _rows = []
     for _i, (mv, sc) in enumerate(policy):
         if _i == 0:
@@ -976,7 +1101,14 @@ def _sr_multipv_lines(policy, ja):
             continue
         _n = _circ[_i] if _i < len(_circ) else ("%2d." % (_i + 1))
         if isinstance(sc, (int, float)):
-            _scs = "詰" if sc >= _MATE_CP else ("被詰" if sc <= -_MATE_CP else "%+d" % sc)
+            if sc >= _MATE_CP:
+                _scs = "詰"
+            elif sc <= -_MATE_CP:
+                _scs = "被詰"
+            elif _best_sc is not None:
+                _scs = "%+d" % (sc - _best_sc)
+            else:
+                _scs = "%+d" % sc
         else:
             _scs = ""
         _rows.append(" " + _sr_pad(_n, 3) + " " + _sr_pad(ja(mv), 12) + _scs)
@@ -1516,10 +1648,13 @@ class _LiveConsole:
                  "_clk_active_sente", "_clk_t0",
                  "_last_board", "_last_kw", "_last_redraw_t",
                  "_leaf_key", "_leaf_text", "_leaf_t",
-                 "_last_winrate", "_think_hold")
+                 "_last_winrate", "_think_hold",
+                 "_prev_lns", "_render_dirty", "_render_th",
+                 "_live_sources")
 
     def __init__(self):
         self._lines = 0
+        self._prev_lns = None
         self._enabled = None
         self._think = None
         self._zenrei = None
@@ -1532,6 +1667,8 @@ class _LiveConsole:
         self._last_rich_panel = None
         self._tall = False
         self._render_lock = threading.Lock()
+        self._render_dirty = threading.Event()
+        self._render_th = None
         self._clk_evt = None
         self._clk_th = None
         self._clk_board = None
@@ -1548,6 +1685,7 @@ class _LiveConsole:
         self._leaf_t = 0.0
         self._last_winrate = None
         self._think_hold = None
+        self._live_sources = []
 
     def _ready(self) -> bool:
         if self._enabled is None:
@@ -1560,16 +1698,34 @@ class _LiveConsole:
                 _flip_ensure_installed()
         return self._enabled
 
+    def _live_register(self, eng) -> None:
+        if eng not in self._live_sources:
+            self._live_sources.append(eng)
+        self._ensure_render_thread()
+
     def set_think(self, rec, pos, policy=None, pv=None, clock=None, mode=None,
                   live=False) -> None:
+        if not self._ready():
+            return
         self._dyn_cp = None
         self._dyn_cp_pos = None
         if (not policy and self._think is not None
                 and self._think[1] == pos and self._think[2]):
             policy = self._think[2]
+        if (isinstance(rec, dict) and rec.get("source") == "emergency"
+                and self._think is not None and isinstance(self._think[0], dict)):
+            _prev_rec = self._think[0]
+            for _ek in list(_prev_rec.keys()):
+                if _ek not in ("council_winner", "nnue_bestmove", "source",
+                               "ply", "elapsed_ms"):
+                    if rec.get(_ek) is None and _prev_rec.get(_ek) is not None:
+                        rec[_ek] = _prev_rec[_ek]
+            if not policy and self._think[2]:
+                policy = self._think[2]
         if (self._think is not None and self._think[1] == pos
                 and isinstance(self._think[0], dict) and isinstance(rec, dict)):
-            for _k in ("dl_top_move", "council_wr_dl", "dl_used", "sharpness"):
+            for _k in ("dl_top_move", "council_wr_dl", "dl_used", "sharpness",
+                       "dl_display_policy", "confidence", "momentum"):
                 if rec.get(_k) is None and self._think[0].get(_k) is not None:
                     rec[_k] = self._think[0][_k]
         if (self._think is not None and self._think[1] != pos
@@ -1628,20 +1784,53 @@ class _LiveConsole:
         self._throttled_redraw()
 
     def _throttled_redraw(self) -> None:
-        _now = time.monotonic()
-        if _now - self._last_redraw_t < (1.0 if self._tall else 0.2):
-            return
-        self._last_redraw_t = _now
-        self._redraw()
+        self._ensure_render_thread()
+        self._render_dirty.set()
 
     def _redraw(self) -> None:
         if self._last_board is None:
             return
-        self.show(self._last_board, **self._last_kw)
+        self._ensure_render_thread()
+        self._render_dirty.set()
 
-    def show(self, board, **kw) -> None:
-        if not self._ready():
+
+    def _ensure_render_thread(self) -> None:
+        if self._render_th is not None:
             return
+        with self._render_lock:
+            if self._render_th is not None:
+                return
+            t = threading.Thread(target=self._render_loop, daemon=True,
+                                 name="live-render")
+            self._render_th = t
+            t.start()
+
+    def _render_loop(self) -> None:
+        while True:
+            self._render_dirty.wait(timeout=0.2)
+            self._render_dirty.clear()
+            for _eng in list(self._live_sources):
+                _slot = _eng._live_scored_latest
+                if _slot is not None:
+                    _eng._live_scored_latest = None
+                    _cb = _eng._live_info_cb
+                    if _cb is not None:
+                        try:
+                            _cb(_slot)
+                        except Exception:
+                            pass
+            if self._last_board is None:
+                continue
+            if time.monotonic() - self._last_redraw_t < 0.05:
+                continue
+            try:
+                self.show(self._last_board, **self._last_kw)
+            except Exception:
+                pass
+
+
+    def _compose(self, board, **kw):
+        _compose_t0 = time.perf_counter()
         self._last_board = board
         self._last_kw = kw
         if isinstance(self._dyn_cp, (int, float)) and self._dyn_cp_pos:
@@ -1698,39 +1887,70 @@ class _LiveConsole:
                                    + 2 + max((_sr_vis(_l) for _l in
                                               self._leaf_text.split("\n")),
                                              default=0))
-                        try:
-                            import shutil as _lsh
-                            _lcols = max(20, _lsh.get_terminal_size((120, 40)).columns)
-                        except Exception:
-                            _lcols = 120
+                        _lcols, _ = _term_size()
                         if _need_w < _lcols:
                             text = _sr_hjoin(text, self._leaf_text, align="bottom")
                 except Exception:
                     pass
             text += "\n" + _panel
+        _compose_ms = (time.perf_counter() - _compose_t0) * 1000
+        if _compose_ms > 5.0:
+            _dlog(f"[P-2] _compose {_compose_ms:.1f}ms")
+        return text
+
+    def safe_print(self, msg):
         with self._render_lock:
             try:
-                try:
-                    import shutil
-                    _ts = shutil.get_terminal_size((120, 40))
-                    _cols = max(20, _ts.columns)
-                    _rows = max(10, _ts.lines)
-                except Exception:
-                    _cols, _rows = 120, 40
-                _lns = [_sr_clip(_ln, _cols) for _ln in text.split("\n")]
-                text = "\n".join(_lns)
-                buf = (f"\x1b[{self._lines}A\x1b[J" if self._lines else "") + text + "\n"
-                sys.stdout.write(buf)
+                if self._lines > 0:
+                    sys.stdout.write(f"\x1b[{self._lines}A\x1b[J")
+                sys.stdout.write(str(msg) + "\n")
                 sys.stdout.flush()
+                self._lines = 0
+                self._prev_lns = None
+            except OSError:
+                pass
+
+    def _blit(self, text) -> None:
+        with self._render_lock:
+            try:
+                _cols, _rows = _term_size()
+                _lns = [_sr_clip(_ln, _cols) for _ln in text.split("\n")]
+                if _cfg_bool("Live_Frame_Clamp", True) and len(_lns) > _rows - 1:
+                    _lns = _lns[:_rows - 1]
+                _prev = self._prev_lns
+                if (_prev is not None and len(_prev) == len(_lns)
+                        and self._lines == len(_prev)):
+                    buf_parts = []
+                    buf_parts.append(f"\x1b[{self._lines}A")
+                    for _di, (_ol, _nl) in enumerate(zip(_prev, _lns)):
+                        if _ol == _nl:
+                            buf_parts.append("\n")
+                        else:
+                            buf_parts.append(f"\x1b[K{_nl}\n")
+                    sys.stdout.write("".join(buf_parts))
+                    sys.stdout.flush()
+                else:
+                    text = "\n".join(_lns)
+                    buf = (f"\x1b[{self._lines}A\x1b[J" if self._lines else "") + text + "\n"
+                    sys.stdout.write(buf)
+                    sys.stdout.flush()
+                self._prev_lns = _lns
                 self._tall = len(_lns) > _rows - 1
                 self._lines = min(len(_lns), _rows - 1)
             except OSError:
                 pass
 
-    def start_clock(self, board, sente_ms, gote_ms, active_sente, **kw) -> None:
-        self._stop_clock()
+    def show(self, board, **kw) -> None:
         if not self._ready():
             return
+        text = self._compose(board, **kw)
+        self._last_redraw_t = time.monotonic()
+        self._blit(text)
+
+    def start_clock(self, board, sente_ms, gote_ms, active_sente, **kw) -> None:
+        if not self._ready():
+            return
+        self._stop_clock()
         if sente_ms is None and gote_ms is None:
             return
         self._clk_board = board
@@ -1772,7 +1992,10 @@ class _LiveConsole:
             kw = dict(self._clk_kw) if self._clk_kw else {}
             kw["sente_time"] = _sr_fmt_clock(s_ms)
             kw["gote_time"] = _sr_fmt_clock(g_ms)
-            self.show(board, **kw)
+            self._last_board = board
+            self._last_kw = kw
+            self._ensure_render_thread()
+            self._render_dirty.set()
 
     def reset(self) -> None:
         self._stop_clock()
@@ -1784,6 +2007,7 @@ class _LiveConsole:
                 except OSError:
                     pass
             self._lines = 0
+            self._prev_lns = None
             self._think = None
             self._dyn_cp = None
             self._dyn_cp_pos = None
@@ -1800,6 +2024,7 @@ class _LiveConsole:
             self._leaf_t = 0.0
             self._last_winrate = None
             self._think_hold = None
+            self._render_dirty.clear()
 
 
 _LIVE = _LiveConsole()
@@ -1833,6 +2058,7 @@ def _popen_utf8(args, **kw):
     return subprocess.Popen(args, **kw)
 
 _flog_lock = threading.Lock()
+_FLOG_FH = None
 
 def _flog(msg):
     if globals().get("_log_diagnosis", True) is False:
@@ -1841,10 +2067,23 @@ def _flog(msg):
             k in str(msg) for k in ("FATAL", "Error", "error", "失敗",
                                     "Exception", "Traceback", "WARN")):
         return
+    global _FLOG_FH
+    _line = f"[{time.strftime('%H:%M:%S')}] {msg}\n"
     try:
         with _flog_lock:
-            with open(_LOG_PATH, "a", encoding="utf-8") as f:
-                f.write(f"[{time.strftime('%H:%M:%S')}] {msg}\n")
+            if _FLOG_FH is None:
+                _FLOG_FH = open(_LOG_PATH, "a", encoding="utf-8")
+            try:
+                _FLOG_FH.write(_line)
+                _FLOG_FH.flush()
+            except (ValueError, OSError):
+                try:
+                    _FLOG_FH.close()
+                except Exception:
+                    pass
+                _FLOG_FH = open(_LOG_PATH, "a", encoding="utf-8")
+                _FLOG_FH.write(_line)
+                _FLOG_FH.flush()
     except Exception:
         pass
 
@@ -1866,18 +2105,31 @@ def _safe_format_exc(exc_type=None, exc_value=None, exc_tb=None):
         return f"(traceback formatting failed: {_fmt_e!r})"
 
 
-def _atomic_append(path, text, lock=None, fsync=True):
+def _atomic_append(path, text, lock=None, fsync=True, os_write=False):
     import contextlib
     ctx_mgr = lock if lock else contextlib.nullcontext()
     with ctx_mgr:
-        with open(path, "a", encoding="utf-8") as f:
-            f.write(text)
-            f.flush()
-            if fsync:
-                try:
-                    os.fsync(f.fileno())
-                except OSError:
-                    pass
+        if os_write:
+            _data = text.encode("utf-8") if isinstance(text, str) else text
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND)
+            try:
+                os.write(fd, _data)
+                if fsync:
+                    try:
+                        os.fsync(fd)
+                    except OSError:
+                        pass
+            finally:
+                os.close(fd)
+        else:
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(text)
+                f.flush()
+                if fsync:
+                    try:
+                        os.fsync(f.fileno())
+                    except OSError:
+                        pass
 
 
 _PHIT_TRACE = {"t0": 0.0, "ev": None}
@@ -2159,10 +2411,17 @@ class _Shogidb2Zenrei:
 
 
 _zenrei_live_ref = [None]
+_zenrei_consec_zero = [0]
+
+
+def _zenrei_live_reset():
+    _zenrei_consec_zero[0] = 0
 
 
 def _zenrei_live_push(board):
     if not _LIVE._ready() or not _cfg_bool("Live_Zenrei_Enable", True):
+        return
+    if _zenrei_consec_zero[0] >= 3:
         return
     try:
         _ply = getattr(board, "ply", None)
@@ -2181,11 +2440,26 @@ def _zenrei_live_push(board):
             return "前例多数" if c >= 20 else ("前例約%d局" % c)
         return None
 
-    _t = _txt(_z.get_count(_sf))
-    if _t is not None:
-        _LIVE.set_zenrei(_t)
+    _c_cached = _z.get_count(_sf)
+    if isinstance(_c_cached, int) and _c_cached == 0:
+        _LIVE.set_zenrei("")
+    else:
+        _t = _txt(_c_cached)
+        if _t is not None:
+            _LIVE.set_zenrei(_t)
 
     def _cb(sf, cnt):
+        if isinstance(cnt, int) and cnt == 0:
+            _zenrei_consec_zero[0] += 1
+            if _LIVE._ready():
+                try:
+                    _LIVE.set_zenrei("")
+                    _LIVE._redraw()
+                except Exception:
+                    pass
+            return
+        elif isinstance(cnt, int) and cnt > 0:
+            _zenrei_consec_zero[0] = 0
         _t2 = _txt(cnt)
         if _t2 is not None and _LIVE._ready():
             try:
@@ -2332,12 +2606,20 @@ def _wdoor_consistency_check(game_id, local_kifu_moves, local_result,
 
 _diag_lock = threading.Lock()
 _diag_buf  = []
+_dlog_enabled = True
+_dlog_strftime_cache = ("", 0.0)
 
 def _dlog(msg):
+    if not _dlog_enabled:
+        return
     try:
         with _diag_lock:
+            global _dlog_strftime_cache
+            _now = time.time()
+            if _now - _dlog_strftime_cache[1] >= 1.0:
+                _dlog_strftime_cache = (time.strftime('%H:%M:%S'), _now)
             text = msg() if callable(msg) else msg
-            _diag_buf.append(f"[{time.strftime('%H:%M:%S')}] {text}")
+            _diag_buf.append(f"[{_dlog_strftime_cache[0]}] {text}")
     except Exception:
         pass
 
@@ -2741,7 +3023,10 @@ _PROXY_MODE_REPLACE    = "replace"
 
 
 def _cnum(cfg, key, default, lo, hi, cast):
-    v = cast(cfg.get(key, default))
+    try:
+        v = cast(cfg.get(key, default))
+    except (ValueError, TypeError):
+        v = cast(default)
     if lo is not None:
         v = max(lo, v)
     if hi is not None:
@@ -2752,7 +3037,16 @@ def _cfloat(cfg: dict, key: str, default: float, lo: float = None, hi: float = N
     return _cnum(cfg, key, default, lo, hi, float)
 
 def _cint(cfg: dict, key: str, default: int, lo: int = None, hi: int = None) -> int:
-    return _cnum(cfg, key, default, lo, hi, int)
+    raw = cfg.get(key, default)
+    try:
+        v = int(float(raw))
+    except (ValueError, TypeError):
+        v = int(default)
+    if lo is not None:
+        v = max(lo, v)
+    if hi is not None:
+        v = min(hi, v)
+    return v
 
 def _clamp(v, lo, hi):
     return max(lo, min(hi, v))
@@ -2826,7 +3120,6 @@ _CONFIG_DEFAULTS = {
     "Denryusen_Password":      "",
     "BookDir":                        "",
     "BookFile":                       "",
-    "Book_Path":                      "",
     "Book_Pool_0_BookFile":           "",
     "Book_Pool_0_Label":              "",
     "Book_Pool_1_BookFile":           "",
@@ -2838,11 +3131,8 @@ _CONFIG_DEFAULTS = {
     "Book_Timeout_Ms":                200,
     "Book_Consec":                    4,
     "Book_Hard_Kill_Consec":          0,
-    "Book_Hash":                      512,
-    "Book_Threads":                   1,
-    "Book_SlowMover":                 999,
     "Book_Pool_0_Trust":             _TRUST_ABSOLUTE,
-    "Book_Pool_1_Trust":             _TRUST_ADVISORY,
+    "Book_Pool_1_Trust":             _TRUST_ABSOLUTE,
     "Book_Pool_0_DB_InMemory":       "true",
     "Book_Pool_0_DB_SelectMode":     "head",
     "Book_Pool_0_DB_EvalDiff":       0,
@@ -2855,8 +3145,7 @@ _CONFIG_DEFAULTS = {
     "Book_Council_Bias_Suspect":      1.3,
     "Book2_Fire_On_Consec":           1,
     "Book2_Pool_Index":               1,
-    "Book2_Default_Trust":           _TRUST_ADVISORY,
-    "Book2_Consec":                   1,
+    "Book2_Default_Trust":           _TRUST_ABSOLUTE,
     "nnue_1_OwnBook":                 False,
     "nnue_1_BookFile":                "no_book",
     "nnue_1_BookDir":                 "",
@@ -2871,6 +3160,14 @@ _CONFIG_DEFAULTS = {
     "DL_1_DNN_Batch_Size1":           "256",
     "DL_1_Stochastic_Ponder":         "true",
     "DL_1_PV_Mate_Search_Threads":    "0",
+    "DL_2_PV_Mate_Search_Threads":    "0",
+    "DL_3_PV_Mate_Search_Threads":    "0",
+    "DL_UCT_Threads_Auto_Scale":      True,
+    "DL_Batch_Auto_Scale":            True,
+    "ZF_Serve_Pool_Max":              "",
+    "DL_PVMate_Dynamic":              False,
+    "DL_PVMate_Main_Threads":         "",
+    "DL_PVMate_Sub_Threads":          "",
     "nnue_1_DrawValueBlack":          "-33",
     "nnue_1_DrawValueWhite":          "-33",
     "nnue_1_SlowMover":               "150",
@@ -2936,7 +3233,7 @@ _CONFIG_DEFAULTS = {
     "Makebook_Bad_Cp":                -200,
     "Makebook_Bad_Cp_GP_Coef":        -44.1763,
     "Makebook_Eval_Diff_Cp":          100,
-    "Makebook_Eval_Diff_From_Start_Cp": 0,
+    "Makebook_Eval_Diff_From_Start_Cp": 40,
     "Makebook_Max_Ply":               0,
     "Makebook_Bestline_Node_Coef":    0.7,
     "Makebook_Full_Backup_Max_Pos":   100000,
@@ -2978,12 +3275,14 @@ _CONFIG_DEFAULTS = {
     "Log_Stats":                      True,
     "Live_PV_Leaf_Board":             True,
     "Live_PV_Leaf_Min_S":             0.1,
-    "Live_PV_Leaf_Model_WR":          True,
+    "Live_PV_Leaf_Model_WR":          False,
+    "GP_XCheck_Enable":               False,
     "SvInfer_Use_Slim":               True,
     "Endgame_Veto_Model_WR":          True,
     "Endgame_DL3_MultiPV_Display":    True,
     "Endgame_DL3_MultiPV_N":          5,
-    "Live_Voice_Linger_S":            1.0,
+    "Live_Frame_Clamp":               True,
+    "Live_Voice_Linger_S":            2.5,
     "Live_Zenrei_Enable":             True,
     "Council_Phase_Enable":            True,
     "DL1_Council_Weight_Early":        1.691,
@@ -3350,7 +3649,10 @@ def _could_be_auto_scale(val, coeff, max_t=1.25, tol=0.01):
 def _resolve_auto_managed(key, auto_val, check_fn=None, tol=0.001):
     if key not in _user_cfg_keys:
         return auto_val, False
-    user_val = float(_cfg[key])
+    try:
+        user_val = float(_cfg[key])
+    except (ValueError, TypeError):
+        return auto_val, False
     if abs(user_val - float(auto_val)) <= tol:
         return auto_val, False
     if check_fn is not None and check_fn(user_val):
@@ -3363,8 +3665,8 @@ def _normalize_auto_managed_config(cfg, user_cfg_keys):
     user_cfg_keys = dict(user_cfg_keys)
 
     aggr = _cfloat(cfg, "Time_Aggression", _CONFIG_DEFAULTS["Time_Aggression"], 0.0, _TA_CEIL)
-    nnue1_hash = int(cfg.get("nnue_1_Hash", _CONFIG_DEFAULTS["nnue_1_Hash"]))
-    dl1_hash = int(cfg.get("DL_1_Hash", _CONFIG_DEFAULTS["DL_1_Hash"]))
+    nnue1_hash = _cint(cfg, "nnue_1_Hash", int(_CONFIG_DEFAULTS["nnue_1_Hash"]), 1)
+    dl1_hash = _cint(cfg, "DL_1_Hash", int(_CONFIG_DEFAULTS["DL_1_Hash"]), 1)
 
     auto_values = {
         "nnue_1_SlowMover": str(round(_lerp(*_LERP_SLOWMOVER, _clamp(float(aggr), 0.0, _TA_CEIL)))),
@@ -3604,12 +3906,12 @@ for _lpk in (list(_cfg) if not _MP_LIGHT_IMPORT else []):
                   file=sys.stderr, flush=True)
             _flog(f"[LINUX-PATH-GUARD] {_lpk}={_lpv} (Windows path on POSIX)")
 
-_LERP_SLOWMOVER = (float(_cfg.get("TA_Lerp_SlowMover_Lo", _LERP_SLOWMOVER[0])),
-                   float(_cfg.get("TA_Lerp_SlowMover_Hi", _LERP_SLOWMOVER[1])))
-_LERP_DL_RATIO  = (float(_cfg.get("TA_Lerp_DL_Ratio_Lo",  _LERP_DL_RATIO[0])),
-                   float(_cfg.get("TA_Lerp_DL_Ratio_Hi",  _LERP_DL_RATIO[1])))
-_LERP_DL_MAX_MS = (float(_cfg.get("TA_Lerp_DL_Max_Ms_Lo", _LERP_DL_MAX_MS[0])),
-                   float(_cfg.get("TA_Lerp_DL_Max_Ms_Hi", _LERP_DL_MAX_MS[1])))
+_LERP_SLOWMOVER = (_cfloat(_cfg, "TA_Lerp_SlowMover_Lo", _LERP_SLOWMOVER[0]),
+                   _cfloat(_cfg, "TA_Lerp_SlowMover_Hi", _LERP_SLOWMOVER[1]))
+_LERP_DL_RATIO  = (_cfloat(_cfg, "TA_Lerp_DL_Ratio_Lo", _LERP_DL_RATIO[0]),
+                   _cfloat(_cfg, "TA_Lerp_DL_Ratio_Hi", _LERP_DL_RATIO[1]))
+_LERP_DL_MAX_MS = (_cfloat(_cfg, "TA_Lerp_DL_Max_Ms_Lo", _LERP_DL_MAX_MS[0]),
+                   _cfloat(_cfg, "TA_Lerp_DL_Max_Ms_Hi", _LERP_DL_MAX_MS[1]))
 
 
 def _cfg_bool(key: str, default: bool = False) -> bool:
@@ -3662,15 +3964,15 @@ def _unpack_bestmove(ni):
     return "", None
 
 
-
 _DEBUG_ASSERTIONS = _cfg_bool("Debug_Assertions", False)
 
 _LIVE_PV_LEAF_ENABLE = _cfg_bool("Live_PV_Leaf_Board", True)
-_LIVE_PV_LEAF_MODEL_WR = _cfg_bool("Live_PV_Leaf_Model_WR", True)
+_LIVE_PV_LEAF_MODEL_WR = _cfg_bool("Live_PV_Leaf_Model_WR", False)
+_GP_XCHK_ENABLE = _cfg_bool("GP_XCheck_Enable", False)
 _SVINFER_USE_SLIM = _cfg_bool("SvInfer_Use_Slim", True)
 _ENDGAME_VETO_MODEL_WR = _cfg_bool("Endgame_Veto_Model_WR", True)
 try:
-    _LIVE_VOICE_LINGER_S = _cfloat(_cfg, "Live_Voice_Linger_S", 1.0, lo=0.0)
+    _LIVE_VOICE_LINGER_S = _cfloat(_cfg, "Live_Voice_Linger_S", 2.5, lo=0.0)
 except Exception:
     _LIVE_VOICE_LINGER_S = 1.0
 try:
@@ -3793,12 +4095,12 @@ else:
     _nnue_2_idx = 0
 
 _params = {
-    "POLICY_MOVES": int(_cfg.get("POLICY_MOVES", 9)),
-    "POLICY_NODES": int(_cfg.get("POLICY_NODES", 2043)),
+    "POLICY_MOVES": _cint(_cfg, "POLICY_MOVES", 9),
+    "POLICY_NODES": _cint(_cfg, "POLICY_NODES", 2043),
 }
 
-_RESOURCE_THREADS_SPARE_MIN = int(_cfg.get("Resource_Threads_Spare_Min", 2))
-_RESOURCE_RAM_SAFETY_MARGIN_MB = int(_cfg.get("Resource_RAM_Safety_Margin_MB", 4096))
+_RESOURCE_THREADS_SPARE_MIN = _cint(_cfg, "Resource_Threads_Spare_Min", 2)
+_RESOURCE_RAM_SAFETY_MARGIN_MB = _cint(_cfg, "Resource_RAM_Safety_Margin_MB", 4096)
 
 _PONDER_NEVER = {
     "USI_Ponder":        "false",
@@ -4008,7 +4310,7 @@ else:
         _flog(f"[DLP] DL_Ponder_Mode={_dlponder_mode_cfg!r} unknown — fallback to 'ponder'")
         _dlponder_mode_cfg = "ponder"
     if "DL_Ponder_Enable" in _user_cfg_keys:
-        _dl_ponder_enable = _norm_str(_cfg.get("DL_Ponder_Enable", "false")) == "true"
+        _dl_ponder_enable = _cfg_bool("DL_Ponder_Enable")
         _flog(f"[DLP] DL_Ponder_Enable={_dl_ponder_enable} (明示 user 設定 — auto 判定は不使用)")
     elif _dlponder_mode_cfg in ("ponder", "prefetch"):
         _dl_ponder_enable = (_dlponder_mode_cfg == "ponder")
@@ -4016,10 +4318,10 @@ else:
     else:
         _dlponder_load_state()
         _dlponder_gain = _dlponder_gain_core(_DLPONDER_STATE["nps_ema"], _DLPONDER_STATE["opponent_s_ema"],
-                                   int(_cfg.get("POLICY_NODES", 2043)))
+                                   _cint(_cfg, "POLICY_NODES", 2043))
         _dlponder_decision = _dlponder_decide_core(
-            _dlponder_gain, float(_cfg.get("DLP_Gain_Min", 2.0)),
-            int(_DLPONDER_STATE.get("samples", 0)), int(_cfg.get("DLP_Min_Samples", 3)),
+            _dlponder_gain, _cfloat(_cfg, "DLP_Gain_Min", 2.0),
+            int(_DLPONDER_STATE.get("samples", 0)), _cint(_cfg, "DLP_Min_Samples", 3),
             prev_mode=str(_DLPONDER_STATE.get("mode", "prefetch")))
         _dl_ponder_enable = (_dlponder_decision == "ponder")
         _DLPONDER_STATE["mode"] = _dlponder_decision
@@ -4150,6 +4452,8 @@ _GPU_COUNT = [None]
 
 
 def _sys_gpu_count(timeout_s=2.0):
+    if _MP_LIGHT_IMPORT:
+        return 1
     if _GPU_COUNT[0] is not None:
         return _GPU_COUNT[0]
     n = 1
@@ -4263,7 +4567,7 @@ def _tuning_mode_core(spsa_mode, worker_flag, argv1):
 
 
 _tuning_mode = _tuning_mode_core(
-    _SPSA_MODE, "--spsa-worker" in sys.argv,
+    _RUN_MODE is RunMode.SPSA_WORKER, _RUN_MODE is RunMode.SPSA_WORKER,
     sys.argv[1] if len(sys.argv) > 1 else "")
 
 _tuning_worker_count = _cint(_cfg, "Tuning_Worker_Count", 2, lo=1)
@@ -4344,7 +4648,7 @@ def _safe_cpu_count() -> int:
     if _logical == 0:
         _logical = 2
     try:
-        _cap = _norm_str(_cfg.get("Threads_Physical_Cap", "false")) in ("true", "1")
+        _cap = _cfg_bool("Threads_Physical_Cap")
     except Exception:
         _cap = False
     if _cap:
@@ -4360,8 +4664,29 @@ def _effective_cores() -> int:
     return _phys
 
 
-_resource_ram_pct       = float(_cfg.get("Resource_RAM_Budget_Pct", 1.0))
-_resource_thr_pct       = float(_cfg.get("Resource_Threads_Budget_Pct", 1.0))
+def _dl_scale_plan_core(cores):
+    t = 3 + max(0, (cores - 32) // 32)
+    return {"DL_1": (t, 256 * (t - 2)),
+            "DL_2": (t, 256 * (t - 2)),
+            "DL_3": (1, 128)}
+
+
+def _zf_pool_max_core(cores):
+    return max(1, cores // 32)
+
+
+def _pvmate_threads_plan_core(cores):
+    if cores <= 32:
+        main_t, sub_t = 1, 0
+    elif cores <= 95:
+        main_t, sub_t = 2, 1
+    else:
+        main_t, sub_t = 3, 1
+    return {"main": main_t, "sub": sub_t}
+
+
+_resource_ram_pct       = _cfloat(_cfg, "Resource_RAM_Budget_Pct", 1.0)
+_resource_thr_pct       = _cfloat(_cfg, "Resource_Threads_Budget_Pct", 1.0)
 _budget_overrode_hash   = False
 
 if not _MP_LIGHT_IMPORT:
@@ -4371,7 +4696,7 @@ if not _MP_LIGHT_IMPORT:
         _cfg_bool("Resource_RAM_Use_Available", True) and not _tuning_mode,
         _RESOURCE_RAM_SAFETY_MARGIN_MB)
     _rb_cores    = _effective_cores()
-    _rb_arb_reserve = (int(_cfg.get("ARB1_NNUE2_Hash", 1024))
+    _rb_arb_reserve = (_cint(_cfg, "ARB1_NNUE2_Hash", 1024)
                        if (_cfg_bool("ARB_Enable", True)
                            and _cfg_bool("ARB1_Enable", True)
                            and _cfg_bool("ARB1_Prestart_NNUE2", True))
@@ -4394,11 +4719,11 @@ if not _MP_LIGHT_IMPORT:
     _rb_dl_cpu_reserve = _budget_dl_cpu_reserve_core(
         _rb_vram_t_early,
         _rb_dl_model_mbs,
-        float(_cfg.get("Resource_DL_CPU_Reserve_Factor", 2.5)),
-        int(_cfg.get("Resource_DL_CPU_Reserve_Fallback_MB", 2048)),
+        _cfloat(_cfg, "Resource_DL_CPU_Reserve_Factor", 2.5),
+        _cint(_cfg, "Resource_DL_CPU_Reserve_Fallback_MB", 2048),
         gpu_count=_sys_gpu_count(),
         n_dl_engines=_rb_n_dl_engines)
-    _rb_reserved = (int(_cfg.get("Resource_Reserved_MB", 1536))
+    _rb_reserved = (_cint(_cfg, "Resource_Reserved_MB", 1536)
                     + _rb_arb_reserve + _rb_dl_cpu_reserve)
     if _rb_dl_cpu_reserve:
         if _rb_vram_t_early is not None:
@@ -4442,16 +4767,29 @@ if not _MP_LIGHT_IMPORT:
             _flog(f"[BUDGET-MEM] check failed (ignored): {_e}")
     _rb_thr = _budget_alloc_core(
         _rb_cores, _resource_thr_pct, 0,
-        {"nnue_1_Threads":    float(_cfg.get("Resource_Threads_Share_NNUE1", 8.0)),
-         "DL_1_UCT_Threads1": float(_cfg.get("Resource_Threads_Share_DL1",   3.0)),
-         "DL_2_UCT_Threads1": float(_cfg.get("Resource_Threads_Share_DL2",   3.0)),
-         "DL_3_UCT_Threads1": float(_cfg.get("Resource_Threads_Share_DL3",   1.0))},
+        {"nnue_1_Threads":    _cfloat(_cfg, "Resource_Threads_Share_NNUE1", 8.0),
+         "DL_1_UCT_Threads1": _cfloat(_cfg, "Resource_Threads_Share_DL1", 3.0),
+         "DL_2_UCT_Threads1": _cfloat(_cfg, "Resource_Threads_Share_DL2", 3.0),
+         "DL_3_UCT_Threads1": _cfloat(_cfg, "Resource_Threads_Share_DL3", 1.0)},
         floor_units=1)
+    _dl_scale_auto_thr = _cfg_bool("DL_UCT_Threads_Auto_Scale", True)
+    _dl_scale_auto_bat = _cfg_bool("DL_Batch_Auto_Scale", True)
+    _dl_scale = _dl_scale_plan_core(_rb_cores)
     try:
         _ng_pergpu = max(1, _sys_gpu_count())
-        for _dk, _dcap in (("DL_1_UCT_Threads1", 3),
-                           ("DL_2_UCT_Threads1", 3),
-                           ("DL_3_UCT_Threads1", 2)):
+        if _dl_scale_auto_thr:
+            _pergpu_caps = {
+                "DL_1_UCT_Threads1": _dl_scale["DL_1"][0],
+                "DL_2_UCT_Threads1": _dl_scale["DL_2"][0],
+                "DL_3_UCT_Threads1": _dl_scale["DL_3"][0],
+            }
+        else:
+            _pergpu_caps = {
+                "DL_1_UCT_Threads1": 3,
+                "DL_2_UCT_Threads1": 3,
+                "DL_3_UCT_Threads1": 2,
+            }
+        for _dk, _dcap in _pergpu_caps.items():
             if _rb_thr and _dk in _rb_thr:
                 _pg_v = _clamp(int(_rb_thr[_dk]) // _ng_pergpu, 1, _dcap)
                 if _pg_v != _rb_thr[_dk]:
@@ -4478,7 +4816,7 @@ if not _MP_LIGHT_IMPORT:
             _rb_applied.append(f"{_k}={_v}")
             if _k == "nnue_1_Hash":
                 _budget_overrode_hash = True
-    if os.environ.get("PYFAMATE_DLP_CAL"):
+    if _RUN_MODE is RunMode.DLP_CAL:
         _cfg["nnue_1_Hash"] = "16"
         _cfg["nnue_1_Threads"] = "1"
         _cfg["nnue_2_Hash"] = "16"
@@ -4489,15 +4827,51 @@ if not _MP_LIGHT_IMPORT:
         _rb_applied.append("dlp-cal-min(nnue_1_Hash=16,nnue_1_Threads=1,nnue_2_Hash=16)")
         _cfg["Score_Stability_Swing_Threshold_Cp"] = "99999"
     try:
+        _vram_tight = False
+        if _dl_scale_auto_bat:
+            try:
+                _vt_check, _vu_check = _sys_vram_info()
+                if _vt_check is not None and _vu_check is not None:
+                    _vram_tight = (_vu_check / _vt_check) < 0.15
+            except Exception:
+                pass
+        for _ds_slot, (_ds_thr, _ds_bat) in _dl_scale.items():
+            _ds_thr_key = f"{_ds_slot}_UCT_Threads1"
+            _ds_bat_key = f"{_ds_slot}_DNN_Batch_Size1"
+            _ds_thr_seeded = (_ds_thr_key in _CONFIG_TXT_KEYS
+                              and str(_cfg.get(_ds_thr_key)) == str(_CONFIG_DEFAULTS.get(_ds_thr_key)))
+            _ds_bat_seeded = (_ds_bat_key in _CONFIG_TXT_KEYS
+                              and str(_cfg.get(_ds_bat_key)) == str(_CONFIG_DEFAULTS.get(_ds_bat_key)))
+            if (_dl_scale_auto_thr
+                    and (_ds_thr_key not in _user_cfg_keys or _ds_thr_seeded)):
+                _ds_old_thr = _cfg.get(_ds_thr_key)
+                _cfg[_ds_thr_key] = str(_ds_thr)
+                if str(_ds_old_thr) != str(_ds_thr):
+                    _flog(f"[DL-SCALE] {_ds_thr_key}: {_ds_old_thr}→{_ds_thr} "
+                          f"(cores={_rb_cores})")
+                    _rb_applied.append(f"{_ds_thr_key}={_ds_thr}(scale)")
+            if (_dl_scale_auto_bat and not _vram_tight
+                    and (_ds_bat_key not in _user_cfg_keys or _ds_bat_seeded)):
+                _ds_old_bat = _cfg.get(_ds_bat_key)
+                _cfg[_ds_bat_key] = str(_ds_bat)
+                if str(_ds_old_bat) != str(_ds_bat):
+                    _flog(f"[DL-SCALE] {_ds_bat_key}: {_ds_old_bat}→{_ds_bat} "
+                          f"(cores={_rb_cores})")
+                    _rb_applied.append(f"{_ds_bat_key}={_ds_bat}(scale)")
+            elif _dl_scale_auto_bat and _vram_tight:
+                _flog(f"[DL-SCALE] {_ds_bat_key}: VRAM 逼迫 — batch スケール抑止")
+    except Exception as _dse:
+        _flog(f"[DL-SCALE] 適用失敗 ({type(_dse).__name__}: {_dse}) — 据え置き")
+    try:
         _spare_min = _RESOURCE_THREADS_SPARE_MIN
         _ng_dl = max(1, _sys_gpu_count())
-        _dl_total = int(_cfg.get("DL_1_UCT_Threads1", 1)) * _ng_dl
+        _dl_total = _cint(_cfg, "DL_1_UCT_Threads1", 1) * _ng_dl
         if _cfg_bool("DL_2_Enable", True):
-            _dl_total += int(_cfg.get("DL_2_UCT_Threads1", 1)) * _ng_dl
+            _dl_total += _cint(_cfg, "DL_2_UCT_Threads1", 1) * _ng_dl
         if _cfg_bool("DL_3_Enable", True):
-            _dl_total += int(_cfg.get("DL_3_UCT_Threads1", 1)) * _ng_dl
+            _dl_total += _cint(_cfg, "DL_3_UCT_Threads1", 1) * _ng_dl
         _nnue_cap = max(1, _rb_cores - _dl_total - _spare_min)
-        _nnue_cur = int(_cfg.get("nnue_1_Threads", 4))
+        _nnue_cur = _cint(_cfg, "nnue_1_Threads", 4)
         if _nnue_thr_managed and _nnue_cur != _nnue_cap:
             _cfg["nnue_1_Threads"] = str(_nnue_cap)
             _flog(f"[BUDGET-SPARE] nnue_1_Threads {_nnue_cur}→{_nnue_cap} "
@@ -4514,7 +4888,7 @@ if not _MP_LIGHT_IMPORT:
         _rb_vram_t, _rb_vram_u = _sys_vram_info()
         _flog(f"[BUDGET] system ram={_rb_avail_mb}/{_rb_total_mb}MB free "
               f"basis={_rb_basis_mb}MB (pct_cap={_resource_ram_pct} "
-              f"margin={int(_cfg.get('Resource_RAM_Safety_Margin_MB', 4096))}) "
+              f"margin={_cint(_cfg, 'Resource_RAM_Safety_Margin_MB', 4096)}) "
               f"cores={_rb_cores} thr_pct={_resource_thr_pct} "
               f"reserved={_rb_reserved}MB "
               + (f"vram={_rb_vram_u}/{_rb_vram_t}MB " if _rb_vram_t is not None
@@ -4607,8 +4981,8 @@ del _book_no_child_check
 _BOOK_PROBE_TRACE_LEFT = 3
 _SELFPLAY_COMMANDS = frozenset({"spsa", "sprt", "grid", "setup"})
 _book_spsa_disabled = (bool(_SPSA_MODE)
-    or bool(os.environ.get("PYFAMATE_DLP_CAL"))
-    or ("--spsa-worker" in sys.argv)
+    or _RUN_MODE is RunMode.DLP_CAL
+    or _RUN_MODE is RunMode.SPSA_WORKER
     or (len(sys.argv) > 1 and sys.argv[1] in _SELFPLAY_COMMANDS))
 _book_enabled       = (bool(_book_pool_indices) and not _book_spsa_disabled
                         and (bool(_book_path) or _book_pool_all_sbk))
@@ -4617,8 +4991,8 @@ if _book_spsa_disabled and (_book_path or _book_pool_all_sbk):
 
 _nnue_pool_indices = _detect_pool_indices("nnue_Pool_") if not _MP_LIGHT_IMPORT else []
 _NNUE_POOL_FV_SCALE = {
-    i: int(_cfg.get(f"nnue_Pool_{_pool_letter(i)}_FV_Scale",
-                    _CONFIG_DEFAULTS.get(f"nnue_Pool_{_pool_letter(i)}_FV_Scale", 40)))
+    i: _cint(_cfg, f"nnue_Pool_{_pool_letter(i)}_FV_Scale",
+              _CONFIG_DEFAULTS.get(f"nnue_Pool_{_pool_letter(i)}_FV_Scale", 40))
     for i in _nnue_pool_indices
 }
 _NNUE_POOL_PATHS_NORM = {
@@ -4767,11 +5141,11 @@ class _TimeDynGlobals:
 
 _time_dyn = _TimeDynGlobals()
 
-_time_dyn.time_aggression = _clamp(float(_cfg["Time_Aggression"]), 0.0, _TA_CEIL)
+_time_dyn.time_aggression = _cfloat(_cfg, "Time_Aggression", 0.7601, 0.0, _TA_CEIL)
 _time_aggression_base = _time_dyn.time_aggression
 
 def _resolve_ta(key: str, base: float) -> float:
-    v = float(_cfg.get(key, -1.0))
+    v = _cfloat(_cfg, key, -1.0)
     return base if v < 0.0 else _clamp(v, 0.0, _TA_CEIL)
 
 
@@ -4810,7 +5184,7 @@ if "nnue_2_Threads" in _user_cfg_keys:
 else:
     _endgame_spare = _RESOURCE_THREADS_SPARE_MIN
     _nnue_2_threads = str(max(
-        int(_cfg["nnue_1_Threads"]),
+        _cint(_cfg, "nnue_1_Threads", 4, 1),
         max(1, _effective_cores() - _endgame_spare)))
     _flog(f"[BUDGET-SPARE] nnue_2_Threads={_nnue_2_threads} 初期値: "
           f"cores={_effective_cores()} spare={_endgame_spare} "
@@ -4877,7 +5251,7 @@ def _endgame_restore_opts(nnue_1_opts: dict, promoted: dict) -> dict:
 _mate_solver_path    = str(_cfg["mate_solver_Path"]).strip()
 _mate_solver_enable = (
     not _MP_LIGHT_IMPORT
-    and _norm_str(_cfg["mate_solver_Enable"]) == "true"
+    and _cfg_bool("mate_solver_Enable")
     and bool(_mate_solver_path)
 )
 
@@ -4894,13 +5268,15 @@ def _probe_csa_mate_solver(path):
         _has_tesuki = "sfen-tesuki" in _out
         _cleaned = _out.replace("sfen-tsumero", "X").replace("sfen-tesuki", "X")
         _has_solve = _has_tsumero or _has_tesuki or "sfen" in _cleaned
-        return _has_solve, _has_tsumero, _has_tesuki
+        _has_serve = "csa serve" in _out
+        return _has_solve, _has_tsumero, _has_tesuki, _has_serve
     except Exception:
-        return False, False, False
+        return False, False, False, False
 
 _zyfamate_enable = False
 _zyfamate_has_tsumero = False
 _zyfamate_has_tesuki = False
+_zyfamate_has_serve = False
 if _mate_solver_enable:
     try:
         if not (os.path.isabs(_mate_solver_path)
@@ -4918,11 +5294,12 @@ if _mate_solver_enable:
                     break
     except Exception as _zfr_e:
         _flog(f"[ZYFAMATE] path resolve failed (ignored): {_zfr_e!r}")
-    _zf_solve, _zf_tsu, _zf_tek = _probe_csa_mate_solver(_mate_solver_path)
+    _zf_solve, _zf_tsu, _zf_tek, _zf_srv = _probe_csa_mate_solver(_mate_solver_path)
     if _zf_solve:
         _zyfamate_enable = True
         _zyfamate_has_tsumero = _zf_tsu
         _zyfamate_has_tesuki = _zf_tek
+        _zyfamate_has_serve = _zf_srv
         if _zf_tsu and _zf_tek:
             _flog(f"[ZYFAMATE] csa.exe detected (solve+tsumero+tesuki): {_mate_solver_path}")
         else:
@@ -5006,12 +5383,12 @@ _dl_3_path    = (_resolve_pool_path("DL_Pool_", None, "DL_3_Engine_Index", "DL_3
 _dl_3_mcts_opts = _build_dl_mcts_opts(_dl_3_path, "DL_3") if _dl_3_path else {}
 _flog(f"[DL_MCTS] DL_3 mcts_opts resolved: {_dl_3_mcts_opts or '(none — using engine defaults)'}")
 _dl_3_enable  = (
-    _norm_str(_cfg["DL_3_Enable"]) in ("true", "1", "yes")
+    _cfg_bool("DL_3_Enable", True)
     and bool(_dl_3_path)
 )
-_time_dyn.dl_3_rescue_eff_s_min     = float(_cfg["DL_3_Rescue_Eff_S_Min"])
-_time_dyn.dl_3_empty_eff_s_min      = float(_cfg["DL_3_Empty_Eff_S_Min"])
-_dl_3_nodes                = int(_cfg["DL_3_Nodes"])
+_time_dyn.dl_3_rescue_eff_s_min     = _cfloat(_cfg, "DL_3_Rescue_Eff_S_Min", 2.0, 0.0)
+_time_dyn.dl_3_empty_eff_s_min      = _cfloat(_cfg, "DL_3_Empty_Eff_S_Min", 2.0, 0.0)
+_dl_3_nodes                = _cint(_cfg, "DL_3_Nodes", 300, 0)
 _dl_3_effective_nodes      = _dl_3_nodes if _dl_3_nodes > 0 else _params["POLICY_NODES"]
 
 
@@ -5036,14 +5413,14 @@ _dl_3_opts = _build_dl_opts(
 
 
 
-_game_phase_handover_default   = float(_cfg.get("GP_Handover_Default",   1.0))
-_makebook_bad_cp        = int(float(_cfg.get("Makebook_Bad_Cp", -200)))
-_makebook_bad_cp_game_phase_coef = float(_cfg.get("Makebook_Bad_Cp_GP_Coef", -44.1763))
-_makebook_eval_diff_cp        = int(float(_cfg.get("Makebook_Eval_Diff_Cp", 100)))
-_makebook_eval_diff_from_start_cp = int(float(_cfg.get("Makebook_Eval_Diff_From_Start_Cp", 0)))
-_makebook_max_ply             = int(float(_cfg.get("Makebook_Max_Ply", 0)))
-_makebook_bestline_coef       = float(_cfg.get("Makebook_Bestline_Node_Coef", 0.7))
-_makebook_full_backup_max_pos = int(float(_cfg.get("Makebook_Full_Backup_Max_Pos", 100000)))
+_game_phase_handover_default   = _cfloat(_cfg, "GP_Handover_Default", 1.0)
+_makebook_bad_cp        = _cint(_cfg, "Makebook_Bad_Cp", -200)
+_makebook_bad_cp_game_phase_coef = _cfloat(_cfg, "Makebook_Bad_Cp_GP_Coef", -44.1763)
+_makebook_eval_diff_cp        = _cint(_cfg, "Makebook_Eval_Diff_Cp", 100)
+_makebook_eval_diff_from_start_cp = _cint(_cfg, "Makebook_Eval_Diff_From_Start_Cp", 0)
+_makebook_max_ply             = _cint(_cfg, "Makebook_Max_Ply", 0)
+_makebook_bestline_coef       = _cfloat(_cfg, "Makebook_Bestline_Node_Coef", 0.7)
+_makebook_full_backup_max_pos = _cint(_cfg, "Makebook_Full_Backup_Max_Pos", 100000)
 
 _dyn_threads_enable = True
 if _tuning_mode and _dyn_threads_enable:
@@ -5055,17 +5432,17 @@ if _tuning_mode and _dyn_threads_enable:
 
 
 
-_dl_gap_min_base    = float(_cfg["DL_Score_Gap_Min_Base"])
-_dl_gap_min_per_sec = float(_cfg["DL_Score_Gap_Min_Per_Sec"])
-_dl_gap_min_min     = float(_cfg["DL_Score_Gap_Min_Min"])
-_dl_gap_min_max     = float(_cfg["DL_Score_Gap_Min_Max"])
-_dl_gap_min_game_phase_coef = float(_cfg.get("DL_Score_Gap_Min_GP_Coef", -5.3427))
+_dl_gap_min_base    = _cfloat(_cfg, "DL_Score_Gap_Min_Base", 17.0)
+_dl_gap_min_per_sec = _cfloat(_cfg, "DL_Score_Gap_Min_Per_Sec", 0.652)
+_dl_gap_min_min     = _cfloat(_cfg, "DL_Score_Gap_Min_Min", 27.0)
+_dl_gap_min_max     = _cfloat(_cfg, "DL_Score_Gap_Min_Max", 49.0)
+_dl_gap_min_game_phase_coef = _cfloat(_cfg, "DL_Score_Gap_Min_GP_Coef", -5.3427)
 
-_dl_stab_base    = float(_cfg["DL_Stability_Threshold_Base"])
-_dl_stab_per_sec = float(_cfg["DL_Stability_Threshold_Per_Sec"])
-_dl_stab_min     = float(_cfg["DL_Stability_Threshold_Min"])
-_dl_stab_max     = float(_cfg["DL_Stability_Threshold_Max"])
-_dl_stab_game_phase_tighten = float(_cfg.get("DL_Stability_GP_Tighten", 9))
+_dl_stab_base    = _cfloat(_cfg, "DL_Stability_Threshold_Base", 199.0)
+_dl_stab_per_sec = _cfloat(_cfg, "DL_Stability_Threshold_Per_Sec", 2.4983)
+_dl_stab_min     = _cfloat(_cfg, "DL_Stability_Threshold_Min", 84.0)
+_dl_stab_max     = _cfloat(_cfg, "DL_Stability_Threshold_Max", 243.0)
+_dl_stab_game_phase_tighten = _cfloat(_cfg, "DL_Stability_GP_Tighten", 9)
 
 
 
@@ -5074,14 +5451,14 @@ _dl_time_ratio_auto = _lerp(*_LERP_DL_RATIO, _time_aggression_dl)
 _time_dyn.dl_time_ratio, _dl_time_ratio_user_set = _resolve_auto_managed(
     "DL_Time_Ratio", _dl_time_ratio_auto,
     check_fn=lambda v: _could_be_auto_lerp(v, *_LERP_DL_RATIO))
-_dl_min_remaining_moves   = max(1,  int(_cfg["DL_Min_Remaining_Moves"]))
+_dl_min_remaining_moves   = _cint(_cfg, "DL_Min_Remaining_Moves", 8, 1)
 _rem_moves_expected_game_ply = _cint(_cfg, "Rem_Moves_Expected_Game_Ply", 260, lo=100, hi=512)
-_dl_time_min_ms      = float(_cfg["DL_Time_Min_ms"])
+_dl_time_min_ms      = _cfloat(_cfg, "DL_Time_Min_ms", 1844.0, 0.0)
 _eff_s_fischer_cap_ratio = _cfloat(_cfg, "Eff_S_Fischer_Cap_Ratio", 0.3893, lo=0.0)
 _dl_time_min_eff_s_cap_ratio = _cfloat(_cfg, "DL_Time_Min_Eff_S_Cap_Ratio", 0.7, lo=0.0)
 _inc_spend_ratio = _cfloat(_cfg, "Inc_Spend_Ratio", 0.8244, lo=0.1, hi=1.0)
 _fischer_horizon_moves = _cint(_cfg, "Fischer_Horizon_Moves", 28, lo=0)
-_dl_time_ratio_eff_s_coef = float(_cfg.get("DL_Time_Ratio_Eff_S_Coef", -0.0049))
+_dl_time_ratio_eff_s_coef = _cfloat(_cfg, "DL_Time_Ratio_Eff_S_Coef", -0.0049)
 _dl_time_max_ms_auto = _lerp(*_LERP_DL_MAX_MS, _time_aggression_dl)
 _time_dyn.dl_time_max_ms, _dl_time_max_ms_user_set = _resolve_auto_managed(
     "DL_Time_Max_ms", _dl_time_max_ms_auto, tol=1.0,
@@ -5100,7 +5477,7 @@ if not _nnue_2_slowmover_user_set:
 
 
 _dl_2_enable                = _cfg_bool("DL_2_Enable", True)
-_dl_2_node_ratio = float(_cfg.get("DL_2_Node_Ratio", 0.8508))
+_dl_2_node_ratio = _cfloat(_cfg, "DL_2_Node_Ratio", 0.8508)
 _RETIRED_CONFIG_KEYS = frozenset({
     "Handover_Reversible_Enable", "Endgame_DL_Veto_Enable",
     "Sente_Repetition_Council_Enable", "Gote_Repetition_Council_Enable",
@@ -5121,6 +5498,7 @@ _RETIRED_CONFIG_KEYS = frozenset({
     "DL1_Council_Decay_End_Ply", "DL2_Council_Decay_End_Ply",
     "NNUE_Only_Promote_In_Place",
     "ARB_Gap_Min_Cp", "ARB_Min_Eff_S", "ARB1_Prestart_Min_Eff_S",
+    "Book_Path", "Book_Hash", "Book_Threads", "Book_SlowMover", "Book2_Consec",
 })
 _retired_found = _RETIRED_CONFIG_KEYS & set(_user_cfg_keys)
 if _retired_found:
@@ -5165,23 +5543,23 @@ _dl3_proxy_scope       = _norm_str(_cfg.get("DL3_Proxy_Scope", "always"))
 if _dl3_proxy_scope not in ("always", "dl2_absent"):
     _dl3_proxy_scope = "always"
 
-_game_phase_w_hand    = float(_cfg.get("GP_W_Hand",    0.125335))
-_game_phase_w_promo   = float(_cfg.get("GP_W_Promo",   0.0))
-_game_phase_w_camp     = float(_cfg.get("GP_W_Camp",   0.107800))
-_game_phase_w_king    = float(_cfg.get("GP_W_King",    0.097863))
+_game_phase_w_hand    = _cfloat(_cfg, "GP_W_Hand", 0.125335)
+_game_phase_w_promo   = _cfloat(_cfg, "GP_W_Promo", 0.0)
+_game_phase_w_camp     = _cfloat(_cfg, "GP_W_Camp", 0.107800)
+_game_phase_w_king    = _cfloat(_cfg, "GP_W_King", 0.097863)
 _game_phase_king_ref  = _cfloat(_cfg, "GP_King_Ref", 1.532946, lo=0.1)
-_game_phase_nyugyoku_king_onset = float(_cfg.get("GP_Nyugyoku_King_Onset", 0.345101))
-_game_phase_nyugyoku_king_full  = float(_cfg.get("GP_Nyugyoku_King_Full",  0.839616))
+_game_phase_nyugyoku_king_onset = _cfloat(_cfg, "GP_Nyugyoku_King_Onset", 0.345101)
+_game_phase_nyugyoku_king_full  = _cfloat(_cfg, "GP_Nyugyoku_King_Full", 0.839616)
 if _game_phase_nyugyoku_king_full <= _game_phase_nyugyoku_king_onset:
     _game_phase_nyugyoku_king_full = _game_phase_nyugyoku_king_onset + 1e-6
 _game_phase_hand_ref  = _cfloat(_cfg, "GP_Hand_Ref", 9.278644, lo=1.0)
 _game_phase_promo_ref = _cfloat(_cfg, "GP_Promo_Ref", 5.686510, lo=1.0)
 _game_phase_camp_ref   = _cfloat(_cfg, "GP_Camp_Ref", 7.314302, lo=1.0)
 _game_phase_scale     = _cfloat(_cfg, "GP_Scale", 1.285300, lo=1e-6)
-_game_phase_w_ply     = float(_cfg.get("GP_W_Ply", 0.524339))
+_game_phase_w_ply     = _cfloat(_cfg, "GP_W_Ply", 0.524339)
 _game_phase_ply_ref   = _cfloat(_cfg, "GP_Ply_Ref", 139.157857, lo=1.0)
 _game_phase_ply_enable = _cfg_bool("GP_Ply_Enable", True)
-_game_phase_w_exposure = float(_cfg.get("GP_W_Exposure", 0.0))
+_game_phase_w_exposure = _cfloat(_cfg, "GP_W_Exposure", 0.0)
 _game_phase_exposure_ref = _cfloat(_cfg, "GP_Exposure_Ref", 12.244777, lo=1.0)
 _game_phase_child_pull = _cfloat(_cfg, "GP_Child_Pull", 0.0, lo=0.0)
 
@@ -5248,9 +5626,7 @@ def _zero_main_fischer_core(active, remaining_ms, inc_ms, resume_inc_ratio):
     return "neutral"
 
 
-
-
-_dl_prefetch_nodes    = max(1, int(_cfg["DL_Prefetch_Nodes"]))
+_dl_prefetch_nodes    = _cint(_cfg, "DL_Prefetch_Nodes", 500, 1)
 
 
 _council_phase_enable       = bool(_cfg["Council_Phase_Enable"])
@@ -5262,7 +5638,7 @@ _opponent_style            = _norm_str(_cfg.get("Opponent_Style", "auto"))
 if _opponent_style not in ("auto", "nnue", "dl", "none"):
     _opponent_style = "auto"
 _opponent_id_min_n               = _cint(_cfg, "OppID_Min_N", 8, lo=1)
-_opponent_id_margin              = _clamp01(float(_cfg.get("OppID_Margin", 0.25)))
+_opponent_id_margin              = _clamp01(_cfloat(_cfg, "OppID_Margin", 0.25))
 _opponent_id_nnue_names   = tuple(p.strip().lower() for p in
                             str(_cfg.get("OppID_NNUE_Names", "")).split(",")
                             if p.strip())
@@ -5275,12 +5651,11 @@ _opponent_id_hybrid_names = tuple(p.strip().lower() for p in
 _draw_ply                  = _cint(_cfg, "Draw_Ply", 0, lo=0)
 
 _dl_prefetch_idp_nodes = (
-    int(_cfg["DL_Prefetch_IDP_Nodes"])
-    if int(_cfg["DL_Prefetch_IDP_Nodes"]) > 0
-    else _params["POLICY_NODES"]
+    _cint(_cfg, "DL_Prefetch_IDP_Nodes", 2228, 0)
+    or _params["POLICY_NODES"]
 )
 
-_move_overhead_ms = max(0, int(_cfg["Move_Overhead_Ms"]))
+_move_overhead_ms = _cint(_cfg, "Move_Overhead_Ms", 200, 0)
 _move_overhead_s = max(0.05, _move_overhead_ms / 1000.0)
 
 _SETOPTION_INT_SPIN = {
@@ -5290,8 +5665,10 @@ _SETOPTION_INT_SPIN = {
     "Fischer_Horizon_Moves":      (0, 99999999, "_fischer_horizon_moves"),
 }
 
-_pv_mate_use_nnue2 = int(_cfg.get("PV_Mate_Use_NNUE2", 0)) != 0
-_pv_mate_use_dl3   = int(_cfg.get("PV_Mate_Use_DL3", 0)) != 0
+_SETOPTION_REGISTRY: dict[str, object] = {}
+
+_pv_mate_use_nnue2 = _cfg_bool("PV_Mate_Use_NNUE2")
+_pv_mate_use_dl3   = _cfg_bool("PV_Mate_Use_DL3")
 if _pv_mate_use_nnue2 or _pv_mate_use_dl3:
     if _pv_mate_use_nnue2 and _pv_mate_use_dl3:
         _pv_mate_source = "both"
@@ -5341,6 +5718,7 @@ class USIEngine:
         self.name   = name
         self.proc   = None
         self._q     = queue.Queue(maxsize=50000)
+        self._q_drop_count = 0
         self._alive = False
         self._send_lock = threading.Lock()
         self._via_shell = False
@@ -5351,11 +5729,15 @@ class USIEngine:
         self._force_stderr = False
         self._last_multipv_sent = None
         self._live_info_cb = None
+        self._live_scored_latest = None
         self.announced_options: set = set()
 
         self._dld_logged: set = set()
         self._go_sent: int = 0
         self._bm_seen: int = 0
+        self._last_ack_gen: int | None = None
+        self._bm_gen: int | None = None
+        self._last_rec: dict | None = None
 
     def start(self):
         if self.proc is not None:
@@ -5387,8 +5769,12 @@ class USIEngine:
             self.announced_options = set()
             self._dld_logged = set()
             self._dyn_threads_last = None
+            self._pvmate_last = None
             self._go_sent = 0
             self._bm_seen = 0
+            self._last_ack_gen = None
+            self._bm_gen = None
+            self._last_rec = None
 
         _popen_kwargs = dict(
             stdin=subprocess.PIPE,
@@ -5507,14 +5893,17 @@ class USIEngine:
     def _reader(self, proc, q):
         try:
             for line in proc.stdout:
-                _ln = line.rstrip("\n")
+                _ln = _parse_usi_line(line.rstrip("\n"))
+                if q.full() and _ln.kind == "info":
+                    self._q_drop_count = getattr(self, "_q_drop_count", 0) + 1
+                    if self._q_drop_count % 1000 == 1:
+                        _flog(f"[{self.name}] reader queue full — "
+                              f"dropped {self._q_drop_count} scoreless "
+                              f"info lines (cumulative)")
+                    continue
                 q.put(_ln)
-                _cb = self._live_info_cb
-                if _cb is not None and _is_scored_info(_ln):
-                    try:
-                        _cb(_ln)
-                    except Exception:
-                        pass
+                if _ln.kind == "scored" and self._live_info_cb is not None:
+                    self._live_scored_latest = _ln
         except Exception as _fe:
             _flog(f"[ignored] {__file__}:1583: {_fe}")
         finally:
@@ -5544,12 +5933,34 @@ class USIEngine:
             _flog(f"[{self.name}] send error: {e}")
 
     def _note_line(self, line):
-        if line is not None and line.startswith("bestmove"):
-            self._bm_seen += 1
+        if line is not None:
+            if line.startswith("bestmove"):
+                with self._send_lock:
+                    self._bm_seen += 1
+                    self._bm_gen = self._last_ack_gen
+                    self._last_ack_gen = None
+            elif line.startswith("info string pyfa_ack "):
+                try:
+                    with self._send_lock:
+                        self._last_ack_gen = int(line.split()[-1])
+                except (ValueError, IndexError):
+                    pass
+            elif line.startswith("info string pyfa_rec "):
+                try:
+                    self._last_rec = json.loads(line[len("info string pyfa_rec "):])
+                except (json.JSONDecodeError, ValueError):
+                    pass
         return line
 
     def bm_is_current(self):
         return self._bm_seen == self._go_sent
+
+    def classify_bestmove(self):
+        if self._bm_gen is None:
+            return "unknown"
+        if self._bm_gen == self._go_sent:
+            return "current"
+        return "stale"
 
     def wait_for(self, keyword, timeout=300.0):
         deadline = time.perf_counter() + timeout
@@ -5613,7 +6024,7 @@ class USIEngine:
         except queue.Empty:
             return ""
 
-    def flush_until_ready(self, timeout=30.0, max_stale_lines=500):
+    def flush_until_ready(self, timeout=30.0, max_stale_lines=500, relay_cb=None):
         if not self._alive or not self.proc or not self.proc.stdin:
             return False
         self.send("isready")
@@ -5654,11 +6065,21 @@ class USIEngine:
                     _dlog(f"[{self.name}] flush_until_ready: drained "
                           f"{_drained_count} stale line(s) before readyok")
                 self._bm_seen = self._go_sent
+                self._last_ack_gen = None
+                self._bm_gen = None
                 return True
+            if relay_cb is not None and ("dl_live_policy " in line or
+                                         "info " in line and " score " in line):
+                try:
+                    relay_cb(line)
+                except Exception:
+                    pass
             _drained_count += 1
             _drained_tail.append(line)
             if len(_drained_tail) > 8:
                 del _drained_tail[0]
+            if _drained_count == 20:
+                _flog(f"[{self.name}] flush_until_ready: drain count >= 20 (WARN)")
 
     def flush_with_stop(self, timeout=30.0, max_stale_lines=500):
         self.send("stop")
@@ -5866,8 +6287,6 @@ class PonderState:
 
 
 
-
-
 @dataclasses.dataclass
 class Dl2RunState:
     invoked          : bool   = False
@@ -6057,6 +6476,7 @@ class Dl1FetchState:
     t_end      : float  = 0.0
     t_lock_wait: float  = 0.0
     cont_changed: bool  = False
+    phase1_done : object = dataclasses.field(default_factory=threading.Event)
 
 
 @dataclasses.dataclass
@@ -6277,14 +6697,8 @@ class EngineConfig:
     time_aggression_margin_k: float = 0.9018
     zmf_resume_inc_ratio: float = 8.0
     book_default_index: int   = 0
-    book_dir: str   = 'book'
-    book_file_name: str   = ''
     book_gote_index: int   = 0
-    book_hash: int   = 512
-    book_path: str   = ''
     book_sente_index: int   = 0
-    book_slowmover: int   = 999
-    book_threads: int   = 1
     dl_1_model_default: str   = 'eval/model.onnx'
     dl_time_min_ms: float = 1844.0
     time_aggression_game_phase_gamma: float = 2.0
@@ -6330,7 +6744,6 @@ class EngineConfig:
     tonshi_guard_movetime_max_s: float = 1.0
     mate_solver_min_ply: int   = 0
     book2_fire_consec: int   = 1
-    book2_consec_max: int   = 1
     book2_default_trust: str   = _TRUST_ADVISORY
     book2_pool_index: int   = 1
     book_council_bias_advisory: float = 2.6
@@ -6383,8 +6796,6 @@ class EngineConfig:
     game_phase_ply_enable: bool  = True
     game_phase_child_pull: float = 0.0
     log_engine_stderr: bool = False
-    log_config:        bool = False
-    log_diagnosis:     bool = False
     log_stats:         bool = True
 
     time_aggression_base:        float = 0.7601
@@ -6575,14 +6986,8 @@ class EngineConfig:
             time_aggression_margin_k = _cfloat(cfg, "Time_Margin_K", 0.9018, lo=0.0),
             zmf_resume_inc_ratio = float(cfg.get("Zero_Main_Fischer_Resume_Inc_Ratio", 8.0)),
             book_default_index = int(cfg.get("Book_Default_Index", _CONFIG_DEFAULTS["Book_Default_Index"])),
-            book_dir = str(cfg["BookDir"]).strip(),
-            book_file_name = str(cfg["BookFile"]).strip(),
             book_gote_index = int(cfg.get("Book_Gote_Index", _CONFIG_DEFAULTS["Book_Gote_Index"])),
-            book_hash = int(cfg.get("Book_Hash", _CONFIG_DEFAULTS["Book_Hash"])),
-            book_path = str(cfg.get("Book_Path", "")).strip(),
             book_sente_index = int(cfg.get("Book_Sente_Index", _CONFIG_DEFAULTS["Book_Sente_Index"])),
-            book_slowmover = int(cfg.get("Book_SlowMover", _CONFIG_DEFAULTS["Book_SlowMover"])),
-            book_threads = int(cfg.get("Book_Threads", _CONFIG_DEFAULTS["Book_Threads"])),
             dl_1_model_default = str(cfg["DL_1_DNN_Model1"]),
             dl_time_min_ms = float(cfg["DL_Time_Min_ms"]),
             time_aggression_game_phase_gamma = _cfloat(cfg, "Time_GP_Gamma", 2.0, lo=0.05),
@@ -6628,7 +7033,6 @@ class EngineConfig:
             mate_solver_council = _dict_bool(cfg, "Mate_Solver_Council", True),
             mate_solver_min_ply = int(cfg["Mate_Solver_Min_Ply"]),
             book2_fire_consec = _cint(cfg, "Book2_Fire_On_Consec", 1, lo=1),
-            book2_consec_max = _cint(cfg, "Book2_Consec", 1, lo=1),
             book2_default_trust = _norm_str(cfg.get("Book2_Default_Trust", _TRUST_ADVISORY)),
             book2_pool_index = int(cfg.get("Book2_Pool_Index", 1)),
             book_council_bias_advisory = _cfloat(cfg, "Book_Council_Bias_Advisory", 2.6, lo=0.0),
@@ -6684,8 +7088,6 @@ class EngineConfig:
             game_phase_exposure_ref = _cfloat(cfg, "GP_Exposure_Ref", 12.244777, lo=1.0),
             game_phase_child_pull = _cfloat(cfg, "GP_Child_Pull", 0.0, lo=0.0),
             log_engine_stderr = _dict_bool(cfg, "Log_Engine_Stderr", False),
-            log_config        = _dict_bool(cfg, "Log_Config", False),
-            log_diagnosis     = _dict_bool(cfg, "Log_Diagnosis", True),
             log_stats         = _dict_bool(cfg, "Log_Stats", True),
             time_aggression_base = _cfloat(cfg, "Time_Aggression", 0.7601, 0.0, _TA_CEIL),
             policy_nodes_per_eff_s = float(cfg.get("POLICY_NODES_Per_Eff_S", 495)),
@@ -6949,13 +7351,15 @@ def _sbk_load_book(path: str):
 
     _SBK_BOOK_CACHE[abspath] = (sig, position_dict)
     try:
-        with open(cache_path, "w", encoding="utf-8") as cf:
-            json.dump({
-                "mtime_ns": st.st_mtime_ns,
-                "size": st.st_size,
-                "source": os.path.basename(abspath),
-                "positions": position_dict,
-            }, cf, ensure_ascii=False)
+        _sbk_cache_data = {
+            "mtime_ns": st.st_mtime_ns,
+            "size": st.st_size,
+            "source": os.path.basename(abspath),
+            "positions": position_dict,
+        }
+        _atomic_write_file(cache_path,
+                           lambda f: json.dump(_sbk_cache_data, f, ensure_ascii=False),
+                           label="bookloader-sbk-cache")
         _flog(f"[bookloader-sbk] ディスクキャッシュ書込 path={cache_path!r}")
     except Exception as e:
         _flog(f"[bookloader-sbk] ディスクキャッシュ書込失敗 (無視して続行): {e}")
@@ -7118,13 +7522,15 @@ def _db_load_book(path: str):
 
     _DB_BOOK_CACHE[abspath] = (sig, pd)
     try:
-        with open(cache_path, "w", encoding="utf-8") as cf:
-            json.dump({
-                "mtime_ns": stt.st_mtime_ns,
-                "size": stt.st_size,
-                "source": os.path.basename(abspath),
-                "positions": pd,
-            }, cf, ensure_ascii=False)
+        _db_cache_data = {
+            "mtime_ns": stt.st_mtime_ns,
+            "size": stt.st_size,
+            "source": os.path.basename(abspath),
+            "positions": pd,
+        }
+        _atomic_write_file(cache_path,
+                           lambda f: json.dump(_db_cache_data, f, ensure_ascii=False),
+                           label="bookloader-db-cache")
         _flog(f"[bookloader-db] ディスクキャッシュ書込 path={cache_path!r}")
     except Exception as e:
         _flog(f"[bookloader-db] ディスクキャッシュ書込失敗 (無視): {e}")
@@ -7201,6 +7607,23 @@ def _book_apply_file(ctx, which: str, idx: int, book_file: str, *, send_isready:
             _flog(f"{log_tag} db 切替成功 path={book_file!r} positions={len(position_dict)} "
                   f"index={idx} trust={st.trust!r} mode={_db_pool_select_mode(idx)} "
                   f"eval_diff={_db_pool_eval_diff(idx)} ply_range={_db_pool_ply_range(idx)}")
+            _HAND_ORDER = "RBGSNLPrbgsnlp"
+            _bad_hand = 0
+            for _hk in list(position_dict.keys())[:100]:
+                _hp = _hk.split()
+                if len(_hp) >= 3 and _hp[2] != "-":
+                    _hi = -1
+                    for _hc in _hp[2]:
+                        if _hc.isdigit():
+                            continue
+                        _hj = _HAND_ORDER.find(_hc)
+                        if _hj < 0 or _hj < _hi:
+                            _bad_hand += 1
+                            break
+                        _hi = _hj
+            if _bad_hand:
+                _flog(f"[BOOK-DB][WARN] 非正準持駒順キーが {_bad_hand}/100 件 "
+                      f"(FlippedBook 偽陰性の恐れ) path={book_file!r}")
         st.db_pool_index = idx
         st.sbk_position_dict = None
         return True
@@ -7211,7 +7634,7 @@ def _book_apply_file(ctx, which: str, idx: int, book_file: str, *, send_isready:
         _flog(f"{log_tag} BookFile 差し替えスキップ — 子エンジン不在/死亡 (book_file={book_file!r})。")
         return False
     try:
-        eng.send(f"setoption name BookFile value {book_file}")
+        eng.setoption("BookFile", book_file)
         if send_isready:
             eng.send("isready")
             if eng.wait_for("readyok", timeout=30) is None:
@@ -7322,7 +7745,19 @@ def _book_resolve_file(index: int) -> str:
             and not os.path.isabs(f)
             and "/" not in f and "\\" not in f
             and _book_dir and os.path.isabs(_book_dir)):
-        f = os.path.join(_book_dir, f)
+        direct = os.path.join(_book_dir, f)
+        if os.path.isfile(direct):
+            f = direct
+        else:
+            ext = os.path.splitext(f)[1].lstrip(".").lower()
+            if ext:
+                sub = os.path.join(_book_dir, ext, f)
+                if os.path.isfile(sub):
+                    f = sub
+                else:
+                    f = direct
+            else:
+                f = direct
     return f
 
 
@@ -7553,7 +7988,16 @@ def _db_probe_position(st, position_cmd: str):
     if not pd:
         return (False, None)
     try:
-        key = _book_key_from_sfen(_board_for_position(position_cmd).sfen())
+        _lbk = _LIVE_BOOK_KEY
+        if _lbk[0] == position_cmd and _lbk[1]:
+            key = _lbk[1]
+        else:
+            key = _book_key_from_sfen(_board_for_position(position_cmd).sfen())
+        if _LIVE_BOOK_KEY_VERIFY and _lbk[0] == position_cmd and _lbk[1]:
+            _ref_key = _book_key_from_sfen(_board_for_position(position_cmd).sfen())
+            if key != _ref_key:
+                _flog(f"[BOOK-KEY][WARN] cached != rebuilt key={key!r} ref={_ref_key!r}")
+                key = _ref_key
     except Exception as e:
         _flog(f"[bookloader-db] 局面復元失敗 (定跡切れ扱い): {e}")
         return (False, None)
@@ -7609,7 +8053,16 @@ def _sbk_probe_position(st, position_cmd: str):
     if not pd:
         return (False, None)
     try:
-        key = _book_key_from_sfen(_board_for_position(position_cmd).sfen())
+        _lbk = _LIVE_BOOK_KEY
+        if _lbk[0] == position_cmd and _lbk[1]:
+            key = _lbk[1]
+        else:
+            key = _book_key_from_sfen(_board_for_position(position_cmd).sfen())
+        if _LIVE_BOOK_KEY_VERIFY and _lbk[0] == position_cmd and _lbk[1]:
+            _ref_key = _book_key_from_sfen(_board_for_position(position_cmd).sfen())
+            if key != _ref_key:
+                _flog(f"[BOOK-KEY][WARN] cached != rebuilt key={key!r} ref={_ref_key!r}")
+                key = _ref_key
     except Exception as e:
         _flog(f"[bookloader-sbk] 局面復元失敗 (定跡切れ扱い): {e}")
         return (False, None)
@@ -7889,6 +8342,7 @@ class EngineContext:
         "revive",
         "current_position", "endgame_mode",
         "csa_board",
+        "_current_csa_game",
         "game_log", "game_meta",
         "nnue_root_history",
         "nnue_health",
@@ -7900,10 +8354,11 @@ class EngineContext:
         "book2", "book2_state",
         "mate_pv", "mate_pv_base_position",
         "_mate_ponder_thread", "_mate_ponder_cancel", "_mate_ponder_pos", "_mate_ponder_result",
-        "_mate_go_mate_ok", "_mate_go_mate_silent",
+        "_mate_go_mate_ok", "_mate_go_mate_silent", "_mate_go_active",
         "_mate_nomate_cache", "_mate_cache_hits",
         "_zyfamate", "_zyfamate_has_tsumero", "_zyfamate_has_tesuki",
         "_original_fv_scale",
+        "_pvmate_pending",
     )
 
     def __init__(self, dl_1, nnue_1, dl_2, nnue_2,
@@ -7948,6 +8403,7 @@ class EngineContext:
         self._mate_ponder_cancel = None
         self._mate_ponder_pos    = None
         self._mate_ponder_result = None
+        self._mate_go_active     = False
         self._mate_go_mate_ok     = None
         self._mate_go_mate_silent = 0
         self._mate_nomate_cache   = None
@@ -7956,6 +8412,7 @@ class EngineContext:
         self._zyfamate_has_tsumero = _zyfamate_has_tsumero
         self._zyfamate_has_tesuki = _zyfamate_has_tesuki
         self._original_fv_scale   = None
+        self._pvmate_pending      = None
 
     def reset_game(self):
         self.current_position        = "position startpos"
@@ -7981,6 +8438,7 @@ class EngineContext:
         self.mate_pv               = []
         self.mate_pv_base_position = ""
         self._original_fv_scale = None
+        self._pvmate_pending = None
         _sr_ja_empty_seen.clear()
 
 def _extract_clock_sides(go_line, move_count):
@@ -8488,6 +8946,8 @@ def _calc_dl_2_time_margin_ms(eff_s: float, model_mb: float,
 
 _LIVE_BOARD = (None, None)
 _LIVE_BOARD_VERIFY = False
+_LIVE_BOOK_KEY = (None, None)
+_LIVE_BOOK_KEY_VERIFY = False
 
 
 def _parse_position_moves(position_cmd: str):
@@ -8500,16 +8960,26 @@ def _parse_position_moves(position_cmd: str):
     return " ".join(toks), []
 
 
+def _extend_board(old_pos, old_board, new_pos):
+    try:
+        ob, om = _parse_position_moves(old_pos)
+        nb, nm = _parse_position_moves(new_pos)
+        if ob == nb and len(om) <= len(nm) and nm[:len(om)] == om:
+            b = old_board.clone()
+            for m in nm[len(om):]:
+                b.apply_usi(m)
+            return b
+    except Exception:
+        pass
+    return None
+
+
 def _advance_live_board(pos: str) -> "ShogiBoard":
     old_pos, old_board = _LIVE_BOARD
     if old_board is not None and old_pos:
-        old_base, old_moves = _parse_position_moves(old_pos)
-        new_base, new_moves = _parse_position_moves(pos)
-        if old_base == new_base and len(old_moves) <= len(new_moves) and new_moves[:len(old_moves)] == old_moves:
-            b = old_board.clone()
-            for m in new_moves[len(old_moves):]:
-                b.apply_usi(m)
-            return b
+        ext = _extend_board(old_pos, old_board, pos)
+        if ext is not None:
+            return ext
     return ShogiBoard(sfen=pos, track_history=False)
 
 
@@ -8525,8 +8995,12 @@ def _set_current_position(ctx, pos: str) -> None:
                 _flog(f"[UNIFIED-BOARD][WARN] incremental != rebuild for {pos!r} — "
                       f"rebuild を採用")
                 new_board = _ref
-        global _LIVE_BOARD
+        global _LIVE_BOARD, _LIVE_BOOK_KEY
         _LIVE_BOARD = (pos, new_board)
+        try:
+            _LIVE_BOOK_KEY = (pos, _book_key_from_sfen(new_board.sfen()))
+        except Exception:
+            _LIVE_BOOK_KEY = (None, None)
         try:
             _zenrei_live_push(new_board)
         except Exception:
@@ -8544,6 +9018,16 @@ def _board_for_position(position_cmd: str) -> "ShogiBoard":
     live = _LIVE_BOARD
     if live[0] == position_cmd and live[1] is not None:
         return live[1]
+    if live[1] is not None and live[0]:
+        ext = _extend_board(live[0], live[1], position_cmd)
+        if ext is not None:
+            if _LIVE_BOARD_VERIFY:
+                _ref = ShogiBoard(sfen=position_cmd, track_history=False)
+                if ext.sfen() != _ref.sfen():
+                    _flog(f"[VBOARD][WARN] extend != rebuild for {position_cmd!r} — "
+                          f"rebuild を採用")
+                    return _ref
+            return ext
     return _board_for_position_cached(position_cmd)
 
 
@@ -8600,7 +9084,6 @@ def _calc_state_phase(WHAND: int, PROMO: int, CAMP: int, KING: float,
 
     game_phase = game_phase_core + nyugyoku_bonus
     return _clamp(game_phase, 0.0, 1.5)
-
 
 
 _GAME_PHASE_NYUGYOKU_BAND_WIDTH = 0.5
@@ -9126,6 +9609,10 @@ def _council_vote(dl_top, dl_2_top, nnue_top, ply=0,
 _CSM_WR_SLOPE = 0.004
 _CSM_TIGHTNESS_SLOPE = math.log(3) / 25.0
 _CSM_INSTABILITY_SLOPE = math.log(3) / 30.0
+_CSM_DQ_BASE      = 0.40
+_CSM_DQ_PER_DEPTH = 0.03
+_CSM_DQ_MIN       = 0.55
+_CSM_DQ_MAX       = 1.00
 
 _REGIME_EMA_ALPHA               = 0.20
 _REGIME_CRUISE_THRESHOLD        = 0.65
@@ -9218,6 +9705,13 @@ def _compute_confidence(winner, dl_top, dl_2_top, nnue_top, nnue_score_cp,
     return 0.50 * agreement + 0.25 * dl_certainty + 0.25 * ease
 
 
+def _compute_depth_quality(nnue_depth):
+    if not nnue_depth:
+        return _CSM_DQ_MAX
+    return _clamp(_CSM_DQ_BASE + nnue_depth * _CSM_DQ_PER_DEPTH,
+                  _CSM_DQ_MIN, _CSM_DQ_MAX)
+
+
 def _compute_sharpness(*, dl_spread_cp=None, dl_gap_cp=None,
                         dl_top=None, nnue_top=None, nnue_score_cp=None,
                         score_gap_dl_nnue=None):
@@ -9288,6 +9782,9 @@ def _apply_csm_and_regime(ctx, nnue_info, final_move, *,
             final_move, dl_top, dl_2_top, nnue_top, nnue_score_cp,
             dl_gap_cp=dl_gap_cp, dl_spread_cp=dl_spread_cp,
             time_aggression_ratio=ta_ratio)
+        _dq = _compute_depth_quality(nnue_info.get("depth"))
+        nnue_info["depth_quality"]  = _dq
+        nnue_info["confidence_dq"] = _clamp01(nnue_info["confidence"] * _dq)
         nnue_info["sharpness"] = _compute_sharpness(
             dl_spread_cp=dl_spread_cp, dl_gap_cp=dl_gap_cp,
             dl_top=_sharp_dl, nnue_top=nnue_top,
@@ -9333,6 +9830,60 @@ _RE_WINC         = re.compile(r"winc\s+(\d+)")
 _RE_BYOYOMI      = re.compile(r"byoyomi\s+(\d+)")
 _RE_SETOPTION    = re.compile(r"setoption name (\S+) value (.+)")
 _RE_SFEN_STM     = re.compile(r"\bsfen\s+\S+\s+([bw])\b")
+_RE_MULTIPV      = re.compile(r"\bmultipv\s+(\d+)")
+
+
+class UsiLine(str):
+    __slots__ = ("depth", "seldepth", "score_cp", "mate", "pv", "multipv",
+                 "nodes", "bestmove", "ponder_move", "kind")
+
+
+def _parse_usi_line(ln: str) -> UsiLine:
+    o = UsiLine(ln)
+    o.depth = o.seldepth = o.score_cp = o.mate = o.pv = None
+    o.multipv = o.nodes = o.bestmove = o.ponder_move = None
+
+    if ln.startswith("bestmove"):
+        o.kind = "bestmove"
+        _bm = _RE_BESTMOVE.match(ln)
+        if _bm:
+            o.bestmove = _bm.group(1)
+        _pm = _RE_BESTMOVE_PONDER.match(ln)
+        if _pm:
+            o.ponder_move = _pm.group(1)
+        return o
+
+    if not ln.startswith("info"):
+        o.kind = "proto" if ("readyok" in ln or "usiok" in ln) else "other"
+        return o
+
+    if "depth" in ln and "score" in ln:
+        o.kind = "scored"
+        _dm = _RE_DEPTH.search(ln)
+        if _dm:
+            o.depth = int(_dm.group(1))
+        _sdm = _RE_SELDEPTH.search(ln)
+        if _sdm:
+            o.seldepth = int(_sdm.group(1))
+        _sm = _RE_SCORE_CP.search(ln)
+        if _sm:
+            o.score_cp = int(_sm.group(1))
+        _mm = _RE_MATE.search(ln)
+        if _mm:
+            o.mate = int(_mm.group(1))
+        _pv = _RE_PV_FULL.search(ln)
+        if _pv:
+            o.pv = _pv.group(1)
+        _mpv = _RE_MULTIPV.search(ln)
+        if _mpv:
+            o.multipv = int(_mpv.group(1))
+        _nm = _RE_NODES.search(ln)
+        if _nm:
+            o.nodes = int(_nm.group(1))
+    else:
+        o.kind = "info"
+
+    return o
 
 
 def _run_dl_1_search(dl_1, position_cmd, n, nodes, timeout,
@@ -9343,7 +9894,7 @@ def _run_dl_1_search(dl_1, position_cmd, n, nodes, timeout,
         return {}, {}, {}, {}, False
 
     if dl_1._last_multipv_sent != n:
-        dl_1.send(f"setoption name MultiPV value {n}")
+        dl_1.setoption("MultiPV", n)
         dl_1._last_multipv_sent = n
 
     dl_1.send(position_cmd)
@@ -9365,10 +9916,10 @@ def _run_dl_1_search(dl_1, position_cmd, n, nodes, timeout,
     _wall_start = time.perf_counter()
     _lp_last_emit = 0.0
     for line in dl_1.iter_until("bestmove", timeout=_search_timeout):
-        if "bestmove" in line:
+        if line.kind == "bestmove":
             _got_bestmove = True
-        mm = _RE_MATE.search(line)
-        if mm and int(mm.group(1)) > 0:
+        _mate_n = line.mate
+        if _mate_n is not None and _mate_n > 0:
             mate_detected = True
 
         if not _early_stop_sent and not mate_detected:
@@ -9385,42 +9936,31 @@ def _run_dl_1_search(dl_1, position_cmd, n, nodes, timeout,
                 except Exception as _fe:
                     _flog(f"[ignored] {__file__}: wallclock stop: {_fe}")
             else:
-                nm = _RE_NODES.search(line)
-                if nm and int(nm.group(1)) >= nodes:
+                if line.nodes is not None and line.nodes >= nodes:
                     try:
                         dl_1.send("stop")
                         _early_stop_sent = True
                     except Exception as _fe:
                         _flog(f"[ignored] {__file__}:3261: {_fe}")
 
-        if "multipv" not in line or " pv " not in line:
-            if " pv " not in line or not line.startswith("info"):
-                continue
+        if line.pv is None:
+            continue
 
-        score = 0
-        sm = _RE_SCORE_CP.search(line)
-        if sm:
-            score = int(sm.group(1))
-        if mm:
-            score = _mate_sign_score(int(mm.group(1)))
+        score = line.score_cp if line.score_cp is not None else 0
+        if _mate_n is not None:
+            score = _mate_sign_score(_mate_n)
 
+        _pv_toks = line.pv.split()
+        if not _pv_toks:
+            continue
+        root_move = _pv_toks[0]
         if collect_extended:
-            pv_m = _RE_PV_FULL.search(line)
-            if not pv_m:
-                continue
-            pv_moves = pv_m.group(1).split()
-            root_move = pv_moves[0]
-        else:
-            pv_m = _RE_PV_FIRST.search(line)
-            if not pv_m:
-                continue
-            root_move = pv_m.group(1)
+            pv_moves = _pv_toks
 
         moves_scores[root_move] = score
 
         if collect_extended:
-            dm = _RE_DEPTH.search(line)
-            depth = int(dm.group(1)) if dm else 0
+            depth = line.depth if line.depth is not None else 0
             if live_depth_holder is not None:
                 live_depth_holder[0] = (root_move, depth)
             score_hist.setdefault(root_move, []).append((depth, score))
@@ -9453,7 +9993,7 @@ def _run_dl_3_search(dl_3, position_cmd, n, movetime_ms, timeout,
         return {}, {}, {}, {}, False
 
     if dl_3._last_multipv_sent != n:
-        dl_3.send(f"setoption name MultiPV value {n}")
+        dl_3.setoption("MultiPV", n)
         dl_3._last_multipv_sent = n
 
     dl_3.send(position_cmd)
@@ -9469,41 +10009,31 @@ def _run_dl_3_search(dl_3, position_cmd, n, movetime_ms, timeout,
     _DRAIN_ALLOWANCE_S = min(2.0, eff_s * 0.2) if eff_s is not None else 2.0
 
     for line in dl_3.iter_until("bestmove", timeout=timeout):
-        if "bestmove" in line:
+        if line.kind == "bestmove":
             _got_bestmove = True
 
-        mm = _RE_MATE.search(line)
-        if mm and int(mm.group(1)) > 0:
+        _mate_n = line.mate
+        if _mate_n is not None and _mate_n > 0:
             mate_detected = True
 
-        if "multipv" not in line or " pv " not in line:
-            if " pv " not in line or not line.startswith("info"):
-                continue
+        if line.pv is None:
+            continue
 
-        score = 0
-        sm = _RE_SCORE_CP.search(line)
-        if sm:
-            score = int(sm.group(1))
-        if mm:
-            score = _mate_sign_score(int(mm.group(1)))
+        score = line.score_cp if line.score_cp is not None else 0
+        if _mate_n is not None:
+            score = _mate_sign_score(_mate_n)
 
+        _pv_toks = line.pv.split()
+        if not _pv_toks:
+            continue
+        root_move = _pv_toks[0]
         if collect_extended:
-            pv_m = _RE_PV_FULL.search(line)
-            if not pv_m:
-                continue
-            pv_moves = pv_m.group(1).split()
-            root_move = pv_moves[0]
-        else:
-            pv_m = _RE_PV_FIRST.search(line)
-            if not pv_m:
-                continue
-            root_move = pv_m.group(1)
+            pv_moves = _pv_toks
 
         moves_scores[root_move] = score
 
         if collect_extended:
-            dm = _RE_DEPTH.search(line)
-            depth = int(dm.group(1)) if dm else 0
+            depth = line.depth if line.depth is not None else 0
             score_hist.setdefault(root_move, []).append((depth, score))
             if depth > depth_best.get(root_move, -1):
                 depth_best[root_move] = depth
@@ -9539,6 +10069,7 @@ def _prefetch_flush(dl_1, label="dl_1", eff_s=None):
                 _pln = dl_1._q.get(block=False)
             except queue.Empty:
                 break
+            dl_1._note_line(_pln)
             if _pln is None:
                 _dlog("[PRE-FLUSH] %s: sentinel during pre-drain (%d lines)"
                       % (label, _pre_drained))
@@ -9565,6 +10096,7 @@ def _prefetch_flush(dl_1, label="dl_1", eff_s=None):
                     break
                 continue
             empty_streak = 0
+            dl_1._note_line(ln)
             if ln is None:
                 _dlog("[PRE-FLUSH] %s: sentinel (engine dead)" % label)
                 break
@@ -9900,6 +10432,7 @@ class Prefetcher:
         self._dl_3_ref    = None
         self._dl_3_shared_lock = None
         self._dl_3_lock   = threading.Lock()
+        self._dl1_ready   = threading.Event()
 
     def start(self, dl_1, position_cmd, n, nodes, timeout=None,
               dl_2=None, dl_2_lock=None,
@@ -9918,6 +10451,7 @@ class Prefetcher:
             self._dl_3_ref    = dl_3 if _eng_alive(dl_3) else None
             self._dl_3_shared_lock = dl_3_lock
             self._generation += 1
+            self._dl1_ready.clear()
             my_gen = self._generation
         _ptimeout = timeout if timeout is not None else (_time_dyn.dl_time_fallback_ms / 1000.0)
 
@@ -9952,6 +10486,7 @@ class Prefetcher:
                 if self._generation == my_gen and self._pos == position_cmd:
                     self._result = r
                     self._src    = "prefetch"
+                    self._dl1_ready.set()
                     _dlog(f"Prefetch done: moves={[mv for mv,_ in policy]} mate={mate} gap={r[2]}")
 
 
@@ -9967,6 +10502,7 @@ class Prefetcher:
                     if self._generation == my_gen and self._pos == position_cmd:
                         self._result = r2
                         self._src    = "prefetch"
+                        self._dl1_ready.set()
                         _dlog(f"Prefetch IDP done: top={r2[0][0][0] if r2[0] else None} nodes={_dl_prefetch_idp_nodes}")
 
             if dl_2 is None or dl_2_lock is None:
@@ -10085,7 +10621,7 @@ class Prefetcher:
             try:
                 if _ranked and len(_ranked) >= 2:
                     _voi_scores = [sc for _, sc in _ranked[:_top_n]]
-                    _voi_norm = float(_cfg.get("Voi_Norm_Cp", 600)) or 600.0
+                    _voi_norm = _cfloat(_cfg, "Voi_Norm_Cp", 600) or 600.0
                     _pf_max_voi = _clamp((max(_voi_scores) - min(_voi_scores)) / _voi_norm, 0.0, 1.0)
                 else:
                     _pf_max_voi = 0.0
@@ -10096,7 +10632,7 @@ class Prefetcher:
             )
             _park_nodes = _root_park_budget_core(
                 _cfg_park_nodes, _pf_max_voi,
-                float(_cfg.get("Root_Park_VOI_Scale", 0.0)),
+                _cfloat(_cfg, "Root_Park_VOI_Scale", 0.0),
             )
             if _park_nodes != _cfg_park_nodes:
                 _dlog(f"[PF-2] ROOT-PARK nodes adjusted: {_cfg_park_nodes} -> {_park_nodes} (voi={_pf_max_voi:.3f})")
@@ -10177,6 +10713,7 @@ class Prefetcher:
             self._pos    = position_cmd
             self._result = result
             self._src    = "ponder"
+            self._dl1_ready.set()
 
     def inject_dl_2(self, position_cmd, result):
         with self._lock:
@@ -10282,24 +10819,15 @@ def _make_dl1_multipv_cb(ctx, pos):
     def _cb(ln, _ctx=ctx):
         if _ctx.current_position != pos:
             return
-        if " pv " not in ln:
+        if not ln.pv:
             return
-        _pm = _RE_PV_FULL.search(ln)
-        if not _pm:
-            return
-        _root = _pm.group(1).split()[0]
+        _root = ln.pv.split()[0]
         if _pb is not None and not _bestmove_is_for_board(_root, _pb):
             return
-        _sc = 0
-        _sm = _RE_SCORE_CP.search(ln)
-        if _sm:
-            _sc = int(_sm.group(1))
-        else:
-            _mm = _RE_MATE.search(ln)
-            if _mm:
-                _sc = _mate_sign_score(int(_mm.group(1)))
-        _dm = _RE_DEPTH.search(ln)
-        _dep = int(_dm.group(1)) if _dm else 0
+        _sc = ln.score_cp if ln.score_cp is not None else 0
+        if _sc == 0 and ln.mate is not None:
+            _sc = _mate_sign_score(ln.mate)
+        _dep = ln.depth if ln.depth is not None else 0
         _prev = _scores.get(_root)
         if _prev is None or _dep >= _prev[1]:
             _scores[_root] = (_sc, _dep)
@@ -10311,7 +10839,8 @@ def _make_dl1_multipv_cb(ctx, pos):
             if _now - _last_emit[0] >= 0.25:
                 _last_emit[0] = _now
                 try:
-                    print("info string dl_live_policy "
+                    _tag = _pos_hash8(pos)
+                    print("info string dl_live_policy %s " % _tag
                           + json.dumps([(m, round(float(sc), 4))
                                         for m, sc in _pol[:10]]), flush=True)
                 except Exception:
@@ -10466,28 +10995,21 @@ def relay_until_bestmove(eng, timeout=120, intercept_bestmove=False,
                     if not _stop_out:
                         continue
                     _lines_read += 1
-                    if _is_scored_info(_stop_out):
+                    if getattr(_stop_out, 'kind', None) == "scored":
                         nnue_info["scored_info_seen"] = True
-                        dm2 = _RE_DEPTH.search(_stop_out)
-                        d2 = int(dm2.group(1)) if dm2 else 0
+                        d2 = _stop_out.depth or 0
                         if d2 > _best_depth:
                             _best_depth = d2
-                            sm2 = _RE_SCORE_CP.search(_stop_out)
-                            if sm2:
-                                nnue_info["score_cp"] = int(sm2.group(1))
-                            else:
-                                mm2 = _RE_MATE.search(_stop_out)
-                                if mm2:
-                                    nnue_info["score_cp"] = _mate_sign_score(int(mm2.group(1)))
-                                    nnue_info["mate_ply"] = int(mm2.group(1))
+                            if _stop_out.score_cp is not None:
+                                nnue_info["score_cp"] = _stop_out.score_cp
+                            elif _stop_out.mate is not None:
+                                nnue_info["score_cp"] = _mate_sign_score(_stop_out.mate)
+                                nnue_info["mate_ply"] = _stop_out.mate
                             nnue_info["depth"] = d2
-                            if full_pv_holder is not None and " pv " in _stop_out:
-                                _fpv2 = _RE_PV_FULL.search(_stop_out)
-                                if _fpv2:
-                                    _fpv2_str = _fpv2.group(1)
-                                    _old_pv = full_pv_holder[0]
-                                    if _old_pv is None or len(_fpv2_str) >= len(_old_pv):
-                                        full_pv_holder[0] = _fpv2_str
+                            if full_pv_holder is not None and _stop_out.pv is not None:
+                                _old_pv = full_pv_holder[0]
+                                if _old_pv is None or len(_stop_out.pv) >= len(_old_pv):
+                                    full_pv_holder[0] = _stop_out.pv
                     if not intercept_bestmove and not _stop_out.startswith("bestmove"):
                         if not _suppress_info_print:
                             try:
@@ -10587,39 +11109,28 @@ def relay_until_bestmove(eng, timeout=120, intercept_bestmove=False,
             continue
         _lines_read += 1
 
-        if _is_scored_info(out):
+        if getattr(out, 'kind', None) == "scored":
             nnue_info["scored_info_seen"] = True
-            dm = _RE_DEPTH.search(out)
-            d  = int(dm.group(1)) if dm else 0
+            d = out.depth or 0
             _cur_score = nnue_info["score_cp"]
             _cur_mate_ply = None
-            sm = _RE_SCORE_CP.search(out)
-            if sm:
-                _cur_score = int(sm.group(1))
-            else:
-                mm = _RE_MATE.search(out)
-                if mm:
-                    _cur_mate_ply = int(mm.group(1))
-                    _cur_score = _mate_sign_score(_cur_mate_ply)
+            if out.score_cp is not None:
+                _cur_score = out.score_cp
+            elif out.mate is not None:
+                _cur_mate_ply = out.mate
+                _cur_score = _mate_sign_score(_cur_mate_ply)
             if d > _best_depth:
                 _best_depth = d
                 nnue_info["score_cp"] = _cur_score
                 if _cur_mate_ply is not None:
                     nnue_info["mate_ply"] = _cur_mate_ply
                 nnue_info["depth"] = d
-                sdm = _RE_SELDEPTH.search(out)
-                if sdm:
-                    nnue_info["seldepth"] = int(sdm.group(1))
-                if full_pv_holder is not None and " pv " in out:
-                    _fpv = _RE_PV_FULL.search(out)
-                    if _fpv:
-                        full_pv_holder[0] = _fpv.group(1)
+                if out.seldepth is not None:
+                    nnue_info["seldepth"] = out.seldepth
+                if full_pv_holder is not None and out.pv is not None:
+                    full_pv_holder[0] = out.pv
             if live_info_cb is not None:
-                _pv_for_cb = None
-                if " pv " in out:
-                    _fpv_cb = _RE_PV_FULL.search(out)
-                    if _fpv_cb:
-                        _pv_for_cb = _fpv_cb.group(1).split()
+                _pv_for_cb = out.pv.split() if out.pv is not None else None
                 try:
                     live_info_cb(_cur_score, d, _pv_for_cb)
                 except Exception:
@@ -10633,35 +11144,30 @@ def relay_until_bestmove(eng, timeout=120, intercept_bestmove=False,
                 nnue_info["book_info_seen"] = True
 
         if (partial_pv_holder is not None or partial_pv_depth_holder is not None) \
-                and out.startswith("info") and " pv " in out:
-            pv_match = _RE_PV_FIRST.search(out)
-            if pv_match:
-                _pv_head_move = pv_match.group(1)
-                if partial_pv_holder is not None:
-                    partial_pv_holder[0] = _pv_head_move
-                if partial_pv_depth_holder is not None:
-                    _dm = _RE_DEPTH.search(out)
-                    _depth_tuple = (
-                        _pv_head_move,
-                        int(_dm.group(1)) if _dm else 0,
-                    )
-                    if pv_head_lock is not None:
-                        with pv_head_lock:
-                            partial_pv_depth_holder[0] = _depth_tuple
-                    else:
+                and getattr(out, 'pv', None) is not None:
+            _pv_head_move = out.pv.split(None, 1)[0]
+            if partial_pv_holder is not None:
+                partial_pv_holder[0] = _pv_head_move
+            if partial_pv_depth_holder is not None:
+                _depth_tuple = (
+                    _pv_head_move,
+                    out.depth or 0,
+                )
+                if pv_head_lock is not None:
+                    with pv_head_lock:
                         partial_pv_depth_holder[0] = _depth_tuple
-                if pv_head_event is not None:
-                    pv_head_event.set()
+                else:
+                    partial_pv_depth_holder[0] = _depth_tuple
+            if pv_head_event is not None:
+                pv_head_event.set()
 
-        if out.startswith("bestmove"):
+        if getattr(out, 'kind', None) == "bestmove":
             nnue_info["relay_elapsed_s"] = time.perf_counter() - _t_start
-            bm = _RE_BESTMOVE.match(out)
-            if bm:
-                nnue_info["bestmove"] = bm.group(1)
-            pm = _RE_BESTMOVE_PONDER.match(out)
-            if pm:
-                ponder_move = pm.group(1)
-                nnue_info["ponder"] = pm.group(1)
+            if out.bestmove:
+                nnue_info["bestmove"] = out.bestmove
+            if out.ponder_move:
+                ponder_move = out.ponder_move
+                nnue_info["ponder"] = out.ponder_move
             eng._empty_relay_streak = 0
             _flog(
                 "relay_until_bestmove: bestmove received"
@@ -10684,9 +11190,6 @@ def relay_until_bestmove(eng, timeout=120, intercept_bestmove=False,
                 pass
 
     return ponder_move, nnue_info
-
-
-
 
 
 def _model_size_mb(engine_exe_path, model_relative="eval/model.onnx"):
@@ -10898,7 +11401,7 @@ def _write_game_stats(game_log, game_meta, cfg=None):
     _do_log_stats = cfg.log_stats
     if not _do_log_stats:
         return
-    if os.environ.get("PYFAMATE_DLP_CAL"):
+    if _RUN_MODE is RunMode.DLP_CAL:
         return
     if not game_log:
         return
@@ -11040,7 +11543,7 @@ def _write_game_stats(game_log, game_meta, cfg=None):
                 "Council_Nyugyoku_DL_Restore":        cfg.council_nyugyoku_dl_restore,
                 "MaxMin_Tie_Margin":                  cfg.maxmin_tie_margin,
                 "Multi_Ponder_Enable":                int(_multi_ponder_enable),
-                "SMP_Alt_Min_Gap":                    float(_cfg.get("SMP_Alt_Min_Gap", 0.0)),
+                "SMP_Alt_Min_Gap":                    _cfloat(_cfg, "SMP_Alt_Min_Gap", 0.0),
                 "Score_Stability_Swing_Threshold_Cp": float(cfg.score_stability_swing_threshold_cp),
                 "Score_Stability_Eff_S_Boost":        cfg.score_stability_eff_s_boost,
                 "Score_Stability_GP_Scale_Min":        cfg.score_stability_game_phase_scale_min,
@@ -11099,13 +11602,13 @@ def _write_game_stats(game_log, game_meta, cfg=None):
                 "Council_Score_Discount_Scale":    cfg.council_score_discount_scale,
                 "Council_Score_Discount_Min":      cfg.council_score_discount_min,
                 "Council_Score_Discount_Threshold": cfg.council_score_discount_threshold,
-                "Light_Council_Max_Eff_S":         float(_cfg.get("Light_Council_Max_Eff_S", 3.2674)),
-                "DL_Gap_Lift_Score_Min":           int(_cfg.get("DL_Gap_Lift_Score_Min", 1452)),
-                "DL_Gap_Lift_Spread_Max":          int(_cfg.get("DL_Gap_Lift_Spread_Max", 53)),
-                "GP_Surge_Threshold":              float(_cfg.get("GP_Surge_Threshold", 0.0641)),
-                "GP_Surge_Eff_S_Boost":            float(_cfg.get("GP_Surge_Eff_S_Boost", 1.3129)),
-                "GP_Surge_DL_Weight_Boost":        float(_cfg.get("GP_Surge_DL_Weight_Boost", 1.0574)),
-                "GP_Surge_DL2_Timeout_Boost":      float(_cfg.get("GP_Surge_DL2_Timeout_Boost", 1.1744)),
+                "Light_Council_Max_Eff_S":         _cfloat(_cfg, "Light_Council_Max_Eff_S", 3.2674),
+                "DL_Gap_Lift_Score_Min":           _cint(_cfg, "DL_Gap_Lift_Score_Min", 1452),
+                "DL_Gap_Lift_Spread_Max":          _cint(_cfg, "DL_Gap_Lift_Spread_Max", 53),
+                "GP_Surge_Threshold":              _cfloat(_cfg, "GP_Surge_Threshold", 0.0641),
+                "GP_Surge_Eff_S_Boost":            _cfloat(_cfg, "GP_Surge_Eff_S_Boost", 1.3129),
+                "GP_Surge_DL_Weight_Boost":        _cfloat(_cfg, "GP_Surge_DL_Weight_Boost", 1.0574),
+                "GP_Surge_DL2_Timeout_Boost":      _cfloat(_cfg, "GP_Surge_DL2_Timeout_Boost", 1.1744),
                 "dlp": game_meta.get("dlp_diff", {}),
         }
 
@@ -11222,8 +11725,7 @@ def _init_engine_context() -> "EngineContext":
 
 
 def main():
-    _is_dlponder_cal = bool(os.environ.get("PYFAMATE_DLP_CAL"))
-    if "--spsa-worker" not in sys.argv and not _is_dlponder_cal:
+    if _RUN_MODE not in (RunMode.DLP_CAL, RunMode.SPSA_WORKER):
         _flip_ensure_installed()
     ctx = _init_engine_context()
 
@@ -11243,8 +11745,7 @@ def main():
             pass
 
     atexit.register(_shutdown, ctx, "atexit")
-    _is_spsa_worker = ("--spsa-worker" in sys.argv)
-    if sys.platform == "win32" and not _is_dlponder_cal and not _is_spsa_worker:
+    if sys.platform == "win32" and _RUN_MODE not in (RunMode.DLP_CAL, RunMode.SPSA_WORKER):
         def _wsl_final_sweep():
             try:
                 _r = subprocess.run(["wsl", "-l", "-q"], timeout=3,
@@ -11265,7 +11766,7 @@ def main():
                     pass
         _wsl_final_sweep()
         atexit.register(_wsl_final_sweep)
-    elif sys.platform != "win32" and not _is_dlponder_cal and not _is_spsa_worker:
+    elif sys.platform != "win32" and _RUN_MODE not in (RunMode.DLP_CAL, RunMode.SPSA_WORKER):
         try:
             _posix_orphan_sweep_startup()
         except Exception as _os_e:
@@ -11467,7 +11968,7 @@ def _activate_endgame(ctx, reason, eff_s=None):
                 assert _fv is not None and str(_fv).strip() != "", (
                     "nnue_1 FV_Scale not resolved (config schema drift)")
                 ctx._original_fv_scale = int(_fv)
-                _target.send(f"setoption name FV_Scale value {ctx.cfg.endgame_fv_scale}")
+                _target.setoption("FV_Scale", ctx.cfg.endgame_fv_scale)
                 _flog(f"[ENDGAME 2-1] FV_Scale -> {ctx.cfg.endgame_fv_scale} (endgame promotion)")
         except Exception as _fve:
             _flog(f"[ignored] ENDGAME FV_Scale switch: {_fve}")
@@ -11495,7 +11996,7 @@ def _activate_endgame(ctx, reason, eff_s=None):
         try:
             _promo = _endgame_promotion_opts(_endgame_opts)
             for _pk, _pv in _promo.items():
-                ctx.nnue_1.send(f"setoption name {_pk} value {_pv}")
+                ctx.nnue_1.setoption(_pk, _pv)
             ctx.game_meta["nno_promoted"] = dict(_promo)
             _flog("[NNO-c] nnue_1 promoted in place (DL 休止配当): "
                   + " ".join(f"{k}={v}" for k, v in _promo.items())
@@ -11503,6 +12004,8 @@ def _activate_endgame(ctx, reason, eff_s=None):
         except Exception as e:
             _flog(f"[NNO-c] promotion setoption failed (non-fatal): {e}")
 
+
+    _dl_apply_pv_mate_threads(ctx, f"activate_endgame({reason})", budget_s=eff_s)
 
     _dl_3_try_lazy_warmup_once(ctx, reason, eff_s=eff_s)
 
@@ -11519,10 +12022,12 @@ def _deactivate_endgame(ctx, move_count=None, cur_game_phase=None,
             if _target is not None:
                 _orig_fvs = getattr(ctx, "_original_fv_scale", None)
                 if _orig_fvs is not None:
-                    _target.send(f"setoption name FV_Scale value {_orig_fvs}")
+                    _target.setoption("FV_Scale", _orig_fvs)
                     _flog(f"[ENDGAME 2-1] FV_Scale restored -> {_orig_fvs} (council resume)")
         except Exception as _fve:
             _flog(f"[ignored] ENDGAME FV_Scale restore: {_fve}")
+
+    _dl_apply_pv_mate_threads(ctx, "deactivate_endgame")
 
     _dlog("[MODE] endgame_mode=False (可逆ハンドオーバー) "
           "at ply=%s (cur_game_phase=%s handover_game_phase=%s hys=%s)"
@@ -11542,7 +12047,7 @@ def _deactivate_endgame(ctx, move_count=None, cur_game_phase=None,
                 ctx.ps.active = False
             _restore = _endgame_restore_opts(_nnue_1_opts, _promoted)
             for _rk, _rv in _restore.items():
-                ctx.nnue_1.send(f"setoption name {_rk} value {_rv}")
+                ctx.nnue_1.setoption(_rk, _rv)
             _flog("[NNO-c] nnue_1 promotion restored (可逆ハンドオーバー): "
                   + " ".join(f"{k}={v}" for k, v in _restore.items()))
         except Exception as e:
@@ -11558,6 +12063,11 @@ def _deactivate_endgame(ctx, move_count=None, cur_game_phase=None,
 
 _ACTIVE_BESTMOVE_SINK = None
 _BESTMOVE_IS_INSTANT = False
+_GEN_ACK_ENABLED = os.environ.get("PYFAMATE_GEN_ACK") == "1"
+_REC_EMIT_ENABLED = os.environ.get("PYFAMATE_REC_EMIT") == "1"
+_GO_RECV_GEN = 0
+_BM_SENT_GEN = 0
+_STOP_REARM = False
 _GO_EMITTED = False
 
 
@@ -11639,7 +12149,8 @@ def _safe_bestmove(final_move, ponder_move=None, label="", nnue_info=None):
     if (nnue_info is not None and not _suppress_info_print
             and _ACTIVE_BESTMOVE_SINK is None):
         _parts = []
-        for _mk in ("confidence", "sharpness", "momentum"):
+        for _mk in ("confidence", "confidence_dq", "depth_quality",
+                    "sharpness", "momentum"):
             if _mk in nnue_info:
                 _parts.append(f"{_mk}={nnue_info[_mk]}")
         if _parts:
@@ -11647,6 +12158,19 @@ def _safe_bestmove(final_move, ponder_move=None, label="", nnue_info=None):
                 print(f"info string [Pyfamate] {' '.join(_parts)}", flush=True)
             except OSError:
                 pass
+    global _BM_SENT_GEN, _STOP_REARM
+    if _BM_SENT_GEN == _GO_RECV_GEN and _GO_RECV_GEN > 0 and not _STOP_REARM:
+        _flog(f"[GEN] duplicate bestmove suppressed gen={_GO_RECV_GEN} "
+              f"move={final_move!r}")
+        return final_move, ponder_move
+    if _GEN_ACK_ENABLED:
+        try:
+            print(f"info string pyfa_ack {_GO_RECV_GEN}", flush=True)
+        except OSError:
+            pass
+    _BM_SENT_GEN = _GO_RECV_GEN
+    _STOP_REARM = False
+
     bm_line = f"bestmove {final_move}"
     if ponder_move:
         bm_line += f" ponder {ponder_move}"
@@ -12145,7 +12669,7 @@ def _restart_nnue_impl(ctx, caller, *, slot, readyok_timeout=None, async_launch=
                 if _promo_live:
                     for _pk, _pv in _promo_live.items():
                         try:
-                            eng.send(f"setoption name {_pk} value {_pv}")
+                            eng.setoption(_pk, _pv)
                             opts[_pk] = str(_pv)
                         except Exception as _se:
                             _flog(f"{caller}: NNO-c re-apply {_pk}={_pv} failed: {_se!r}")
@@ -12156,7 +12680,7 @@ def _restart_nnue_impl(ctx, caller, *, slot, readyok_timeout=None, async_launch=
         if slot == "nnue_1":
             try:
                 if ctx.endgame_mode and ctx.cfg.endgame_fv_scale > 0:
-                    eng.send(f"setoption name FV_Scale value {ctx.cfg.endgame_fv_scale}")
+                    eng.setoption("FV_Scale", ctx.cfg.endgame_fv_scale)
                     _flog(f"{caller}: endgame_fv_scale={ctx.cfg.endgame_fv_scale} re-applied to fresh nnue_1")
             except Exception as _fe:
                 _flog(f"{caller}: FV_Scale re-apply failed: {_fe!r}")
@@ -12291,7 +12815,7 @@ def _apply_slow_mover(eng, opts, user_set, label, cfg, eff_s=None, go_clock=None
                                      time_aggression=_time_dyn.time_aggression_nnue_dyn)
     _current_slow = int(opts.get("SlowMover", 185))
     if _dynamic_slow != _current_slow:
-        eng.send(f"setoption name SlowMover value {_dynamic_slow}")
+        eng.setoption("SlowMover", _dynamic_slow)
         opts["SlowMover"] = str(_dynamic_slow)
         _dlog(f"{label} SlowMover updated: {_current_slow} → {_dynamic_slow} "
               f"(eff_s={eff_s:.1f} nnue_dyn={_time_dyn.time_aggression_nnue_dyn:.3f})")
@@ -12320,7 +12844,11 @@ def _consensus_skip_decision_core(dl_top, nnue_top, nnue_depth, min_depth,
 def _dl_2_fetch_thread_fn(p: "Dl2FetchParams", s: "Dl2RunState") -> None:
     if p.cache_miss and p.dl_thread is not None:
         _t_wait_dl1 = time.perf_counter()
-        p.dl_thread.join()
+        if p.dl1_fetch is not None:
+            p.dl1_fetch.phase1_done.wait(
+                timeout=min(30.0, max(5.0, float(p.eff_s or 0.0))))
+        else:
+            p.dl_thread.join(timeout=30.0)
         s.t_wait_dl1_ms = (time.perf_counter() - _t_wait_dl1) * 1000
 
     if p.consensus_skip_enable:
@@ -12348,8 +12876,7 @@ def _dl_2_fetch_thread_fn(p: "Dl2FetchParams", s: "Dl2RunState") -> None:
                 p.consensus_skip_wait_max_ms,
             )
             p.nnue_pv_head_event.wait(timeout=_consensus_wait_ms / 1000.0)
-            with p._nnue_pv_head_lock:
-                _nnue_head          = p.nnue_pv_head_depth_holder[0]
+            _nnue_head = p.nnue_pv_head_depth_holder[0]
             _nnue_top_for_consensus = _nnue_head[0] if _nnue_head else None
             _nnue_depth             = _nnue_head[1] if _nnue_head else 0
 
@@ -12530,7 +13057,8 @@ def _dl_1_fetch_thread_fn(p: "Dl1FetchParams", s: "Dl1FetchState") -> None:
                     pass
             try:
                 _out = [(m, round(float(sc), 4)) for m, sc in _pol[:10]]
-                print("info string dl_live_policy " + json.dumps(_out), flush=True)
+                _ptag = _pos_hash8(_p.position)
+                print("info string dl_live_policy %s " % _ptag + json.dumps(_out), flush=True)
             except Exception:
                 pass
         _raw = fetch_dl_policy(
@@ -12552,10 +13080,13 @@ def _dl_1_fetch_thread_fn(p: "Dl1FetchParams", s: "Dl1FetchState") -> None:
             try:
                 _dl_pol_out = [(m, round(float(s), 4))
                                for m, s in _raw[0][:10]]
-                print("info string dl_live_policy "
+                _ptag2 = _pos_hash8(p.position)
+                print("info string dl_live_policy %s " % _ptag2
                       + json.dumps(_dl_pol_out), flush=True)
             except Exception:
                 pass
+
+    s.phase1_done.set()
 
     if _raw is not None and p.eff_s >= _DL_CONT_MIN_EFF_S and p.ctx.dl_1._alive:
         _ph2_ok = p.ctx.prefetch.dl_1_lock.acquire(timeout=0.1)
@@ -13144,11 +13675,15 @@ def _ponder_arb_worker(ctx, cfg, ponder_pos, pred_z, dl_pred, use_poll,
     try:
         if use_poll:
             r1 = None
+            _poll_deadline = time.perf_counter() + 30.0
             while not stop_event.is_set() and gps.ponder_arb_gen == my_gen:
                 r1 = ctx.prefetch.peek_dl_1(ponder_pos)
                 if r1 is not None:
                     break
-                time.sleep(0.3)
+                if time.perf_counter() >= _poll_deadline:
+                    break
+                ctx.prefetch._dl1_ready.wait(timeout=0.5)
+                ctx.prefetch._dl1_ready.clear()
             if r1 is None or gps.ponder_arb_gen != my_gen:
                 return
             _policy, _mate = r1[0], r1[1]
@@ -13210,7 +13745,7 @@ def _ponder_arb_launch(ctx, ponder_pos):
     if not use_poll and not dl_pred:
         return
     if gps.ponder_arb_thread is not None and gps.ponder_arb_thread.is_alive():
-        gps.ponder_arb_thread.join(timeout=0.5)
+        gps.ponder_arb_thread.join(timeout=0.1)
         if gps.ponder_arb_thread.is_alive():
             _flog("[PREARB-DRAIN] 旧 worker drain 失敗 — 今 cycle の launch を棄権")
             return
@@ -13274,12 +13809,11 @@ def _speculative_arb_worker(ctx, cfg, position_cmd, speculative_arb_dl_ready, sp
                   f"— gap-filter 確定、投機的裁定中止")
             return
 
-        _MAX_WAIT_ROUNDS = 20
+        _MAX_WAIT_S = 10.0
+        _POLL_S = 0.25
         nnue_move = None
-        for _ in range(_MAX_WAIT_ROUNDS):
-            if speculative_arb_stop.is_set():
-                return
-            time.sleep(0.5)
+        _deadline = time.perf_counter() + _MAX_WAIT_S
+        while time.perf_counter() < _deadline:
             if speculative_arb_stop.is_set():
                 return
             if nnue_pv_head_lock is not None:
@@ -13292,6 +13826,8 @@ def _speculative_arb_worker(ctx, cfg, position_cmd, speculative_arb_dl_ready, sp
                 if _depth >= cfg.consensus_skip_min_depth:
                     nnue_move = _mv
                     break
+            nnue_pv_head_event.wait(timeout=_POLL_S)
+            nnue_pv_head_event.clear()
         if not nnue_move or speculative_arb_stop.is_set():
             return
 
@@ -13431,29 +13967,24 @@ def _arb_run_searchmoves(eng, position_cmd, move_a, move_b, movetime_ms,
             return None, meta
         if not out:
             continue
-        if _is_scored_info(out):
-            dm = _RE_DEPTH.search(out)
-            d = int(dm.group(1)) if dm else 0
+        if out.kind == "scored":
+            d = out.depth if out.depth is not None else 0
             if d >= _best_depth:
                 _best_depth = d
-                sm = _RE_SCORE_CP.search(out)
-                if sm:
-                    meta["score_cp"] = int(sm.group(1))
-                else:
-                    mm = _RE_MATE.search(out)
-                    if mm:
-                        meta["score_cp"] = _mate_sign_score(int(mm.group(1)))
+                if out.score_cp is not None:
+                    meta["score_cp"] = out.score_cp
+                elif out.mate is not None:
+                    meta["score_cp"] = _mate_sign_score(out.mate)
                 meta["depth"] = d
                 if live_info_cb is not None:
-                    _pv = out.split(" pv ", 1)[1].split() if " pv " in out else None
+                    _pv = out.pv.split() if out.pv else None
                     try:
                         live_info_cb(meta["score_cp"], d, _pv)
                     except Exception:
                         pass
-        elif out.startswith("bestmove"):
-            bm = _RE_BESTMOVE.match(out)
+        elif out.kind == "bestmove":
             meta["elapsed_ms"] = (time.perf_counter() - _t0) * 1000.0
-            return (bm.group(1) if bm else None), meta
+            return out.bestmove, meta
 
 
 def _council_arbitrate(ctx, position_cmd, nnue_move, dl_move,
@@ -13488,13 +14019,12 @@ def _council_arbitrate(ctx, position_cmd, nnue_move, dl_move,
             and _eng_alive(ctx.nnue_1)):
         _nnue1_std = str(_nnue_1_opts.get("Threads", "8"))
         try:
-            ctx.nnue_1.send(
-                f"setoption name Threads value {cfg.arb1_nnue1_burst_threads}")
+            ctx.nnue_1.setoption("Threads", cfg.arb1_nnue1_burst_threads)
             _thr_restore = _nnue1_std
         except Exception as _te:
             _flog(f"[ARB-THR] throttle failed (ignored): {_te}")
         try:
-            eng.send(f"setoption name Threads value {_nnue1_std}")
+            eng.setoption("Threads", _nnue1_std)
             _n2_handoff = True
             _dlog(f"[ARB-THR] thread handoff: nnue_1→"
                   f"{cfg.arb1_nnue1_burst_threads} nnue_2→{_nnue1_std}")
@@ -13507,12 +14037,12 @@ def _council_arbitrate(ctx, position_cmd, nnue_move, dl_move,
     finally:
         if _n2_handoff:
             try:
-                eng.send("setoption name Threads value 1")
+                eng.setoption("Threads", 1)
             except Exception as _te:
                 _flog(f"[ARB-THR] nnue_2 idle-posture restore failed: {_te}")
         if _thr_restore is not None:
             try:
-                ctx.nnue_1.send(f"setoption name Threads value {_thr_restore}")
+                ctx.nnue_1.setoption("Threads", _thr_restore)
                 _dlog(f"[ARB-THR] handoff reversed: nnue_2→1 "
                       f"nnue_1→{_thr_restore}")
             except Exception as _te:
@@ -13967,6 +14497,8 @@ _MOVE_RECORD_DEFAULTS = {
     "ponder_move_agreement":  None,
     "ponder_prefetch_corr":   None,
     "confidence":             None,
+    "depth_quality":          None,
+    "confidence_dq":          None,
     "sharpness":              None,
     "momentum":               None,
     "regime_conviction":       None,
@@ -13977,6 +14509,21 @@ _MOVE_RECORD_DEFAULTS = {
     "arb_tenth_flip":         False,
 }
 _MOVE_RECORD_FROZEN = _types.MappingProxyType(_MOVE_RECORD_DEFAULTS)
+
+
+def _pos_hash8(pos: str) -> str:
+    return hashlib.md5((pos or "").encode()).hexdigest()[:8]
+
+
+_NI_RECORD_KEYS = ("confidence", "depth_quality", "confidence_dq",
+                    "sharpness", "momentum",
+                    "regime_conviction", "regime_label",
+                    "regime_collapse", "regime_force_crisis")
+
+def _ni_record_fields(ni) -> dict:
+    if not ni:
+        return {k: None for k in _NI_RECORD_KEYS}
+    return {k: ni.get(k) for k in _NI_RECORD_KEYS}
 
 
 def _build_move_record(fields):
@@ -14061,13 +14608,42 @@ def _append_move_record(ctx, rec):
 
     _live_stats_append_move(ctx, rec)
 
+    if _REC_EMIT_ENABLED:
+        _REC_EMIT_KEYS = (
+            "ply", "pos_hash", "council_winner", "bestmove", "handler", "source",
+            "confidence", "confidence_dq", "depth_quality", "sharpness", "momentum",
+            "nnue_score_cp", "nnue_depth", "nnue_pv", "dl_display_policy",
+            "council_wr_nnue", "game_phase", "eff_s", "regime_label", "dl_used",
+        )
+        try:
+            _emit = {}
+            for _ek in _REC_EMIT_KEYS:
+                _ev = rec.get(_ek)
+                if _ev is not None:
+                    _emit[_ek] = _ev
+            if "pos_hash" not in _emit:
+                _pos = getattr(ctx, "current_position", None) or ""
+                _emit["pos_hash"] = _pos_hash8(_pos)
+            _js = json.dumps(_emit, ensure_ascii=True, separators=(",", ":"), default=str)
+            if len(_js) > 8192:
+                _emit.pop("dl_display_policy", None)
+                _js = json.dumps(_emit, ensure_ascii=True, separators=(",", ":"), default=str)
+            if len(_js) > 8192:
+                _emit.pop("nnue_pv", None)
+                _js = json.dumps(_emit, ensure_ascii=True, separators=(",", ":"), default=str)
+            print(f"info string pyfa_rec {_js}", flush=True)
+        except (OSError, KeyboardInterrupt, SystemExit, MemoryError):
+            pass
+        except Exception as _re_exc:
+            _flog(f"[WO-2] pyfa_rec emit error: {_re_exc!r}")
+
 
 _live_stats_lock = threading.Lock()
 _stats_write_lock = _live_stats_lock
 
 
 def _live_stats_enabled(ctx) -> bool:
-    if os.environ.get("PYFAMATE_DLP_CAL"):
+    if _RUN_MODE is RunMode.DLP_CAL:
         return False
     return bool(ctx.cfg.log_stats)
 
@@ -14096,8 +14672,17 @@ def _live_stats_append_move(ctx, rec):
         if "ts" not in _out:
             _out = dict(_out)
             _out["ts"] = round(time.time(), 3)
+        else:
+            _out = dict(_out)
+        if "pos_hash" not in _out:
+            try:
+                _pos = getattr(ctx, "current_position", None) or ""
+                _out["pos_hash"] = _pos_hash8(_pos)
+            except Exception:
+                pass
         _line = json.dumps(_out, ensure_ascii=False, default=str)
-        _atomic_append(_STATS_PATH, _line + "\n", lock=_stats_write_lock, fsync=False)
+        _atomic_append(_STATS_PATH, _line + "\n", lock=_stats_write_lock,
+                       fsync=False, os_write=True)
     except Exception as _e:
         _flog(f"[STATS] move write failed (ignored): {_e!r}")
 
@@ -14125,7 +14710,7 @@ def _council_lookup_prefetch_cache(ctx):
 def _dyn_apply_nnue_threads(ctx, eng, path):
     if not _dyn_threads_enable or eng is None:
         return
-    if os.environ.get("PYFAMATE_DLP_CAL"):
+    if _RUN_MODE is RunMode.DLP_CAL:
         return
     try:
         _idle = _mon_idle_cores
@@ -14137,12 +14722,12 @@ def _dyn_apply_nnue_threads(ctx, eng, path):
                else 1)
         _my_idle = _idle / _wc
         _nnue_now = getattr(eng, "_dyn_threads_last",
-                            int(_cfg.get("nnue_1_Threads", 4)))
+                            _cint(_cfg, "nnue_1_Threads", 4))
         _target = max(1, int(_nnue_now + _my_idle - _spare))
         _target = min(_target, _effective_cores())
         if _target == getattr(eng, "_dyn_threads_last", None):
             return
-        eng.send(f"setoption name Threads value {_target}")
+        eng.setoption("Threads", _target)
         _last = getattr(eng, "_dyn_threads_last", None)
         if _last != _target:
             _flog(f"[BUDGET-DYN] {getattr(eng, 'name', '?')} Threads "
@@ -14155,10 +14740,75 @@ def _dyn_apply_nnue_threads(ctx, eng, path):
               f"{type(_de).__name__}: {_de}")
 
 
-def _dyn_apply_nnue_hash(eng, eng_name):
+def _dl_main_slot(ctx):
+    return "dl_3" if ctx.endgame_mode else "dl_1"
+
+
+_pvmate_dynamic = _cfg_bool("DL_PVMate_Dynamic", False)
+_pvmate_main_threads_cfg = str(_cfg.get("DL_PVMate_Main_Threads", "")).strip()
+_pvmate_sub_threads_cfg = str(_cfg.get("DL_PVMate_Sub_Threads", "")).strip()
+
+
+def _dl_apply_pv_mate_threads(ctx, reason, budget_s=None):
+    if not _pvmate_dynamic:
+        return
+    try:
+        _plan = _pvmate_threads_plan_core(_effective_cores())
+        _main_t = (int(_pvmate_main_threads_cfg)
+                   if _pvmate_main_threads_cfg else _plan["main"])
+        _sub_t = (int(_pvmate_sub_threads_cfg)
+                  if _pvmate_sub_threads_cfg else _plan["sub"])
+        _main_slot = _dl_main_slot(ctx)
+        _slots_map = {}
+        for _sn, _eng, _opts_name in (
+            ("dl_1", ctx.dl_1, "_dl_1_opts"),
+            ("dl_3", ctx.dl_3, "_dl_3_opts"),
+        ):
+            if _eng is None or not _eng_alive(_eng):
+                continue
+            _t = _main_t if _sn == _main_slot else _sub_t
+            _ds_cfg_key = {"dl_1": "DL_1", "dl_3": "DL_3"}.get(_sn)
+            if _ds_cfg_key:
+                _user_key = f"{_ds_cfg_key}_PV_Mate_Search_Threads"
+                if _user_key in _user_cfg_keys:
+                    continue
+            _slots_map[_sn] = (_eng, _opts_name, _t)
+        if ctx.dl_2 is not None and _eng_alive(ctx.dl_2):
+            _user_key_dl2 = "DL_2_PV_Mate_Search_Threads"
+            if _user_key_dl2 not in _user_cfg_keys:
+                _slots_map["dl_2"] = (ctx.dl_2, "_dl_2_opts", _sub_t)
+        for _sn, (_eng, _opts_name, _t) in _slots_map.items():
+            if "PV_Mate_Search_Threads" not in _eng.announced_options:
+                continue
+            if _eng.classify_bestmove() != "current":
+                ctx._pvmate_pending = True
+                continue
+            if getattr(_eng, "_pvmate_last", None) == _t:
+                continue
+            if budget_s is not None and budget_s < 1.0:
+                ctx._pvmate_pending = True
+                continue
+            _eng.setoption("PV_Mate_Search_Threads", _t)
+            _eng.flush_until_ready(timeout=2.0, max_stale_lines=50)
+            _old = getattr(_eng, "_pvmate_last", None)
+            _eng._pvmate_last = _t
+            try:
+                _opts_dict = globals().get(_opts_name)
+                if _opts_dict is not None:
+                    _opts_dict["PV_Mate_Search_Threads"] = str(_t)
+            except Exception:
+                pass
+            _flog(f"[PVMATE-DYN] {_sn} PV_Mate_Search_Threads "
+                  f"{_old if _old is not None else '(既定)'}→{_t} "
+                  f"(main={_main_slot} reason={reason})")
+    except Exception as _pe:
+        _flog(f"[PVMATE-DYN] 適用失敗 (旧値維持): {type(_pe).__name__}: {_pe}")
+
+
+def _dyn_apply_nnue_hash(eng, eng_name, readyok_budget_s=None):
     if not _dyn_threads_enable or eng is None:
         return
-    if os.environ.get("PYFAMATE_DLP_CAL"):
+    if _RUN_MODE is RunMode.DLP_CAL:
         return
     try:
         _avail = _mon_avail_mb
@@ -14166,8 +14816,8 @@ def _dyn_apply_nnue_hash(eng, eng_name):
             return
         _orig = getattr(eng, "_dyn_hash_original", None)
         if _orig is None:
-            eng._dyn_hash_original = int(_cfg.get(
-                f"{eng_name}_Hash", _cfg.get("USI_Hash", 256)))
+            eng._dyn_hash_original = _cint(_cfg,
+                f"{eng_name}_Hash", _cfg.get("USI_Hash", 256))
             _orig = eng._dyn_hash_original
         _current = getattr(eng, "_dyn_hash_last", _orig)
         _wc = (_tuning_worker_count
@@ -14185,9 +14835,11 @@ def _dyn_apply_nnue_hash(eng, eng_name):
             return
         if _target == _current:
             return
-        eng.send(f"setoption name USI_Hash value {_target}")
+        eng.setoption("USI_Hash", _target)
         eng.send("isready")
-        eng.flush_until_ready(timeout=60.0)
+        eng.flush_until_ready(
+            timeout=(60.0 if readyok_budget_s is None
+                     else max(5.0, min(60.0, float(readyok_budget_s)))))
         _flog(f"[BUDGET-DYN] {eng_name} Hash "
               f"{_current}→{_target}MB "
               f"(avail={_avail}MB per_worker={_my_avail}MB)")
@@ -14197,8 +14849,8 @@ def _dyn_apply_nnue_hash(eng, eng_name):
 
 
 _dl_dyn_nodes_enable = _cfg_bool("DL_Dynamic_Nodes_Enable", False)
-_dl_dyn_nodes_gpu_thresh = int(_cfg.get("DL_Dynamic_Nodes_GPU_Thresh", "85"))
-_dl_dyn_nodes_floor_ratio = float(_cfg.get("DL_Dynamic_Nodes_Floor_Ratio", "0.25"))
+_dl_dyn_nodes_gpu_thresh = _cint(_cfg, "DL_Dynamic_Nodes_GPU_Thresh", "85")
+_dl_dyn_nodes_floor_ratio = _cfloat(_cfg, "DL_Dynamic_Nodes_Floor_Ratio", "0.25")
 
 
 def _dyn_dl_nodes(base_nodes):
@@ -14217,8 +14869,8 @@ def _dyn_dl_nodes(base_nodes):
 
 
 _dl_2_resource_gate_enable = _cfg_bool("DL_2_Resource_Gate_Enable", False)
-_dl_2_resource_gate_gpu_thresh = int(_cfg.get("DL_2_Resource_Gate_GPU_Thresh", "90"))
-_dl_2_resource_gate_vram_margin = int(_cfg.get("DL_2_Resource_Gate_VRAM_Margin_MB", "1024"))
+_dl_2_resource_gate_gpu_thresh = _cint(_cfg, "DL_2_Resource_Gate_GPU_Thresh", "90")
+_dl_2_resource_gate_vram_margin = _cint(_cfg, "DL_2_Resource_Gate_VRAM_Margin_MB", "1024")
 
 
 def _dl_2_resource_gate_ok():
@@ -14241,10 +14893,33 @@ def _council_launch_nnue(ctx, line, move_count, go_clock):
     _apply_slow_mover(ctx.nnue_1, _nnue_1_opts,
                       ctx.cfg.nnue_slowmover_user_set, "SlowMover", go_clock=go_clock, cfg=ctx.cfg)
     _dyn_apply_nnue_threads(ctx, ctx.nnue_1, "council")
-    _dyn_apply_nnue_hash(ctx.nnue_1, "nnue_1")
+    if getattr(ctx, "_pvmate_pending", None):
+        _dl_apply_pv_mate_threads(ctx, "council(pending)")
+        ctx._pvmate_pending = None
+    _dyn_apply_nnue_hash(ctx.nnue_1, "nnue_1",
+                         readyok_budget_s=getattr(go_clock, "eff_s", None))
     ctx.nnue_1.send(ctx.current_position)
     ctx.nnue_1.send(go_clock.patched_line)
 
+
+
+
+def _dl_late_wait_fn(dl1_fetch, remaining_s, bm_sent, consumed,
+                     ctx, position_cmd):
+    dl1_fetch.phase1_done.wait(timeout=remaining_s)
+    if dl1_fetch.result is None:
+        return
+    bm_sent.wait(timeout=remaining_s + 60.0)
+    if consumed.is_set():
+        return
+    if ctx.prefetch is not None:
+        try:
+            _r = dl1_fetch.result
+            _inject = (_r[0], _r[1], _r[2], _r[4], _r[5])
+            ctx.prefetch.inject_dl_1(position_cmd, _inject)
+            _dlog("[A4-STEP2] DL_1 late result injected into prefetch cache")
+        except Exception as _e:
+            _dlog(f"[A4-STEP2] inject_dl_1 failed (ignored): {_e!r}")
 
 
 def _run_council_search(ctx, line, move_count, dl_timeout,
@@ -14315,7 +14990,10 @@ def _run_council_search(ctx, line, move_count, dl_timeout,
             position       = ctx.current_position,
         )
         def _dl1_live_wrapper(_p, _s):
-            _dl_1_fetch_thread_fn(_p, _s)
+            try:
+                _dl_1_fetch_thread_fn(_p, _s)
+            finally:
+                _s.phase1_done.set()
             if _p.eff_s < _DL_CONT_MIN_EFF_S and _s.result and _s.result[0]:
                 try:
                     if (_LIVE._ready()
@@ -14451,8 +15129,19 @@ def _run_council_search(ctx, line, move_count, dl_timeout,
     elif (ctx.cfg.dl_2_enable and ctx.dl_2._alive
           and not mate_detected and _dl_2_time_ok
           and _dl_2_resource_gate_ok()):
+        def _dl2_fetch_wrapper(_p, _s):
+            try:
+                _dl_2_fetch_thread_fn(_p, _s)
+            except (KeyboardInterrupt, SystemExit, MemoryError):
+                raise
+            except Exception as _d2exc:
+                _s.result = None
+                try:
+                    _flog(f"[DL_2-FETCH] thread exception: {type(_d2exc).__name__}: {_d2exc!r}")
+                except Exception:
+                    pass
         _dl_2_thread = threading.Thread(
-            target=_dl_2_fetch_thread_fn,
+            target=_dl2_fetch_wrapper,
             args=(_dl_2_fetch_params, _d2s),
             daemon=True,
         )
@@ -14590,6 +15279,8 @@ def _run_council_search(ctx, line, move_count, dl_timeout,
 
     _dl_pv_lines   = {}
     _dl_depth_best = {}
+    _dl_late_bm_sent  = None
+    _dl_late_consumed = None
     if cached is None:
         try:
             ctx.dl_1.send("stop")
@@ -14611,8 +15302,8 @@ def _run_council_search(ctx, line, move_count, dl_timeout,
                     f"(dl_budget_left={_dl_budget_left_s*1000:.0f}ms "
                     f"move_budget_left={_move_left_s*1000:.0f}ms)"
                 )
-                _dl_thread.join(timeout=_dl1_wait_s)
-                if _dl_thread.is_alive():
+                _dl1_fetch.phase1_done.wait(timeout=_dl1_wait_s)
+                if not _dl1_fetch.phase1_done.is_set():
                     _dlog(
                         "DL_1 bounded wait expired — DL_1 still running, "
                         "proceeding nnue-only for this move"
@@ -14693,6 +15384,19 @@ def _run_council_search(ctx, line, move_count, dl_timeout,
                     "council degraded to NNUE-only (silent council "
                     "fallback observable signal)"
                 )
+            _late_remaining_s = _move_budget_left_s(
+                _eff_s, _t_go_start, safety_s=0.5)
+            if _late_remaining_s > 0.05:
+                _dl_late_bm_sent  = threading.Event()
+                _dl_late_consumed = threading.Event()
+                threading.Thread(
+                    target=_dl_late_wait_fn,
+                    args=(_dl1_fetch, _late_remaining_s, _dl_late_bm_sent,
+                          _dl_late_consumed, ctx, ctx.current_position),
+                    daemon=True,
+                ).start()
+                _dlog(f"[A4-STEP2] DL_1 late-wait thread: "
+                      f"budget={_late_remaining_s*1000:.0f}ms")
     else:
         _dl_score_hist = _cache_score_hist
         _dl_depth_best = _cache_depth_best
@@ -14931,7 +15635,7 @@ def _run_council_search(ctx, line, move_count, dl_timeout,
         else None
     )
 
-    _disagree_log_threshold = int(_cfg.get("Council_Disagreement_Log_Threshold_Cp", 150))
+    _disagree_log_threshold = _cint(_cfg, "Council_Disagreement_Log_Threshold_Cp", 150)
     if (_disagreement_score > 0
             and _score_gap_dl_nnue is not None
             and _score_gap_dl_nnue >= _disagree_log_threshold):
@@ -15165,6 +15869,35 @@ def _run_council_search(ctx, line, move_count, dl_timeout,
             final_move = dl_top_vote
             council_override = True
             council_override_source = "dl1_conviction"
+
+    if (_dl_late_bm_sent is not None
+            and dl_top_vote is None
+            and _dl1_fetch.phase1_done.is_set()
+            and _dl1_fetch.result is not None):
+        _dl_late_consumed.set()
+        (_late_policy, _late_mate, _late_gap, _late_pv,
+         _late_depth, _late_hist) = _dl1_fetch.result
+        ctx.game_progress.dl1_timeout_streak = 0
+        if _late_policy:
+            policy          = _late_policy
+            mate_detected   = mate_detected or _late_mate
+            _dl_actual_gap  = _late_gap
+            _dl_pv_lines    = _late_pv
+            _dl_depth_best  = _late_depth
+            _dl_score_hist  = _late_hist
+            dl_top_vote     = policy[0][0]
+            _late_votes = [v for v in [dl_top_vote, nnue_top_vote, dl_2_top_vote]
+                           if v is not None]
+            if _late_votes:
+                _lt = {}
+                for _v in _late_votes:
+                    _lt[_v] = _lt.get(_v, 0) + 1
+                _disagreement_score = len(_late_votes) - _lt[max(_lt, key=_lt.get)]
+            _dlog(f"[A4-STEP2] DL_1 late vote folded in before ARB: "
+                  f"dl={dl_top_vote} nnue={nnue_top_vote} "
+                  f"disagree={_disagreement_score}")
+        else:
+            _dlog("[A4-STEP2] DL_1 late result arrived but policy empty (gap abstain)")
 
     _arb_meta = None
     _arb_vote = None
@@ -15544,24 +16277,69 @@ def _run_council_search(ctx, line, move_count, dl_timeout,
                         _tg_ladder.append(_tg_mv)
                         if len(_tg_ladder) >= 3:
                             break
-                for _tg_cand in [final_move] + _tg_ladder:
-                    _tg_jt = _move_budget_left_s(eff_s, _t_go_start)
-                    if _tg_jt < 0.05:
-                        break
-                    _tg_go = _mate_go_cmd(ctx, int(min(_tg_jt, ctx.cfg.tonshi_guard_movetime_max_s) * 1000))
-                    _tonshi_guard_fired = True
-                    _tg_res, _ = _run_single_pv_mate_check(
-                        ctx, _position_after_moves(ctx.current_position, [_tg_cand]),
-                        _tg_go, eff_s, _tg_jt, f"tonshi-{_tg_cand}")
-                    if _tg_res != "mate":
-                        if _tg_cand != final_move:
-                            _flog(f"[TONSHI-GUARD] ply={move_count} {final_move} は相手の頓死詰み "
-                                  f"→ 次善 {_tg_cand} へ差替 (king_danger; child move)")
-                            final_move = _tg_cand
-                            ponder_move = None
-                            _tonshi_guard_refuted = True
-                            _zf_leaf_sfen = None
-                        break
+                _tg_all_cands = [final_move] + _tg_ladder
+                _tonshi_guard_fired = True
+                if (_zf_active and _effective_cores() >= 16
+                        and len(_tg_all_cands) > 1
+                        and _move_budget_left_s(eff_s, _t_go_start) >= 0.3):
+                    _tg_par_sfens = {}
+                    for _tg_pc in _tg_all_cands:
+                        try:
+                            _tg_par_sfens[_tg_pc] = _sfen_for_position(
+                                _position_after_moves(ctx.current_position, [_tg_pc]))
+                        except Exception:
+                            pass
+                    _tg_par_results = {}
+                    _tg_par_threads = []
+                    _tg_par_to = min(1.0, ctx.cfg.tonshi_guard_movetime_max_s,
+                                     max(0.1, _move_budget_left_s(eff_s, _t_go_start)))
+                    for _tg_pc, _tg_ps in _tg_par_sfens.items():
+                        def _tg_par_worker(_mv=_tg_pc, _sf=_tg_ps, _to=_tg_par_to):
+                            try:
+                                _tg_par_results[_mv] = _zyfamate_solve(
+                                    _sf, timeout_s=_to, nodes=20000000,
+                                    path=ctx.cfg.mate_solver_path)
+                            except Exception:
+                                _tg_par_results[_mv] = ("busy", None, 0)
+                        _t = threading.Thread(target=_tg_par_worker, daemon=True,
+                                              name=f"zf_ladder_{_tg_pc}")
+                        _tg_par_threads.append(_t)
+                        _t.start()
+                    _tg_par_join_to = max(0.1, _move_budget_left_s(eff_s, _t_go_start))
+                    for _t in _tg_par_threads:
+                        _t.join(timeout=max(0.05, _tg_par_join_to))
+                    for _tg_cand in _tg_all_cands:
+                        _tg_pr = _tg_par_results.get(_tg_cand)
+                        if _tg_pr is None:
+                            break
+                        _tg_res = _tg_pr[0]
+                        if _tg_res != "mate":
+                            if _tg_cand != final_move:
+                                _flog(f"[TONSHI-GUARD] ply={move_count} {final_move} は相手の頓死詰み "
+                                      f"→ 次善 {_tg_cand} へ差替 (king_danger; ladder-par)")
+                                final_move = _tg_cand
+                                ponder_move = None
+                                _tonshi_guard_refuted = True
+                                _zf_leaf_sfen = None
+                            break
+                else:
+                    for _tg_cand in _tg_all_cands:
+                        _tg_jt = _move_budget_left_s(eff_s, _t_go_start)
+                        if _tg_jt < 0.05:
+                            break
+                        _tg_go = _mate_go_cmd(ctx, int(min(_tg_jt, ctx.cfg.tonshi_guard_movetime_max_s) * 1000))
+                        _tg_res, _ = _run_single_pv_mate_check(
+                            ctx, _position_after_moves(ctx.current_position, [_tg_cand]),
+                            _tg_go, eff_s, _tg_jt, f"tonshi-{_tg_cand}")
+                        if _tg_res != "mate":
+                            if _tg_cand != final_move:
+                                _flog(f"[TONSHI-GUARD] ply={move_count} {final_move} は相手の頓死詰み "
+                                      f"→ 次善 {_tg_cand} へ差替 (king_danger; child move)")
+                                final_move = _tg_cand
+                                ponder_move = None
+                                _tonshi_guard_refuted = True
+                                _zf_leaf_sfen = None
+                            break
 
             _zf_tesuki_done = False
             if _zf_tek_thread is not None:
@@ -15628,6 +16406,8 @@ def _run_council_search(ctx, line, move_count, dl_timeout,
 
     final_move, ponder_move = _safe_bestmove(final_move, ponder_move, label="council",
                                              nnue_info=nnue_info)
+    if _dl_late_bm_sent is not None:
+        _dl_late_bm_sent.set()
 
     nnue_info["bestmove"] = final_move
     dl_top   = policy[0][0]  if policy else None
@@ -15777,13 +16557,7 @@ def _run_council_search(ctx, line, move_count, dl_timeout,
                      if _dl_pv_lines else None)),
         "nnue_pv": (_council_full_pv_holder[0] if _council_full_pv_holder and _council_full_pv_holder[0] else None),
         "dl_display_policy": (_dl_display_policy if _dl_display_policy else None),
-        "confidence": nnue_info.get("confidence") if nnue_info else None,
-        "sharpness": nnue_info.get("sharpness") if nnue_info else None,
-        "momentum": nnue_info.get("momentum") if nnue_info else None,
-        "regime_conviction": nnue_info.get("regime_conviction") if nnue_info else None,
-        "regime_label": nnue_info.get("regime_label") if nnue_info else None,
-        "regime_collapse": nnue_info.get("regime_collapse") if nnue_info else None,
-        "regime_force_crisis": nnue_info.get("regime_force_crisis") if nnue_info else None,
+        **_ni_record_fields(nnue_info),
     })
 
     def _ms_clamp(_s):
@@ -15804,7 +16578,7 @@ def _run_council_search(ctx, line, move_count, dl_timeout,
         ponder_move,
         move_count,
         alt_reply=_multi_ponder_alt_reply(_dl_pv_lines, final_move, ponder_move,
-            policy=policy, alt_min_gap=float(_cfg.get("SMP_Alt_Min_Gap", 0.0))),
+            policy=policy, alt_min_gap=_cfloat(_cfg, "SMP_Alt_Min_Gap", 0.0)),
     )
     try:
         _cnsc = nnue_info.get("score_cp", 0) or 0
@@ -15890,7 +16664,10 @@ def _run_light_council_search(ctx, line, move_count, go_clock, dl_timeout_s=0.0)
     _apply_slow_mover(ctx.nnue_1, _nnue_1_opts,
                       ctx.cfg.nnue_slowmover_user_set, "SlowMover", eff_s=eff_s, cfg=ctx.cfg)
     _dyn_apply_nnue_threads(ctx, ctx.nnue_1, "light_council")
-    _dyn_apply_nnue_hash(ctx.nnue_1, "nnue_1")
+    if getattr(ctx, "_pvmate_pending", None):
+        _dl_apply_pv_mate_threads(ctx, "light_council(pending)")
+        ctx._pvmate_pending = None
+    _dyn_apply_nnue_hash(ctx.nnue_1, "nnue_1", readyok_budget_s=eff_s)
     ctx.nnue_1.send(ctx.current_position)
     ctx.nnue_1.send(go_clock.patched_line)
 
@@ -16198,13 +16975,7 @@ def _run_light_council_search(ctx, line, move_count, go_clock, dl_timeout_s=0.0)
         "opponent_id_sample":     ctx.game_progress.opponent_id_last_sample,
         "opponent_id_style":      _lc_opponent_id_style,
         "opponent_id_samples":    ctx.game_progress.opponent_id_samples,
-        "confidence": nnue_info.get("confidence") if nnue_info else None,
-        "sharpness": nnue_info.get("sharpness") if nnue_info else None,
-        "momentum": nnue_info.get("momentum") if nnue_info else None,
-        "regime_conviction": nnue_info.get("regime_conviction") if nnue_info else None,
-        "regime_label": nnue_info.get("regime_label") if nnue_info else None,
-        "regime_collapse": nnue_info.get("regime_collapse") if nnue_info else None,
-        "regime_force_crisis": nnue_info.get("regime_force_crisis") if nnue_info else None,
+        **_ni_record_fields(nnue_info),
     })
 
     ctx.game_progress.opponent_id_last_sample = None
@@ -16364,6 +17135,173 @@ def _run_mate_solver_thread(ctx, position_cmd, go_cmd,
 
 _ZF_CREATE_FLAGS = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
+
+def _zf_norm_sfen(sfen):
+    _s = (sfen or "").strip()
+    return _s[5:].lstrip() if _s.startswith("sfen ") else _s
+
+
+class _ZfServer:
+
+
+    def __init__(self, path, index):
+        self._path = path
+        self._index = index
+        self.lock = threading.Lock()
+        self._proc = None
+        self._q = None
+        self._broken_until = 0.0
+
+    def _spawn(self):
+        _env = os.environ.copy()
+        if self._index > 0:
+            _env.setdefault("ZYFAMATE_HASH_MB", "512")
+        self._proc = subprocess.Popen(
+            [self._path, "serve"],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            creationflags=_ZF_CREATE_FLAGS, env=_env)
+        self._q = queue.Queue()
+
+        def _reader(_proc=self._proc, _q=self._q, _idx=self._index):
+            try:
+                for _raw in iter(_proc.stdout.readline, b""):
+                    _q.put(_raw.decode("utf-8", errors="replace").rstrip("\r\n"))
+            except Exception as _zr_exc:
+                try:
+                    _flog(f"[ZF-SERVE] reader#{_idx} error: {type(_zr_exc).__name__}: {_zr_exc!r}")
+                except Exception:
+                    pass
+            _q.put(None)
+
+        threading.Thread(target=_reader, daemon=True,
+                         name=f"zf_serve_reader_{self._index}").start()
+        self._proc.stdin.write(b"ping\n")
+        self._proc.stdin.flush()
+        _deadline = time.perf_counter() + 10.0
+        while True:
+            _ln = self._q.get(timeout=max(0.05, _deadline - time.perf_counter()))
+            if _ln is None:
+                raise RuntimeError("serve process died at startup")
+            if _ln == "=done":
+                break
+        _dlog(f"[ZF-SERVE] server#{self._index} spawned (pid={self._proc.pid})")
+
+    def kill(self):
+        try:
+            if self._proc is not None:
+                self._proc.kill()
+        except Exception:
+            pass
+        self._proc = None
+        self._q = None
+
+    def request(self, line, timeout_s):
+        try:
+            if self._proc is None or self._proc.poll() is not None:
+                if time.perf_counter() < self._broken_until:
+                    return "dead", None
+                self._spawn()
+        except Exception as _e:
+            _dlog(f"[ZF-SERVE] spawn failed: {_e!r} — 30s は再試行しない")
+            self.kill()
+            self._broken_until = time.perf_counter() + 30.0
+            return "dead", None
+        try:
+            self._proc.stdin.write(line.encode("utf-8") + b"\n")
+            self._proc.stdin.flush()
+        except Exception as _e:
+            _dlog(f"[ZF-SERVE] write failed: {_e!r}")
+            self.kill()
+            return "dead", None
+        _deadline = time.perf_counter() + timeout_s + 1.5
+        _lines = []
+        while True:
+            _left = _deadline - time.perf_counter()
+            if _left <= 0:
+                _dlog("[ZF-SERVE] request deadline exceeded — server restart")
+                self.kill()
+                return "timeout", None
+            try:
+                _ln = self._q.get(timeout=_left)
+            except queue.Empty:
+                continue
+            if _ln is None:
+                self.kill()
+                return "dead", None
+            if _ln == "=done":
+                return "ok", _lines
+            _lines.append(_ln)
+
+
+_zf_pool_cfg = str(_cfg.get("ZF_Serve_Pool_Max", "")).strip()
+_ZF_SERVE_POOL_MAX = (int(_zf_pool_cfg) if _zf_pool_cfg
+                      else _zf_pool_max_core(_effective_cores()))
+_zf_servers = {}
+_zf_servers_lock = threading.Lock()
+
+
+def _zf_serve_request(path, line, timeout_s):
+    if not _zyfamate_has_serve:
+        return None, None
+    _path = path or _mate_solver_path
+    with _zf_servers_lock:
+        _pool = _zf_servers.setdefault(_path, [])
+        _cands = list(_pool)
+    _srv = None
+    for _s in _cands:
+        if _s.lock.acquire(blocking=False):
+            _srv = _s
+            break
+    if _srv is None:
+        with _zf_servers_lock:
+            if len(_pool) < _ZF_SERVE_POOL_MAX:
+                _srv = _ZfServer(_path, len(_pool))
+                _srv.lock.acquire()
+                _pool.append(_srv)
+    if _srv is None:
+        return None, None
+    try:
+        _st, _lines = _srv.request(line, timeout_s)
+        if _st == "dead":
+            return None, None
+        return _st, _lines
+    finally:
+        _srv.lock.release()
+
+
+def _zf_serve_warm(path=None):
+    if not _zyfamate_has_serve:
+        return
+    def _w():
+        try:
+            _zf_serve_request(path, "ping", 10.0)
+        except Exception:
+            pass
+    threading.Thread(target=_w, daemon=True, name="zf_serve_warm").start()
+
+
+def _zf_serve_shutdown():
+    with _zf_servers_lock:
+        _all = [s for _pl in _zf_servers.values() for s in _pl]
+        _zf_servers.clear()
+    for _s in _all:
+        if not _s.lock.acquire(timeout=1.0):
+            _s.kill()
+            continue
+        try:
+            if _s._proc is not None:
+                _s._proc.stdin.write(b"quit\n")
+                _s._proc.stdin.flush()
+        except Exception:
+            pass
+        finally:
+            _s.lock.release()
+        _s.kill()
+
+
+atexit.register(_zf_serve_shutdown)
+
 _CSA_RANK_TO_USI = {'1': 'a', '2': 'b', '3': 'c', '4': 'd', '5': 'e',
                      '6': 'f', '7': 'g', '8': 'h', '9': 'i'}
 _CSA_DROP_TO_USI = {'FU': 'P', 'KY': 'L', 'KE': 'N', 'GI': 'S',
@@ -16440,27 +17378,48 @@ def _zf_mate_worker(mr, sfen, timeout_s, path=None):
         mr.proof = True
 
 
+def _zf_parse_solve_lines(_lines, sfen):
+    for _i, _ln in enumerate(_lines):
+        if _ln.startswith("mate "):
+            _tok = _ln.split()
+            try:
+                _mate_len = int(_tok[1]) if len(_tok) > 1 else 0
+            except ValueError:
+                _mate_len = 0
+            _pv = _lines[_i + 1] if _i + 1 < len(_lines) else ""
+            _usi_mv = _csa_first_move_to_usi(_pv, sfen) if _pv else None
+            return "mate", _usi_mv, _mate_len
+        if _ln.startswith("nomate"):
+            return "nomate", None, 0
+        if _ln.startswith("unknown"):
+            return "timeout", None, 0
+        if _ln.startswith("parse error"):
+            _dlog(f"[ZYFAMATE] parse error from solver: {sfen[:60]!r}")
+            return "busy", None, 0
+    return "timeout", None, 0
+
+
 def _zyfamate_solve(sfen, timeout_s=30.0, nodes=20000000, path=None):
     _path = path or _mate_solver_path
+    sfen = _zf_norm_sfen(sfen)
+    try:
+        _st, _lines = _zf_serve_request(
+            _path, f"solve {nodes} {timeout_s} {sfen}", timeout_s)
+        if _st == "timeout":
+            return "timeout", None, 0
+        if _st == "ok":
+            return _zf_parse_solve_lines(_lines, sfen)
+    except Exception as _e:
+        _dlog(f"[ZF-SERVE] solve error (one-shot fallback): {_e!r}")
     try:
         _r = subprocess.run(
             [_path, "sfen", sfen, str(nodes), str(timeout_s)],
             capture_output=True, timeout=timeout_s + 2,
+            stdin=subprocess.DEVNULL,
             creationflags=_ZF_CREATE_FLAGS,
         )
         _lines = (_r.stdout or b"").decode("utf-8", errors="replace").strip().splitlines()
-        for _i, _ln in enumerate(_lines):
-            if _ln.startswith("mate "):
-                _tok = _ln.split()
-                _mate_len = int(_tok[1]) if len(_tok) > 1 else 0
-                _pv = _lines[_i + 1] if _i + 1 < len(_lines) else ""
-                _usi_mv = _csa_first_move_to_usi(_pv, sfen) if _pv else None
-                return "mate", _usi_mv, _mate_len
-            if _ln.startswith("nomate"):
-                return "nomate", None, 0
-            if _ln.startswith("unknown"):
-                return "timeout", None, 0
-        return "timeout", None, 0
+        return _zf_parse_solve_lines(_lines, sfen)
     except subprocess.TimeoutExpired:
         return "timeout", None, 0
     except Exception as _e:
@@ -16468,53 +17427,86 @@ def _zyfamate_solve(sfen, timeout_s=30.0, nodes=20000000, path=None):
         return "busy", None, 0
 
 
+def _zf_parse_tsumero_lines(_lines):
+    if not _lines:
+        return False, 0, ""
+    _first = _lines[0]
+    if _first.startswith("True"):
+        _threat_n = 0
+        if "(threat " in _first:
+            try:
+                _threat_n = int(_first.split("(threat ")[1].rstrip(")"))
+            except (IndexError, ValueError):
+                pass
+        _pv = _lines[1] if len(_lines) > 1 else ""
+        return True, _threat_n, _pv
+    return False, 0, ""
+
+
 def _zyfamate_tsumero(sfen, timeout_s=10.0, nodes=5000000, path=None):
     _path = path or _mate_solver_path
+    sfen = _zf_norm_sfen(sfen)
+    try:
+        _st, _lines = _zf_serve_request(
+            _path, f"tsumero {nodes} {timeout_s} {sfen}", timeout_s)
+        if _st == "timeout":
+            return False, 0, ""
+        if _st == "ok":
+            return _zf_parse_tsumero_lines(_lines)
+    except Exception as _e:
+        _dlog(f"[ZF-SERVE] tsumero error (one-shot fallback): {_e!r}")
     try:
         _r = subprocess.run(
             [_path, "sfen-tsumero", sfen, str(nodes), str(timeout_s)],
             capture_output=True, timeout=timeout_s + 2,
+            stdin=subprocess.DEVNULL,
             creationflags=_ZF_CREATE_FLAGS,
         )
         _lines = (_r.stdout or b"").decode("utf-8", errors="replace").strip().splitlines()
-        if not _lines:
-            return False, 0, ""
-        _first = _lines[0]
-        if _first.startswith("True"):
-            _threat_n = 0
-            if "(threat " in _first:
-                try:
-                    _threat_n = int(_first.split("(threat ")[1].rstrip(")"))
-                except (IndexError, ValueError):
-                    pass
-            _pv = _lines[1] if len(_lines) > 1 else ""
-            return True, _threat_n, _pv
-        return False, 0, ""
+        return _zf_parse_tsumero_lines(_lines)
     except Exception as _e:
         _dlog(f"[ZYFAMATE] tsumero error: {_e!r}")
         return False, 0, ""
 
 
+def _zf_parse_tesuki_lines(_lines):
+    if not _lines:
+        return None
+    _first = _lines[0]
+    if not _first.startswith("tesuki "):
+        return None
+    _val = _first.split()[1]
+    if _val in ("-", "unknown"):
+        return None
+    try:
+        if _val.startswith(">"):
+            return int(_val[1:]) + 1
+        return int(_val)
+    except ValueError:
+        return None
+
+
 def _zyfamate_tesuki(sfen, maxn=3, timeout_s=3.0, nodes=2000000, path=None):
     _path = path or _mate_solver_path
+    sfen = _zf_norm_sfen(sfen)
+    try:
+        _st, _lines = _zf_serve_request(
+            _path, f"tesuki {maxn} {nodes} {timeout_s} {sfen}", timeout_s)
+        if _st == "timeout":
+            return None
+        if _st == "ok":
+            return _zf_parse_tesuki_lines(_lines)
+    except Exception as _e:
+        _dlog(f"[ZF-SERVE] tesuki error (one-shot fallback): {_e!r}")
     try:
         _r = subprocess.run(
             [_path, "sfen-tesuki", sfen, str(maxn), str(nodes), str(timeout_s)],
             capture_output=True, timeout=timeout_s + 2,
+            stdin=subprocess.DEVNULL,
             creationflags=_ZF_CREATE_FLAGS,
         )
-        _first = (_r.stdout or b"").decode("utf-8", errors="replace").strip().splitlines()
-        if not _first:
-            return None
-        _first = _first[0]
-        if not _first.startswith("tesuki "):
-            return None
-        _val = _first.split()[1]
-        if _val in ("-", "unknown"):
-            return None
-        if _val.startswith(">"):
-            return int(_val[1:]) + 1
-        return int(_val)
+        _lines = (_r.stdout or b"").decode("utf-8", errors="replace").strip().splitlines()
+        return _zf_parse_tesuki_lines(_lines)
     except Exception as _e:
         _dlog(f"[ZYFAMATE] tesuki error: {_e!r}")
         return None
@@ -16831,7 +17823,7 @@ def _mate_ponder_dispatch(ctx, go_ponder_clock_arg, cur_game_phase, label="go-po
                 getattr(ctx.game_progress, "last_nnue_score_cp", None),
                 cur_game_phase, _endgame_mate_ponder_game_phase,
                 _DLPONDER_STATE.get("opponent_s_ema"),
-                float(_cfg.get("DLP_Ponder_Min_Opp_S", 1.5))):
+                _cfloat(_cfg, "DLP_Ponder_Min_Opp_S", 1.5)):
             return
         _pos = ctx.current_position
         _t = getattr(ctx, "_mate_ponder_thread", None)
@@ -17080,10 +18072,11 @@ def _run_infinite_council(ctx, eng, move_count):
             return
         if not _eng_alive(ctx.dl_1):
             return
-        nnue_move = _latest_nnue["move"]
+        _snap = _latest_nnue
+        nnue_move = _snap["move"]
         if not nnue_move:
             return
-        nnue_cp = _latest_nnue["score_cp"]
+        nnue_cp = _snap["score_cp"]
         try:
             with ctx.prefetch.dl_1_lock:
                 _raw = fetch_dl_policy(
@@ -17185,35 +18178,36 @@ def _run_infinite_council(ctx, eng, move_count):
     _poller_thread.start()
 
     def _relay_and_vote():
+        nonlocal _latest_nnue
         _nnue_bestmove = [None, None]
-        while True:
-            out = eng.readline(timeout=120)
-            if out is None:
-                break
-            if not out:
-                continue
-            if _is_scored_info(out):
-                _dm = _RE_DEPTH.search(out)
-                if _dm:
-                    _d = int(_dm.group(1))
-                    if _d >= _latest_nnue["depth"]:
-                        _latest_nnue["depth"] = _d
-                        _sm = _RE_SCORE_CP.search(out)
-                        if _sm:
-                            _latest_nnue["score_cp"] = int(_sm.group(1))
-                        _pvm = _RE_PV_FIRST.search(out)
-                        if _pvm:
-                            _latest_nnue["move"] = _pvm.group(1)
-            if out.startswith("bestmove"):
-                _parts = out.split()
-                _nnue_bestmove[0] = _parts[1] if len(_parts) > 1 else None
-                _nnue_bestmove[1] = _parts[3] if len(_parts) > 3 and _parts[2] == "ponder" else None
-                break
-            if not _suppress_info_print:
-                try:
-                    print(out, flush=True)
-                except OSError:
-                    pass
+        try:
+            while True:
+                out = eng.readline(timeout=120)
+                if out is None:
+                    break
+                if not out:
+                    continue
+                if out.kind == "scored" and out.depth is not None:
+                    if out.depth >= _latest_nnue["depth"]:
+                        _prev = _latest_nnue
+                        _new_cp = out.score_cp if out.score_cp is not None else _prev["score_cp"]
+                        _new_mv = out.pv.split()[0] if out.pv else _prev["move"]
+                        _latest_nnue = {"move": _new_mv, "score_cp": _new_cp, "depth": out.depth}
+                if out.kind == "bestmove":
+                    _nnue_bestmove[0] = out.bestmove
+                    _nnue_bestmove[1] = out.ponder_move
+                    break
+                if "pyfa_" in out:
+                    continue
+                if not _suppress_info_print:
+                    try:
+                        print(out, flush=True)
+                    except OSError:
+                        pass
+        except (KeyboardInterrupt, SystemExit, MemoryError):
+            raise
+        except Exception as _rv_exc:
+            _flog(f"[INF-COUNCIL] _relay_and_vote error: {_rv_exc!r}")
 
         _stop_event.set()
         _poller_thread.join(timeout=3.0)
@@ -17225,6 +18219,9 @@ def _run_infinite_council(ctx, eng, move_count):
                "bestmove": _nnue_bestmove[0]}
         if _conf > 0:
             _ni["confidence"] = _conf
+            _ic_dq = _compute_depth_quality(_latest_nnue.get("depth"))
+            _ni["depth_quality"]  = _ic_dq
+            _ni["confidence_dq"] = _clamp01(_conf * _ic_dq)
         if _shp is not None:
             _ni["sharpness"] = _shp
         _safe_bestmove(_final, _nnue_bestmove[1], label="infinite-council", nnue_info=_ni)
@@ -17332,7 +18329,12 @@ def _run_endgame_search(ctx, line, move_count, is_infinite,
 
     if not is_infinite:
         _dyn_apply_nnue_threads(ctx, eng, "endgame")
-        _dyn_apply_nnue_hash(eng, "nnue_2" if use_dedicated else "nnue_1")
+        if getattr(ctx, "_pvmate_pending", None):
+            _dl_apply_pv_mate_threads(ctx, "endgame(pending)",
+                                       budget_s=getattr(go_clock, "eff_s", None))
+            ctx._pvmate_pending = None
+        _dyn_apply_nnue_hash(eng, "nnue_2" if use_dedicated else "nnue_1",
+                             readyok_budget_s=getattr(go_clock, "eff_s", None))
     eng.send(ctx.current_position)
     _nnue_patched = (go_clock.patched_line if go_clock is not None else line)
     eng.send(_nnue_patched if not is_infinite else line)
@@ -17906,13 +18908,7 @@ def _run_endgame_search(ctx, line, move_count, is_infinite,
             "source":           None,
             "nnue_pv": (_nnue_full_pv_holder[0] if _nnue_full_pv_holder[0] else None),
             "dl_display_policy": None,
-            "confidence": nnue_info.get("confidence") if nnue_info else None,
-            "sharpness": nnue_info.get("sharpness") if nnue_info else None,
-            "momentum": nnue_info.get("momentum") if nnue_info else None,
-            "regime_conviction": nnue_info.get("regime_conviction") if nnue_info else None,
-            "regime_label": nnue_info.get("regime_label") if nnue_info else None,
-            "regime_collapse": nnue_info.get("regime_collapse") if nnue_info else None,
-            "regime_force_crisis": nnue_info.get("regime_force_crisis") if nnue_info else None,
+            **_ni_record_fields(nnue_info),
         })
         if _LIVE._ready():
             _eg_ck = ({"remaining_ms": go_clock.remaining_ms, "floor_ms": go_clock.floor_ms,
@@ -18011,7 +19007,7 @@ def _shutdown(ctx, reason="unknown"):
             ctx.game_meta["dlp_mode"] = str(_DLPONDER_STATE.get("mode", "unknown"))
             ctx.game_meta["dlp_diff"] = _dlp_game_diff()
             _write_game_stats(ctx.game_log, ctx.game_meta, cfg=ctx.cfg)
-            _suppressed = (bool(os.environ.get("PYFAMATE_DLP_CAL"))
+            _suppressed = (_RUN_MODE is RunMode.DLP_CAL
                            or not ctx.cfg.log_stats)
             _flog(f"_shutdown: flushed {len(ctx.game_log)} pending move(s) "
                   f"(result={ctx.game_meta.get('result')})"
@@ -18153,11 +19149,10 @@ def _forward_draw_ply_to_children(ctx) -> None:
 
 
 def _broadcast_setoption(engines, key, value):
-    cmd = f"setoption name {key} value {value}"
     for eng in engines:
         if _eng_alive(eng):
             try:
-                eng.send(cmd)
+                eng.setoption(key, value)
             except (KeyboardInterrupt, SystemExit, MemoryError):
                 raise
             except Exception as _bse:
@@ -18262,6 +19257,8 @@ def _handle_setoption(ctx, line):
                 _flog(f"{key}={_soi_val}")
             except (ValueError, TypeError):
                 _flog(f"{key} invalid value: {val!r} (ignored)")
+        elif key in _SETOPTION_REGISTRY:
+            _SETOPTION_REGISTRY[key](ctx, key, val)
         elif key in (
             "USI_OwnBook", "NarrowBook", "BookMoves", "BookIgnoreRate",
             "BookFile", "BookDir", "BookEvalDiff", "BookEvalBlackLimit",
@@ -18688,7 +19685,7 @@ def _dl_ponder_dispatch(ctx, line, pos=None, label="go-ponder", dl2_pos=None):
         ctx.ps.dl2_ponder_pos = None
 
     if not _dlponder_forward_gate_core(_DLPONDER_STATE.get("opponent_s_ema"),
-                                  float(_cfg.get("DLP_Ponder_Min_Opp_S", 1.5))):
+                                  _cfloat(_cfg, "DLP_Ponder_Min_Opp_S", 1.5)):
         _DLPONDER_STATE["dlp_gate_skips"] =             int(_DLPONDER_STATE.get("dlp_gate_skips", 0)) + 1
         _flog(f"[DLP-GATE/{label}] DL go ponder skipped this move "
               f"(opponent_s_ema={round(_DLPONDER_STATE['opponent_s_ema'], 1)}s < "
@@ -18712,7 +19709,7 @@ def _dl_ponder_dispatch(ctx, line, pos=None, label="go-ponder", dl2_pos=None):
         try:
             if (_sp_want is not None
                     and getattr(_eng, "_last_sp_sent", None) != _sp_want):
-                _eng.send(f"setoption name Stochastic_Ponder value {_sp_want}")
+                _eng.setoption("Stochastic_Ponder", _sp_want)
                 _eng._last_sp_sent = _sp_want
             _eng.send(_send_pos)
             _eng.send(line)
@@ -18737,14 +19734,11 @@ def _dl_ponder_dispatch(ctx, line, pos=None, label="go-ponder", dl2_pos=None):
               + ")")
 
 
-
 def _stop_all_ponders(ctx, reason=""):
     _stop_dl_ponders(ctx, reason)
     _mate_ponder_cancel(ctx, reason, join_s=1.0)
     ctx._mate_ponder_result = None
     _stop_nnue_ponders(ctx, reason)
-
-
 
 
 def _teardown_game(ctx, reason):
@@ -18777,10 +19771,20 @@ def _locked_usinewgame(lock, eng, label: str) -> None:
               "usinewgame skip (次 go が position を全送するため安全側)")
 
 
+_usinewgame_last_t = [0.0]
+
 def _handle_usinewgame(ctx, line):
+    _now_ung = time.perf_counter()
+    if _now_ung - _usinewgame_last_t[0] < 7.0 and _usinewgame_last_t[0] > 0:
+        _flog("[P6-6] usinewgame: duplicate within %.1fs — skipping heavyweight re-init"
+              % (_now_ung - _usinewgame_last_t[0]))
+        return
+    _usinewgame_last_t[0] = _now_ung
     _diag_reset()
     _teardown_game(ctx, "usinewgame")
     _locked_usinewgame(ctx.prefetch.dl_1_lock, ctx.dl_1, "dl_1")
+    _dl_apply_pv_mate_threads(ctx, "usinewgame")
+    ctx._pvmate_pending = None
     _wsl_restore = []
     for _eng_attr_r in ("nnue_1", "nnue_2"):
         _eng_r = getattr(ctx, _eng_attr_r, None)
@@ -18790,7 +19794,7 @@ def _handle_usinewgame(ctx, line):
                 _wsl_restore.append((_eng_attr_r, _eng_r, _orig_h))
     if _wsl_restore:
         def _wsl_restore_one(_attr, _e, _o):
-            _e.send(f"setoption name USI_Hash value {_o}")
+            _e.setoption("USI_Hash", _o)
             _e.send("isready")
             _e.flush_until_ready(timeout=30.0)
             _flog(f"[WSL-HASH-RESTORE] {_attr} Hash 1→{_o}MB (game start, isready committed)")
@@ -18843,8 +19847,10 @@ def _handle_usinewgame(ctx, line):
         ctx.nnue_2.send("usinewgame")
     if ctx._zyfamate:
         _zf_caps = "solve" + ("+tsumero" if ctx._zyfamate_has_tsumero else "") + ("+tesuki" if ctx._zyfamate_has_tesuki else "")
+        _zf_mode = "serve+one-shot" if _zyfamate_has_serve else "one-shot CLI"
         _flog(f"[{'ZYFAMATE' if ctx._zyfamate_has_tsumero and ctx._zyfamate_has_tesuki else 'CSA-MATE'}] "
-              f"ready (one-shot CLI, {_zf_caps}): {_mate_solver_path}")
+              f"ready ({_zf_mode}, {_zf_caps}): {_mate_solver_path}")
+        _zf_serve_warm(ctx.cfg.mate_solver_path)
     elif ctx.mate_solver is not None:
         if not ctx.mate_solver._alive:
             _ms_eng = ctx.mate_solver
@@ -18874,8 +19880,11 @@ def _handle_usinewgame(ctx, line):
                              name="mate-solver-async-start").start()
         else:
             ctx.mate_solver.send("usinewgame")
-    global _usi_session_active
+    global _usi_session_active, _GO_RECV_GEN, _BM_SENT_GEN, _STOP_REARM
     _usi_session_active = True
+    _GO_RECV_GEN = 0
+    _BM_SENT_GEN = 0
+    _STOP_REARM = False
     ctx.time_aggression.reset_to_static()
     ctx.game_meta["ponder_arb_dispatched"] = ctx.game_progress.ponder_arb_dispatched
     ctx.game_meta["ponder_arb_hits"] = ctx.game_progress.ponder_arb_hits
@@ -18893,6 +19902,9 @@ def _handle_usinewgame(ctx, line):
     if getattr(ctx, "book2", None) is not None:
         _book2_kill(ctx, reason="usinewgame — 新局のため第2 Book を一旦終了")
     ctx.book2_state.reset()
+    for _dl_eng in (ctx.dl_1, ctx.dl_2, ctx.dl_3):
+        if _dl_eng is not None:
+            _dl_eng._last_sp_sent = None
     _assert_sp_consistency(ctx, "usinewgame")
 
 
@@ -18902,7 +19914,7 @@ def _sync_sp_setoption(ctx, clock, label):
     _eff = clock.eff_s if clock is not None else 0.0
     _val = _bstr(_eff >= ctx.cfg.sp_min_eff_s)
     if _val != _nnue_1_opts.get("Stochastic_Ponder", "true"):
-        ctx.nnue_1.send(f"setoption name Stochastic_Ponder value {_val}")
+        ctx.nnue_1.setoption("Stochastic_Ponder", _val)
         _nnue_1_opts["Stochastic_Ponder"] = _val
         _dlog(f"go ponder({label}): nnue_1 Stochastic_Ponder → {_val} (eff_s={_eff:.2f}s)")
     else:
@@ -18922,17 +19934,10 @@ def _wire_ponder_live_cb(ctx):
     _fresh = [False]
 
     def _cb(ln):
-        _s = _RE_SCORE_CP.search(ln)
-        _sc = int(_s.group(1)) if _s else None
-        if _sc is None:
-            _m = _RE_MATE.search(ln)
-            if _m:
-                _sc = _mate_sign_score(int(_m.group(1)))
-        _pv = None
-        if " pv " in ln:
-            _p = _RE_PV_FULL.search(ln)
-            if _p:
-                _pv = _p.group(1).split()
+        _sc = ln.score_cp
+        if _sc is None and ln.mate is not None:
+            _sc = _mate_sign_score(ln.mate)
+        _pv = ln.pv.split() if ln.pv else None
         if _pv:
             if _pb is not None and not _bestmove_is_for_board(_pv[0], _pb):
                 return
@@ -18941,11 +19946,14 @@ def _wire_ponder_live_cb(ctx):
             return
         _LIVE.update_think_pv(pv=_pv, score_cp=_sc, pos=_pos)
     ctx.nnue_1._live_info_cb = _cb
+    _LIVE._live_register(ctx.nnue_1)
 
     if _eng_alive(ctx.dl_1):
         ctx.dl_1._live_info_cb = _make_dl1_multipv_cb(ctx, _pos)
+        _LIVE._live_register(ctx.dl_1)
     elif _eng_alive(ctx.dl_2):
         ctx.dl_2._live_info_cb = _make_dl1_multipv_cb(ctx, _pos)
+        _LIVE._live_register(ctx.dl_2)
 
 def _handle_go_ponder(ctx, line):
     if not _early_ponder:
@@ -18959,6 +19967,8 @@ def _handle_go_ponder(ctx, line):
         ctx.dl_1._live_info_cb = None
     if ctx.dl_2 is not None:
         ctx.dl_2._live_info_cb = None
+    global _GO_RECV_GEN
+    _GO_RECV_GEN += 1
     if ctx.endgame_mode:
         _dlog("[NNUE1-PONDER] go ponder: endgame_mode — forwarding to promoted nnue_1")
         if ctx.ps.nnue1_ponder_sent and ctx.nnue_1._alive:
@@ -19156,7 +20166,6 @@ def _handle_go_ponder(ctx, line):
 
 
 
-
 def _engine_lifecycle_restart(eng, opts, caller, readyok_timeout=30,
                               quit_first=False, post_flush=True):
     try:
@@ -19176,7 +20185,6 @@ def _engine_lifecycle_restart(eng, opts, caller, readyok_timeout=30,
     if post_flush:
         _prefetch_flush(eng, label=f"{eng.name}-post-restart", eff_s=None)
     return True
-
 
 
 _CHILD_RESTART_SLOTS = {
@@ -19534,19 +20542,31 @@ def _handle_go(ctx, line):
             try:
                 ctx.mate_solver.send(ctx.current_position)
                 ctx.mate_solver.send(line)
+                ctx._mate_go_active = True
                 def _forward_mate():
-                    while True:
-                        _out = ctx.mate_solver.readline(timeout=120)
-                        if _out is None:
-                            break
-                        if not _out:
-                            continue
-                        try:
-                            print(_out, flush=True)
-                        except OSError:
-                            pass
-                        if _out.startswith(("checkmate", "bestmove")):
-                            break
+                    try:
+                        while True:
+                            _out = ctx.mate_solver.readline(timeout=120)
+                            if _out is None:
+                                break
+                            if not _out:
+                                continue
+                            try:
+                                print(_out, flush=True)
+                            except OSError:
+                                pass
+                            if _out.startswith(("checkmate", "bestmove")):
+                                return
+                    except (KeyboardInterrupt, SystemExit, MemoryError):
+                        raise
+                    except Exception as _fm_exc:
+                        _flog(f"[GO-MATE] _forward_mate error: {_fm_exc!r}")
+                    try:
+                        print("checkmate notimplemented", flush=True)
+                    except OSError:
+                        pass
+                    finally:
+                        ctx._mate_go_active = False
                 threading.Thread(target=_forward_mate, daemon=True,
                                  name="go-mate-forward").start()
                 _flog(f"[GO-MATE] forwarded to mate_solver: {line!r}")
@@ -19560,6 +20580,8 @@ def _handle_go(ctx, line):
             print("checkmate notimplemented", flush=True)
             _flog("[GO-MATE] mate_solver unavailable — sent 'checkmate notimplemented'")
             return
+    global _GO_RECV_GEN
+    _GO_RECV_GEN += 1
     if ctx.game_progress.ponder_arb_stop is not None:
         try:
             ctx.game_progress.ponder_arb_stop.set()
@@ -19707,8 +20729,7 @@ def _handle_go(ctx, line):
                     _LIVE.set_think(book_rec, ctx.current_position, None)
                 ctx.game_progress.last_child_agreement = None
                 ctx.game_progress.last_nnue_mate_ply = None
-                ctx.game_progress.last_game_phase = _calc_game_phase(
-                    ctx.current_position, ctx.cfg) if ctx.current_position else ctx.game_progress.last_game_phase
+                ctx.game_progress.last_game_phase = book_gp if book_gp is not None else ctx.game_progress.last_game_phase
                 ctx.game_progress.council_agree_streak = 0
                 ctx.game_progress.opponent_id_last_sample = None
                 ctx.game_progress.ponder_arb_pred = None
@@ -19881,24 +20902,19 @@ def _drain_sp_early_bestmove(eng, caller="ponderhit", grace_s=0.30):
             if time.perf_counter() >= _deadline:
                 break
             continue
-        if _is_scored_info(out):
-            _dm = _RE_DEPTH.search(out)
-            _d = int(_dm.group(1)) if _dm else 0
+        if out.kind == "scored":
+            _d = out.depth if out.depth is not None else 0
             if _d >= nnue_info.get("depth", -1):
                 nnue_info["depth"] = _d
-                _sm = _RE_SCORE_CP.search(out)
-                if _sm:
-                    nnue_info["score_cp"] = int(_sm.group(1))
-                else:
-                    _mm = _RE_MATE.search(out)
-                    if _mm:
-                        nnue_info["score_cp"] = _mate_sign_score(int(_mm.group(1)))
-                        nnue_info["mate_ply"] = int(_mm.group(1))
+                if out.score_cp is not None:
+                    nnue_info["score_cp"] = out.score_cp
+                elif out.mate is not None:
+                    nnue_info["score_cp"] = _mate_sign_score(out.mate)
+                    nnue_info["mate_ply"] = out.mate
             continue
-        if out.startswith("bestmove"):
-            parts = out.split()
-            _bm = parts[1] if len(parts) >= 2 else ""
-            _pd = parts[3] if (len(parts) >= 4 and parts[2] == "ponder") else None
+        if out.kind == "bestmove":
+            _bm = out.bestmove or ""
+            _pd = out.ponder_move
             if _bm and _bm not in ("resign", "win", "(none)"):
                 nnue_info["bestmove"] = _bm
                 if _pd:
@@ -20061,28 +21077,23 @@ def _harvest_one_dl_ponder(eng, n, timeout_s, label, *, cfg=None):
     mate_detected = False
     _got_bestmove = False
     for line in eng.iter_until("bestmove", timeout=timeout_s):
-        if "bestmove" in line:
+        if line.kind == "bestmove":
             _got_bestmove = True
-        mm = _RE_MATE.search(line)
-        if mm and int(mm.group(1)) > 0:
+        _mate_n = line.mate
+        if _mate_n is not None and _mate_n > 0:
             mate_detected = True
-        if "multipv" not in line or " pv " not in line:
-            if " pv " not in line or not line.startswith("info"):
-                continue
-        score = 0
-        sm = _RE_SCORE_CP.search(line)
-        if sm:
-            score = int(sm.group(1))
-        if mm:
-            score = _mate_sign_score(int(mm.group(1)))
-        pv_m = _RE_PV_FULL.search(line)
-        if not pv_m:
+        if line.pv is None:
             continue
-        pv_moves  = pv_m.group(1).split()
-        root_move = pv_moves[0]
+        score = line.score_cp if line.score_cp is not None else 0
+        if _mate_n is not None:
+            score = _mate_sign_score(_mate_n)
+        _pv_toks = line.pv.split()
+        if not _pv_toks:
+            continue
+        root_move = _pv_toks[0]
+        pv_moves  = _pv_toks
         moves_scores[root_move] = score
-        dm = _RE_DEPTH.search(line)
-        depth = int(dm.group(1)) if dm else 0
+        depth = line.depth if line.depth is not None else 0
         score_hist.setdefault(root_move, []).append((depth, score))
         if depth > depth_best.get(root_move, -1):
             depth_best[root_move] = depth
@@ -20206,8 +21217,10 @@ def _ponderhit_preamble(ctx, line):
     ctx.nnue_1._live_info_cb = None
     if _eng_alive(ctx.dl_1):
         ctx.dl_1._live_info_cb = _make_dl1_multipv_cb(ctx, ctx.current_position)
+        _LIVE._live_register(ctx.dl_1)
     elif _eng_alive(ctx.dl_2):
         ctx.dl_2._live_info_cb = _make_dl1_multipv_cb(ctx, ctx.current_position)
+        _LIVE._live_register(ctx.dl_2)
     _mate_ponder_cancel(ctx, "ponderhit")
     if not ctx.ps.active and not ctx.ps.mate_skip_pending:
         _flog("ponderhit: WARNING — active=False and mate_skip_pending=False "
@@ -21322,6 +22335,10 @@ def _ponderhit_finalize(ctx, bestmove, ponder_move, position_cmd, move_count,
                 _ponderhit_emit_ni.get("score_cp"),
                 dl_spread_cp=_ph_conf_spread,
                 time_aggression_ratio=_ph_conf_ta)
+            _ph_dq = _compute_depth_quality(_ponderhit_emit_ni.get("depth"))
+            _ponderhit_emit_ni["depth_quality"]  = _ph_dq
+            _ponderhit_emit_ni["confidence_dq"] = _clamp01(
+                _ponderhit_emit_ni["confidence"] * _ph_dq)
             _ponderhit_emit_ni["sharpness"] = _compute_sharpness(
                 dl_spread_cp=_ph_conf_spread, dl_gap_cp=_ph_dl_gap,
                 dl_top=_ponderhit_dl_top, nnue_top=_nnue_bm,
@@ -21379,6 +22396,7 @@ def _ponderhit_finalize(ctx, bestmove, ponder_move, position_cmd, move_count,
         "ply": move_count,
         "eff_s": round(eff_s, 3),
         "bestmove": bestmove,
+        "council_winner": bestmove,
         "ponder": ponder_move,
         "prefetch_hit": extra_stats.get("prefetch_hit", False) if extra_stats else False,
         "prefetch_j_hit": extra_stats.get("prefetch_j_hit", False) if extra_stats else False,
@@ -21395,13 +22413,7 @@ def _ponderhit_finalize(ctx, bestmove, ponder_move, position_cmd, move_count,
         "pv_mate_step": None,
         "pv_mate_source": None,
         "pv_mate_override": False,
-        "confidence": (_ponderhit_emit_ni.get("confidence") if _ponderhit_emit_ni else None),
-        "sharpness": (_ponderhit_emit_ni.get("sharpness") if _ponderhit_emit_ni else None),
-        "momentum": (_ponderhit_emit_ni.get("momentum") if _ponderhit_emit_ni else None),
-        "regime_conviction": (_ponderhit_emit_ni.get("regime_conviction") if _ponderhit_emit_ni else None),
-        "regime_label": (_ponderhit_emit_ni.get("regime_label") if _ponderhit_emit_ni else None),
-        "regime_collapse": (_ponderhit_emit_ni.get("regime_collapse") if _ponderhit_emit_ni else None),
-        "regime_force_crisis": (_ponderhit_emit_ni.get("regime_force_crisis") if _ponderhit_emit_ni else None),
+        **_ni_record_fields(_ponderhit_emit_ni),
         "_diag": diag,
         "game_phase":       _ponderhit_fin_game_phase,
         **_gp_record_fields(_ponderhit_fin_game_phase,
@@ -21545,6 +22557,8 @@ def _handle_ponderhit(ctx, line):
     _ponderhit_finalize(ctx, bestmove, ponder_move, position_cmd,
                  move_count, ponderhit_pv_val=pv_val, extra_stats=extra_stats)
 def _handle_stop(ctx, line):
+    global _STOP_REARM
+    _STOP_REARM = True
     ctx.nnue_1._live_info_cb = None
     if ctx.dl_1 is not None:
         ctx.dl_1._live_info_cb = None
@@ -21561,6 +22575,9 @@ def _handle_stop(ctx, line):
     if _endgame_separate and ctx.nnue_2._alive:
         ctx.nnue_2.send("stop")
     _mate_ponder_cancel(ctx, "stop")
+    if getattr(ctx, "_mate_go_active", False):
+        _mate_solver_stop_safe(ctx, "go-mate-stop")
+        ctx._mate_go_active = False
 
     if ctx.ps.active:
         _flog("stop during go ponder — draining bestmove to GUI")
@@ -22119,7 +23136,6 @@ def _handle_replay(ctx, line):
     print("[replay] 終了", flush=True)
 
 
-
 import argparse
 import bisect
 import io
@@ -22190,6 +23206,40 @@ sv_SFEN_PC = {"P": "FU", "L": "KY", "N": "KE", "S": "GI", "G": "KI", "B": "KA",
 sv_SFEN_PROM = {"+P": "TO", "+L": "NY", "+N": "NK", "+S": "NG", "+B": "UM", "+R": "RY"}
 sv_PC_SFEN = {v: k for k, v in sv_SFEN_PC.items()}
 sv_PC_SFEN.update({v: k for k, v in sv_SFEN_PROM.items()})
+
+_SB_TO_SV_PID: dict[str, int] = {}
+for _ch, _nm in sv_SFEN_PC.items():
+    _pid_s = 1 + sv_PIECES.index(_nm)
+    _SB_TO_SV_PID[_ch] = _pid_s
+    _SB_TO_SV_PID[_ch.lower()] = _pid_s + sv_N_PIECE
+for _pr, _nm in sv_SFEN_PROM.items():
+    _pid_s = 1 + sv_PIECES.index(_nm)
+    _SB_TO_SV_PID[_pr] = _pid_s
+    _SB_TO_SV_PID[_pr[0] + _pr[1].lower()] = _pid_s + sv_N_PIECE
+_SB_HAND_IDX: dict[str, int] = {k: sv_HAND_ORDER.index(v) for k, v in sv_SFEN_PC.items() if v != "OU"}
+
+
+def _shogiboard_to_svboard(sb) -> "SvBoard":
+    svb = SvBoard()
+    cells = svb.cells
+    _lut = _SB_TO_SV_PID
+    for (f, r), pc in sb.board.items():
+        pid = _lut.get(pc)
+        if pid is not None:
+            cells[(r - 1) * 9 + (9 - f)] = pid
+    _hidx = _SB_HAND_IDX
+    for ch, cnt in sb.sente_hand.items():
+        idx = _hidx.get(ch)
+        if idx is not None:
+            svb.hand[0][idx] = cnt
+    for ch, cnt in sb.gote_hand.items():
+        idx = _hidx.get(ch)
+        if idx is not None:
+            svb.hand[1][idx] = cnt
+    svb.side = 0 if getattr(sb, "side", "b") == "b" else 1
+    svb.ply = getattr(sb, "ply", 1)
+    svb.last_to = getattr(sb, "_last_to", None)
+    return svb
 
 
 def sv_sq(file: int, rank: int) -> int:
@@ -22656,8 +23706,7 @@ def sv_geom(rng=None, augment=False):
     return cw, ch, px, py, ex, ex + 10 * cw
 
 
-def sv_img_to_x(im):
-    import torch
+def sv_img_to_np(im):
     if not isinstance(im, np.ndarray):
         if sv_GRAY:
             arr = np.asarray(im.convert("L"), np.float32)[None, :, :]
@@ -22670,7 +23719,12 @@ def sv_img_to_x(im):
         else:
             arr = a3.transpose(2, 0, 1)
     arr /= 255.0
-    return torch.from_numpy(arr)
+    return np.ascontiguousarray(arr)
+
+
+def sv_img_to_x(im):
+    import torch
+    return torch.from_numpy(sv_img_to_np(im))
 
 
 def _sv_find_cjk_font():
@@ -22775,55 +23829,6 @@ def sv_value_target(winner, side, ply, total, lam=0.02):
         return None
     z = 1.0 if winner == side else 0.0
     return 0.5 + (z - 0.5) * math.exp(-lam * max(0, total - ply))
-
-
-def sv_cmd_dataset(a):
-    from PIL import Image as _Img
-    rng = random.Random(a.seed)
-    os.makedirs(os.path.join(a.out, "img"), exist_ok=True)
-    _tcache = _SvTrainTileCache(seed=a.seed)
-    recs = {"cells": [], "hand": [], "side": [], "value": [], "policy": [], "file": []}
-    n = 0
-    games = 0
-    for b0, moves, winner, score in sv_load_games(a.inputs):
-        games += 1
-        b = b0.clone()
-        total = len(moves)
-        positions = [(b.clone(), moves[0] if moves else None, None)]
-        for i, mv in enumerate(moves):
-            b.apply_usi(mv)
-            last_to = (int(mv[2]), ord(mv[3]) - ord("a") + 1)
-            positions.append((b.clone(), moves[i + 1] if i + 1 < total else None, last_to))
-        if a.max_pos and len(positions) > a.max_pos:
-            positions = rng.sample(positions, a.max_pos)
-        for pos_b, nxt, last_to in positions:
-            v = sv_value_target(winner, pos_b.side, pos_b.ply, total + 1, a.value_lambda)
-            if score is not None:
-                v = _cp_to_winrate(score, sv_WR_SLOPE)
-            for _ in range(a.per_pos):
-                im_np = _tcache.render(pos_b, rng, augment=not a.no_augment,
-                                       last_to=last_to, strength=a.aug)
-                fn = "%06d.png" % n
-                _Img.fromarray(im_np).save(os.path.join(a.out, "img", fn))
-                recs["cells"].append(np.array(pos_b.cells, dtype=np.int8))
-                recs["hand"].append(np.array(pos_b.hand, dtype=np.int8).reshape(-1))
-                recs["side"].append(pos_b.side)
-                recs["value"].append(-1.0 if v is None else v)
-                recs["policy"].append(-1 if nxt is None else sv_usi_to_label(nxt))
-                recs["file"].append(fn)
-                n += 1
-    np.savez_compressed(os.path.join(a.out, "labels.npz"),
-                        cells=np.stack(recs["cells"]) if n else np.zeros((0, 81), np.int8),
-                        hand=np.stack(recs["hand"]) if n else np.zeros((0, 14), np.int8),
-                        side=np.array(recs["side"], np.int8),
-                        value=np.array(recs["value"], np.float32),
-                        policy=np.array(recs["policy"], np.int32),
-                        files=np.array(recs["file"]))
-    meta = {"n": n, "games": games, "img": sv_IMG, "n_cell_class": sv_N_CELL_CLASS,
-            "n_move_labels": sv_N_MOVE_LABELS}
-    json.dump(meta, open(os.path.join(a.out, "meta.json"), "w"))
-    print("[dataset] %d games -> %d samples -> %s" % (games, n, a.out))
-
 
 if _SV_OK:
     sv_PACK_DT = np.dtype([("cells", "i1", 81), ("hand", "i1", 14), ("side", "i1"),
@@ -23152,6 +24157,8 @@ class _SvInfer:
 
     def __init__(self):
         self._model = None
+        self._ort = None
+        self._ort_in = None
         self._loaded = False
         self._lock = threading.Lock()
         self._grid_np = None
@@ -23198,6 +24205,16 @@ class _SvInfer:
             except ImportError as _ie:
                 _flog("[SvInfer] 再 import 失敗: %s — model WR 無効" % _ie)
                 return
+        _exe_dir = (os.path.dirname(sys.executable) if _IS_FROZEN
+                    else os.path.dirname(os.path.abspath(__file__)))
+        _p_onnx = os.path.join(_exe_dir, "model.onnx")
+        if (os.path.exists(_p_onnx)
+                and os.environ.get("PYFAMATE_SVINFER_NO_ONNX", "") != "1"):
+            self._load_onnx(_p_onnx)
+            if self._ort is not None:
+                self._prepare_tiles()
+                return
+            _flog("[SvInfer] model.onnx ロード不成立 — torch 経路へフォールバック")
         try:
             import torch
         except ImportError:
@@ -23225,8 +24242,6 @@ class _SvInfer:
         if vram_mb < 6144:
             _flog("[SvInfer] VRAM %dMB < 6144MB — model WR 無効" % vram_mb)
             return
-        _exe_dir = (os.path.dirname(sys.executable) if _IS_FROZEN
-                    else os.path.dirname(os.path.abspath(__file__)))
         p_slim = os.path.join(_exe_dir, "model.infer.pt")
         p_full = os.path.join(_exe_dir, "model.pt")
         _prefer_slim = globals().get("_SVINFER_USE_SLIM", True)
@@ -23269,6 +24284,20 @@ class _SvInfer:
             _flog("[SvInfer] %s loaded (%.1fMB, VRAM %dMB) — model WR 有効"
                   % (os.path.basename(p), os.path.getsize(p) / 1e6, vram_mb))
             self._prepare_tiles()
+
+    def _load_onnx(self, path):
+        r = _svonnx_load_session(path)
+        if not r:
+            return
+        global sv_IMG, sv_GRAY
+        if r["img"] != sv_IMG:
+            _flog("[SvInfer] レンダリング解像度を model.onnx に追従: %d → %d"
+                  % (sv_IMG, r["img"]))
+            sv_IMG = r["img"]
+        sv_GRAY = (r["in_ch"] == 1)
+        self._has_gp = r["has_gp"]
+        self._ort = r["sess"]
+        self._ort_in = r["input"]
 
     def _prepare_tiles(self):
         cw, ch, px, py, x_gote, x_sente = sv_geom()
@@ -23355,35 +24384,43 @@ class _SvInfer:
         with self._lock:
             if not self._loaded:
                 self._load()
-        if self._model is None:
+        if self._model is None and self._ort is None:
             return None
         try:
-            import torch
             if self._grid_np is not None:
                 arr = self._render_fast(sb)
             else:
                 im = sv_render_board(sb, random.Random(0), augment=False,
                                      last_to=sb.last_to)
                 arr = np.asarray(im, np.uint8)
-            x = sv_img_to_x(arr)[None].cuda()
-            try:
-                x = x.to(memory_format=torch.channels_last)
-            except Exception:
-                pass
             _want_gp = getattr(self, "_has_gp", False)
-            with torch.inference_mode():
-                with torch.autocast("cuda", dtype=torch.float16):
-                    if _want_gp and hasattr(self._model, "forward_value_gp"):
-                        out_v, out_g = self._model.forward_value_gp(x)
-                    else:
-                        out_v = self._model.forward_value(x)
-                        out_g = None
-            v = float(torch.sigmoid(out_v.float())[0])
+            if self._ort is not None:
+                outs = self._ort.run(None,
+                                     {self._ort_in: sv_img_to_np(arr)[None]})
+                _lg = max(-60.0, min(60.0, float(outs[0].reshape(-1)[0])))
+                v = 1.0 / (1.0 + math.exp(-_lg))
+                _g = (outs[1].reshape(-1)
+                      if _want_gp and len(outs) >= 2 else None)
+            else:
+                import torch
+                x = sv_img_to_x(arr)[None].cuda()
+                try:
+                    x = x.to(memory_format=torch.channels_last)
+                except Exception:
+                    pass
+                with torch.inference_mode():
+                    with torch.autocast("cuda", dtype=torch.float16):
+                        if _want_gp and hasattr(self._model, "forward_value_gp"):
+                            out_v, out_g = self._model.forward_value_gp(x)
+                        else:
+                            out_v = self._model.forward_value(x)
+                            out_g = None
+                v = float(torch.sigmoid(out_v.float())[0])
+                _g = out_g.float()[0] if out_g is not None else None
             if sb.side == 1:
                 v = 1.0 - v
             r = {"value": v}
-            if out_g is not None:
-                _g = out_g.float()[0]
+            if _g is not None:
                 r["gp"] = _clamp(float(_g[0]), 0.0, 1.5)
                 r["nyug"] = _clamp01(float(_g[1]))
             return r
@@ -23396,8 +24433,427 @@ class _SvInfer:
         sb.last_to = last_to
         return self.infer(sb)
 
+    def infer_board(self, shogi_board):
+        svb = _shogiboard_to_svboard(shogi_board)
+        return self.infer(svb)
 
-_sv_infer = _SvInfer()
+
+_sv_infer_instance = None
+
+
+def _sv_infer_get():
+    global _sv_infer_instance
+    if _sv_infer_instance is None:
+        _sv_infer_instance = _SvInfer()
+    return _sv_infer_instance
+
+
+
+
+def _svonnx_here():
+    return (os.path.dirname(sys.executable) if _IS_FROZEN
+            else os.path.dirname(os.path.abspath(__file__)))
+
+
+def _svonnx_vram_mb():
+    import shutil
+    if not shutil.which("nvidia-smi"):
+        return None
+    try:
+        r = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.total",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=10)
+        lines = (r.stdout or "").strip().splitlines()
+        return int(float(lines[0].strip())) if lines else None
+    except Exception:
+        return None
+
+
+def _svonnx_stale_ckpt(onnx_path, margin_s=60.0):
+    try:
+        t_onnx = os.path.getmtime(onnx_path)
+        d = os.path.dirname(os.path.abspath(onnx_path))
+        for n in ("model.infer.pt", "model.pt"):
+            p = os.path.join(d, n)
+            if os.path.exists(p) and os.path.getmtime(p) > t_onnx + margin_s:
+                return n
+    except Exception:
+        pass
+    return None
+
+
+def _svonnx_cuda_dll_hunt(anchor):
+    if os.name != "nt":
+        return []
+    cands = []
+    try:
+        eng_root = os.path.dirname(os.path.dirname(os.path.abspath(anchor)))
+        for d1 in os.scandir(eng_root):
+            if d1.is_dir():
+                cands.append(d1.path)
+                try:
+                    cands += [d2.path for d2 in os.scandir(d1.path)
+                              if d2.is_dir()]
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    cp = os.environ.get("CUDA_PATH", "")
+    if cp:
+        cands.append(os.path.join(cp, "bin"))
+    for sp in list(sys.path):
+        nv = os.path.join(sp, "nvidia")
+        if os.path.isdir(nv):
+            try:
+                for d1 in os.scandir(nv):
+                    b = os.path.join(d1.path, "bin")
+                    if os.path.isdir(b):
+                        cands.append(b)
+            except Exception:
+                pass
+    hits = {}
+    for d in cands:
+        for pat in ("cudnn64_*.dll", "cublas64_*.dll", "cudart64_*.dll"):
+            if glob.glob(os.path.join(d, pat)):
+                hits.setdefault(d, set()).add(pat.split("64_")[0])
+    if not hits:
+        _flog("[SvInfer] [CUDA-DLL-HUNT] cudnn/cublas/cudart をマシン内で"
+              "発見できず (探索 %d dir)" % len(cands))
+        return []
+    dirs = sorted(hits, key=lambda d: -len(hits[d]))
+    for d in dirs:
+        try:
+            os.add_dll_directory(d)
+        except Exception:
+            pass
+    os.environ["PATH"] = (os.pathsep.join(dirs) + os.pathsep
+                          + os.environ.get("PATH", ""))
+    _flog("[SvInfer] [CUDA-DLL-HUNT] 登録: %s"
+          % "; ".join("%s (%s)" % (d, ",".join(sorted(hits[d])))
+                      for d in dirs[:4]))
+    return dirs
+
+
+def _svonnx_adopt_system_syspath():
+    try:
+        pycmd = _ensure_system_python()
+        if not pycmd:
+            return
+        r = subprocess.run(
+            pycmd + ["-c", "import sys; print('\\n'.join(sys.path))"],
+            capture_output=True, text=True, timeout=10)
+        for line in (r.stdout or "").strip().splitlines():
+            if line and line not in sys.path:
+                sys.path.append(line)
+    except Exception:
+        pass
+
+
+def _svonnx_load_session(path):
+    try:
+        try:
+            import onnxruntime as ort
+        except ImportError:
+            if _IS_FROZEN:
+                _svonnx_adopt_system_syspath()
+            try:
+                import onnxruntime as ort
+            except ImportError:
+                if not _auto_install_ok():
+                    _flog("[SvInfer] onnxruntime 未導入 — PYFAMATE_NO_AUTO_INSTALL=1"
+                          " のため自動インストールをスキップ")
+                    return None
+                _flog("[SvInfer] onnxruntime 未導入 — onnxruntime-gpu を自動インストール中…")
+                if not _pip_install(["onnxruntime-gpu"]):
+                    _flog("[SvInfer] onnxruntime-gpu install 失敗")
+                    return None
+                try:
+                    import onnxruntime as ort
+                except ImportError:
+                    _flog("[SvInfer] onnxruntime 再 import 失敗")
+                    return None
+        avail = list(ort.get_available_providers())
+        pref = ["CUDAExecutionProvider"]
+        if os.environ.get("PYFAMATE_SVINFER_DML", "") == "1":
+            pref.append("DmlExecutionProvider")
+        if os.environ.get("PYFAMATE_SVINFER_CPU", "") == "1":
+            pref.append("CPUExecutionProvider")
+        provs = [p for p in pref if p in avail]
+        vram_mb = _svonnx_vram_mb()
+        if vram_mb is not None and vram_mb < 6144:
+            _flog("[SvInfer] VRAM %dMB < 6144MB — GPU EP 無効化" % vram_mb)
+            provs = [p for p in provs if p == "CPUExecutionProvider"]
+        if not provs:
+            _flog("[SvInfer] 使用可能な EP なし (avail=%s) — 既定は CUDA のみ。"
+                  "onnxruntime-gpu が必要 (DML/CPU を使うなら明示ノブ"
+                  " PYFAMATE_SVINFER_DML=1 / PYFAMATE_SVINFER_CPU=1)"
+                  % ",".join(avail))
+            return None
+        so = ort.SessionOptions()
+        so.log_severity_level = 3
+
+        def _try_ep(prov):
+            try:
+                return ort.InferenceSession(path, sess_options=so,
+                                            providers=[prov])
+            except Exception as pe:
+                _flog("[SvInfer] EP %s 初期化失敗: %r" % (prov, pe))
+                return None
+
+        sess = None
+        if "CUDAExecutionProvider" in provs:
+            _svonnx_cuda_dll_hunt(path)
+            sess = _try_ep("CUDAExecutionProvider")
+            if sess is None and _auto_install_ok():
+                _flog("[SvInfer] [CUDA-DLL-PIP] cudnn/cublas wheel を導入して再試行")
+                if _pip_install(["nvidia-cudnn-cu12", "nvidia-cublas-cu12"]):
+                    _svonnx_cuda_dll_hunt(path)
+                    sess = _try_ep("CUDAExecutionProvider")
+        if sess is None and "DmlExecutionProvider" in provs:
+            sess = _try_ep("DmlExecutionProvider")
+        if sess is None and "CPUExecutionProvider" in provs:
+            sess = _try_ep("CPUExecutionProvider")
+        if sess is None:
+            _flog("[SvInfer] InferenceSession 生成失敗 — model.onnx 不使用"
+                  " (詳細は上の EP 初期化失敗ログ)")
+            return None
+        st = _svonnx_stale_ckpt(path)
+        if st:
+            _flog("[SvInfer] [注意] %s が model.onnx より新しい — 旧モデルの"
+                  " ONNX を使用中。export-onnx で再生成を推奨" % st)
+        ishape = sess.get_inputs()[0].shape
+        r = {"sess": sess,
+             "input": sess.get_inputs()[0].name,
+             "in_ch": int(ishape[1]),
+             "img": int(ishape[2]),
+             "has_gp": len(sess.get_outputs()) >= 2,
+             "vram_mb": vram_mb}
+        _flog("[SvInfer] model.onnx loaded (%.1fMB, EP=%s%s) — model WR 有効"
+              % (os.path.getsize(path) / 1e6, sess.get_providers()[0],
+                 (", VRAM %dMB" % vram_mb) if vram_mb is not None else ""))
+        return r
+    except Exception as oe:
+        _flog("[SvInfer] model.onnx ロード失敗: %r" % (oe,))
+        return None
+
+
+def _sv_adaptive_avg_matrix(n_in, n_out):
+    import torch
+    A = torch.zeros(n_out, n_in)
+    for i in range(n_out):
+        s = (i * n_in) // n_out
+        e = -((-(i + 1) * n_in) // n_out)
+        A[i, s:e] = 1.0 / (e - s)
+    return A
+
+
+def _svonnx_export_ckpt(ckpt, out=None, *, opset=17, verify=True, log=None):
+    import torch
+    p = log if log is not None else (lambda m: print(m, flush=True))
+    out = out or os.path.join(os.path.dirname(os.path.abspath(ckpt)),
+                              "model.onnx")
+    p("[export-onnx] load: %s" % ckpt)
+    ck = torch.load(ckpt, map_location="cpu", weights_only=False)
+    arch = ck.get("arch") if isinstance(ck, dict) else None
+    img = int((arch or {}).get("img", 256))
+    in_ch = int((arch or {}).get("in_ch", 3))
+    if isinstance(arch, dict):
+        arch = {k: v for k, v in arch.items()
+                if k in ("ch", "blocks", "ver", "in_ch")}
+    model = _sv_build_model(**(arch or {}))
+    sd = (ck.get("ema") or ck.get("model") or ck) if isinstance(ck, dict) else ck
+    sd = {k: (v.float() if getattr(v, "dtype", None) is not None
+              and v.dtype.is_floating_point else v) for k, v in sd.items()}
+    model.load_state_dict(sd, strict=False)
+    model.eval()
+    has_gp = any(k.startswith("gp_head.") for k in sd)
+    with torch.no_grad():
+        S = int(model.body(model.stem(
+            torch.zeros(1, in_ch, img, img))).shape[-1])
+
+    class _OnnxWrap(torch.nn.Module):
+        def __init__(self, m):
+            super().__init__()
+            self.m = m
+            self.is_v2 = hasattr(m, "value_conv")
+            if self.is_v2:
+                A = _sv_adaptive_avg_matrix(S, 9)
+                self.register_buffer("A", A)
+                self.register_buffer("At", A.t().contiguous())
+
+        def forward(self, x):
+            f = self.m.body(self.m.stem(x))
+            g = f.mean((2, 3))
+            if self.is_v2:
+                f9 = torch.matmul(torch.matmul(self.A, f), self.At)
+                v = self.m.value_head(
+                    self.m.value_conv(f9).flatten(1)).squeeze(1)
+            else:
+                v = self.m.value_head(g).squeeze(1)
+            if has_gp:
+                return v, self.m.gp_head(g)
+            return v
+
+    wrap = _OnnxWrap(model).eval()
+    p("[export-onnx] arch=%s img=%d in_ch=%d S=%d gp=%s"
+      % (arch, img, in_ch, S, has_gp))
+    if verify:
+        with torch.no_grad():
+            xt = torch.rand(2, in_ch, img, img)
+            yw = wrap(xt)
+            if has_gp:
+                yr = model.forward_value_gp(xt)
+                diff = max(float((yw[0] - yr[0]).abs().max()),
+                           float((yw[1] - yr[1]).abs().max()))
+            else:
+                diff = float((wrap(xt) - model.forward_value(xt)).abs().max())
+        p("[export-onnx] wrapper vs torch forward: max|diff|=%.3g" % diff)
+        if diff > 1e-4:
+            raise ValueError("wrapper/torch 数値不一致 max|diff|=%.3g — export 中止"
+                             % diff)
+    out_names = ["value", "gp"] if has_gp else ["value"]
+    dyn = {"x": {0: "batch"}}
+    dyn.update({n: {0: "batch"} for n in out_names})
+    ex_kw = dict(input_names=["x"], output_names=out_names,
+                 dynamic_axes=dyn, opset_version=int(opset))
+    dummy = torch.zeros(1, in_ch, img, img)
+    try:
+        try:
+            torch.onnx.export(wrap, dummy, out + ".tmp", dynamo=False, **ex_kw)
+        except TypeError:
+            torch.onnx.export(wrap, dummy, out + ".tmp", **ex_kw)
+    except Exception as ee:
+        if "onnx" in repr(ee).lower() and "instal" in repr(ee).lower():
+            p("[export-onnx] onnx パッケージが必要です: pip install onnx")
+        raise
+    os.replace(out + ".tmp", out)
+    p("[export-onnx] wrote %s (%.1fMB)" % (out, os.path.getsize(out) / 1e6))
+    if verify:
+        try:
+            import onnxruntime as ort
+            s = ort.InferenceSession(out, providers=["CPUExecutionProvider"])
+            with torch.no_grad():
+                xt = torch.rand(1, in_ch, img, img)
+                ro = s.run(None, {"x": xt.numpy()})
+                rt = wrap(xt)
+                rt = [t.numpy() for t in (rt if has_gp else (rt,))]
+            odiff = max(float(abs(ro[i] - rt[i]).max()) for i in range(len(ro)))
+            p("[export-onnx] onnxruntime(CPU) vs torch: max|diff|=%.3g %s"
+              % (odiff, "OK" if odiff < 1e-3 else "[WARN] 差が大きい"))
+        except ImportError:
+            p("[export-onnx] onnxruntime 未導入のため ORT 検証はスキップ")
+    return out
+
+
+def _svonnx_export_cli(rest):
+    import argparse
+    try:
+        import torch
+    except ImportError:
+        print("[export-onnx] torch が必要です (変換時のみ): pip install torch",
+              flush=True)
+        sys.exit(1)
+    ap = argparse.ArgumentParser(prog="export-onnx",
+                                 description="model(.infer).pt → model.onnx 変換")
+    ap.add_argument("--ckpt", default="",
+                    help="入力 checkpoint (省略時 model.infer.pt → model.pt の順)")
+    ap.add_argument("--out", default="",
+                    help="出力パス (省略時 checkpoint と同じ場所の model.onnx)")
+    ap.add_argument("--opset", type=int, default=17)
+    ap.add_argument("--no-verify", action="store_true",
+                    help="torch forward との数値一致検証を省略")
+    a = ap.parse_args(rest)
+    ckpt = a.ckpt
+    if not ckpt:
+        for c in ("model.infer.pt", "model.pt"):
+            p = os.path.join(_svonnx_here(), c)
+            if os.path.exists(p):
+                ckpt = p
+                break
+    if not ckpt or not os.path.exists(ckpt):
+        print("[export-onnx] checkpoint が見つかりません: %s"
+              % (ckpt or _svonnx_here()), flush=True)
+        sys.exit(1)
+    try:
+        _svonnx_export_ckpt(ckpt, a.out or None, opset=a.opset,
+                            verify=not a.no_verify)
+    except ValueError as ve:
+        print("[export-onnx] [ERROR] %s" % ve, flush=True)
+        sys.exit(1)
+
+
+def _svcheck_cli(rest):
+    import platform
+    _res = []
+
+    def _p(tag, msg):
+        _res.append(tag)
+        print("[check-model] %-2s %s" % (tag, msg), flush=True)
+
+    _here = _svonnx_here()
+    _p("*", "%s / Python %s / %s"
+       % ("exe (frozen)" if _IS_FROZEN else "script",
+          platform.python_version(), platform.platform()))
+    for _n in ("model.onnx", "model.infer.pt", "model.pt"):
+        _f = os.path.join(_here, _n)
+        _p("*", "%-14s: %s" % (_n, "%.1fMB" % (os.path.getsize(_f) / 1e6)
+                               if os.path.exists(_f) else "なし"))
+    _onnx_p = os.path.join(_here, "model.onnx")
+    if os.path.exists(_onnx_p):
+        _st = _svonnx_stale_ckpt(_onnx_p)
+        if _st:
+            _p("*", "[注意] %s が model.onnx より新しい — 再学習後に"
+                    " export-onnx が未実行の可能性 (旧モデルで推論中)" % _st)
+    try:
+        import onnxruntime as _ort_chk
+        _p("OK", "onnxruntime %s / 利用可能 EP: %s"
+           % (_ort_chk.__version__,
+              ", ".join(_ort_chk.get_available_providers())))
+    except ImportError:
+        _p("NG", "onnxruntime 未導入 — torch フォールバックのみ試行")
+    _vram = _svonnx_vram_mb()
+    _p("*", "nvidia-smi VRAM: %s"
+       % ("%dMB" % _vram if _vram is not None
+          else "取得不可 — NVIDIA ドライバなし?"))
+    _sfen = ("lnsgkgsnl/1r5b1/ppppppppp/9/9/9/"
+             "PPPPPPPPP/1B5R1/LNSGKGSNL b - 1")
+    r, _t_first = None, 0.0
+    try:
+        _t0 = time.time()
+        r = _sv_infer_get().infer_sfen(_sfen)
+        _t_first = (time.time() - _t0) * 1000.0
+    except Exception as _ce:
+        _p("NG", "infer 例外: %r" % (_ce,))
+    _svi = _sv_infer_get()
+    if _svi._ort is not None:
+        _ep = _svi._ort.get_providers()[0]
+        _p("OK" if _ep != "CPUExecutionProvider" else "*",
+           "backend=onnxruntime EP=%s" % _ep)
+    elif _svi._model is not None:
+        _p("OK", "backend=torch フォールバック経路")
+    else:
+        _p("NG", "model ロード不成立 — 理由は diagnosis.txt の [SvInfer] 行")
+    if r is None:
+        _p("NG", "推論不成立 — model WR はこの環境では無効")
+    else:
+        _n = 20
+        _t0 = time.time()
+        for _ in range(_n):
+            r = _sv_infer_get().infer_sfen(_sfen)
+        _avg = (time.time() - _t0) * 1000.0 / _n
+        _p("OK", "平手 value=%.3f%s / 初回 %.0fms ロード込 / 平均 %.1fms/局面"
+           % (r["value"],
+              (" gp=%.2f nyug=%.2f" % (r["gp"], r["nyug"])) if "gp" in r else "",
+              _t_first, _avg))
+        if not (0.25 <= r["value"] <= 0.75):
+            _p("*", "[注意] 平手 value が 0.5 から大きく乖離 — 駒フォントが"
+                    "学習時と異なる可能性 (CJK フォント導入を確認)")
+    _ok = "NG" not in _res
+    print("[check-model] %s" % ("PASS — model WR 有効" if _ok
+                                else "FAIL — model WR 無効 (NG 行が原因)"),
+          flush=True)
+    sys.exit(0 if _ok else 1)
 
 
 class SvDataset:
@@ -23442,6 +24898,11 @@ class SvPackDataset:
         self.aug, self.vlam = aug, value_lambda
         self._rng = None
         self._tile_cache = None
+        self.gpu_render = False
+        self._worker_globals = {
+            "sv_IMG": sv_IMG, "sv_GRAY": sv_GRAY,
+            "sv_WR_SLOPE": sv_WR_SLOPE, "sv_GP_FUSE": sv_GP_FUSE,
+        }
 
     def __getstate__(self):
         return _pickle_clear(self, "shards", "_rng", "_tile_cache")
@@ -23454,6 +24915,12 @@ class SvPackDataset:
         if self.shards is None:
             self.shards = [np.memmap(fp, dtype=self.dt, mode="r")
                            for fp in self.paths]
+            global sv_IMG, sv_GRAY, sv_WR_SLOPE, sv_GP_FUSE
+            wg = self._worker_globals
+            sv_IMG = wg["sv_IMG"]
+            sv_GRAY = wg["sv_GRAY"]
+            sv_WR_SLOPE = wg["sv_WR_SLOPE"]
+            sv_GP_FUSE = wg["sv_GP_FUSE"]
         if self._rng is None:
             info = torch.utils.data.get_worker_info()
             seed = int(info.seed if info else torch.initial_seed()) & 0x7FFFFFFF
@@ -23461,14 +24928,17 @@ class SvPackDataset:
         s = bisect.bisect_right(self.offsets, i) - 1
         rec = self.shards[s][i - self.offsets[s]]
         b = sv_record_to_board(rec)
-        lt = int(rec["last_to"]) if "last_to" in self.dt.names else -1
-        last_to = (9 - lt % 9, lt // 9 + 1) if lt >= 0 else None
-        if self._tile_cache is None:
-            self._tile_cache = _SvTrainTileCache(
-                seed=self._rng.randint(0, 2**31 - 1))
-        im = self._tile_cache.render(b, self._rng, augment=self.aug > 0,
-                                     last_to=last_to, strength=self.aug)
-        x = sv_img_to_x(im)
+        if self.gpu_render:
+            x = torch.zeros(1)
+        else:
+            lt = int(rec["last_to"]) if "last_to" in self.dt.names else -1
+            last_to = (9 - lt % 9, lt // 9 + 1) if lt >= 0 else None
+            if self._tile_cache is None:
+                self._tile_cache = _SvTrainTileCache(
+                    seed=self._rng.randint(0, 2**31 - 1))
+            im = self._tile_cache.render(b, self._rng, augment=self.aug > 0,
+                                         last_to=last_to, strength=self.aug)
+            x = sv_img_to_x(im)
         res, ply, total = int(rec["result"]), int(rec["ply"]), int(rec["total"])
         v = -1.0
         if res >= 0:
@@ -24024,6 +25494,8 @@ def sv_cmd_train(a):
     _budget_mb = _sv_avail_ram_mb() - 4096
     _n_workers = max(0, int(a.workers))
     _prefetch = 4
+    if dev == "cuda" and hasattr(ds, "gpu_render"):
+        ds.gpu_render = True
     if _n_workers > 0 and _budget_mb > 0:
         _gpu_rend = dev == "cuda" and hasattr(ds, "gpu_render") and ds.gpu_render
         _worker_mb = 800 if _gpu_rend else 1200
@@ -24062,15 +25534,17 @@ def sv_cmd_train(a):
     _dlkw = dict(num_workers=_n_workers, drop_last=True, pin_memory=_pin)
     if _n_workers > 0:
         _dlkw.update(persistent_workers=True, prefetch_factor=_prefetch)
-    if dev == "cuda" and hasattr(ds, "gpu_render"):
-        ds.gpu_render = True
     val_dl = None
     if a.val_frac > 0 and len(ds) > 100:
         tr = SvStridedSplit(ds, a.val_frac, train=True)
         va = SvStridedSplit(ds, a.val_frac, train=False)
         dl = _sv_safe_dataloader(tr, a.batch, True, _dlkw)
-        val_dl = DataLoader(va, batch_size=a.batch, num_workers=0)
-        print("[train] val split: %d samples" % len(va))
+        _val_workers = min(2, _n_workers)
+        _val_dlkw = dict(num_workers=_val_workers, drop_last=False, pin_memory=_pin)
+        if _val_workers > 0:
+            _val_dlkw.update(persistent_workers=True, prefetch_factor=2)
+        val_dl = _sv_safe_dataloader(va, a.batch, False, _val_dlkw)
+        print("[train] val split: %d samples (workers=%d)" % (len(va), _val_workers))
     else:
         dl = _sv_safe_dataloader(ds, a.batch, True, _dlkw)
     opt = torch.optim.AdamW(model.parameters(), lr=a.lr, weight_decay=1e-4)
@@ -24133,6 +25607,12 @@ def sv_cmd_train(a):
             torch.save({"ema": _slim, "arch": _arch, "value_only": True},
                        _ip + ".tmp")
             os.replace(_ip + ".tmp", _ip)
+            try:
+                _svonnx_export_ckpt(_ip, verify=False, log=lambda _m: None)
+                print("[train] model.onnx auto-export OK", flush=True)
+            except Exception as _oe:
+                print("[train] model.onnx auto-export failed (無視して続行): %r"
+                      % (_oe,), flush=True)
         except Exception as _se:
             print("[train] slim export failed (無視して続行): %r" % (_se,), flush=True)
 
@@ -24495,41 +25975,6 @@ def sv_cmd_learn(a):
     _flog(f"[learn] completed: {a.out}")
     print("[learn] 完了:", a.out)
 
-
-def sv_cmd_eval(a):
-    import torch
-    dev = "cuda" if torch.cuda.is_available() else "cpu"
-    ck = torch.load(a.model, map_location=dev)
-    _arch = ck.get("arch") if isinstance(ck, dict) else None
-    model = _sv_build_model(**(_arch or {})).to(dev)
-    if isinstance(ck, dict) and "ema" in ck:
-        model.load_state_dict(ck["ema"])
-    elif isinstance(ck, dict) and "model" in ck:
-        model.load_state_dict(ck["model"])
-    else:
-        model.load_state_dict(ck)
-    model.eval()
-    im = Image.open(a.image).convert("RGB").resize((sv_IMG, sv_IMG))
-    x = sv_img_to_x(im)[None].to(dev)
-    with torch.no_grad():
-        out = model(x)
-    cells = out["cells"][0].argmax(0).flatten().tolist()
-    b = SvBoard()
-    b.cells = cells
-    b.side = int(torch.sigmoid(out["side"])[0] > 0.5)
-    hand = out["hand"][0].round().clamp(min=0).int().tolist()
-    b.hand = [hand[:7], hand[7:]]
-    v = float(torch.sigmoid(out["value"])[0])
-    logits = out["policy"][0].cpu().numpy()
-    mask = sv_policy_mask(b)
-    if mask.any():
-        logits = np.where(mask, logits, -np.inf)
-    p = int(logits.argmax())
-    print("認識SFEN :", b.to_sfen())
-    print("手番側勝率:", "%.1f%%" % (v * 100))
-    print("予測次手  :", sv_label_to_usi(p))
-
-
 def sv_learn_main(argv):
     ap = argparse.ArgumentParser(prog="learn", description="盤面ビジョンモデル学習")
     ap.add_argument("--kif", default="", help=r"棋譜フォルダ (既定 C:\kif, E:\kif)")
@@ -24797,6 +26242,18 @@ def _handle_learn(ctx, line):
 
 
 
+
+def _handle_dumpparams(ctx, line):
+    try:
+        params = _spsa_default_params()
+        dump = {p.name: (int(p.value) if p.is_int else round(p.value, 6)) for p in params}
+        print("info string dumpparams " + json.dumps(dump, ensure_ascii=False), flush=True)
+        _flog("[DUMPPARAMS] %d params dumped" % len(dump))
+    except Exception as e:
+        print("info string dumpparams error: %s" % e, flush=True)
+        _flog("[DUMPPARAMS] error: %r" % e)
+
+
 EXACT_DISPATCH = {
     "usi":        _handle_usi,
     "isready":    _handle_isready,
@@ -24815,6 +26272,7 @@ EXACT_DISPATCH = {
     "makebook":   _handle_makebook,
     "dlp":        _handle_dlp,
     "replay":     _handle_replay,
+    "dumpparams": _handle_dumpparams,
 }
 
 TOKEN_DISPATCH = {
@@ -24862,7 +26320,6 @@ def _dispatch(ctx, line):
         _handle_bare_sfen(ctx, line)
         return
     _flog(f"unknown command: {line!r}")
-
 
 
 
@@ -25113,9 +26570,40 @@ def _tuner_report(records, n_games, version_counter):
         lines.append("")
         lines.append(f"  [stale 検出スキップ: {_e}]")
 
+    try:
+        _dw_games = _tuner_load_games(_STATS_PATH)
+        if _dw_games and len(_dw_games) >= 4:
+            lines.append("")
+            lines.append("── 倍々窓テーブル (最終局から遡り) ──")
+            lines.append(f"  {'窓':>6s}  {'W':>4s}  {'D':>4s}  {'L':>4s}  {'勝率':>8s}  {'Elo差':>8s}")
+            lines.append("  " + "-" * 44)
+            _dw_window = 10
+            while _dw_window <= len(_dw_games):
+                _dw_tail = _dw_games[-_dw_window:]
+                _dw_w = _dw_d = _dw_l = 0
+                for _dg in _dw_tail:
+                    _res = _dg.get("result") or _dg.get("meta", {}).get("result", "")
+                    if _res in ("win", "sente_win", "gote_win", "+"):
+                        _dw_w += 1
+                    elif _res in ("lose", "sente_lose", "gote_lose", "-"):
+                        _dw_l += 1
+                    else:
+                        _dw_d += 1
+                _dw_n = _dw_w + _dw_d + _dw_l
+                _dw_score = (_dw_w + _dw_d * 0.5) / _dw_n if _dw_n > 0 else 0.5
+                _dw_elo = _sprt_elo_from_score(_dw_score) if 0 < _dw_score < 1 else 0.0
+                lines.append(
+                    f"  {_dw_window:>6d}  {_dw_w:>4d}  {_dw_d:>4d}  {_dw_l:>4d}  "
+                    f"{_dw_score:>7.1%}  {_dw_elo:>+7.1f}")
+                _dw_window *= 2
+    except Exception as _dwe:
+        lines.append(f"  [倍々窓スキップ: {_dwe}]")
+
     lines.append("")
     lines.append("=" * 64)
-    return "\n".join(lines)
+    _report_text = "\n".join(lines)
+    print(_report_text)
+    return _report_text
 def _ab_compare_stats(path_a: str, path_b: str) -> str:
     rec_a, games_a, _ = _tuner_load_records(path_a)
     rec_b, games_b, _ = _tuner_load_records(path_b)
@@ -25308,7 +26796,7 @@ def _spsa_default_params() -> list:
     _p("Endgame_Min_Eff_S",
        _clamp(_scfg.endgame_min_eff_s or 1.5, 0.8, 3.0),
                                                        0.8,  3.0,  c=0.15,  is_int=False)
-    _p("Light_Council_Max_Eff_S",    float(_cfg.get("Light_Council_Max_Eff_S", 3.2674)),
+    _p("Light_Council_Max_Eff_S",    _cfloat(_cfg, "Light_Council_Max_Eff_S", 3.2674),
                                                                    1.8,  4.5,  c=0.15,  is_int=False)
     _p("Light_Council_DL3_Weight",   _scfg.light_council_dl3_weight,   0.6,  1.5,  c=0.09,  is_int=False)
     _p("DL_Time_Ratio_Eff_S_Coef",   _dl_time_ratio_eff_s_coef, -0.02, 0.02, c=0.002, is_int=False)
@@ -25322,9 +26810,9 @@ def _spsa_default_params() -> list:
                                                                 500, 8000, c=250)
     _p("POLICY_MOVES",             float(_params["POLICY_MOVES"]), 3, 20, c=1)
 
-    _p("Council_Override_Min_Diff_cp",     float(_cfg.get("Council_Override_Min_Diff_cp", 50)),
+    _p("Council_Override_Min_Diff_cp",     _cfloat(_cfg, "Council_Override_Min_Diff_cp", 50),
                                                                     45,  150, c=10)
-    _p("DL_Conviction_Score_Gap_cp",       float(_cfg.get("DL_Conviction_Score_Gap_cp", 538)),
+    _p("DL_Conviction_Score_Gap_cp",       _cfloat(_cfg, "DL_Conviction_Score_Gap_cp", 538),
                                                                     280, 750, c=40)
 
     _p("GP_W_Hand",    _game_phase_w_hand,    0.0,  2.0,  c=0.10, is_int=False)
@@ -25343,7 +26831,7 @@ def _spsa_default_params() -> list:
     _p("GP_W_Exposure", _game_phase_w_exposure, 0.0, 1.5, c=0.08, is_int=False)
     _p("GP_Exposure_Ref", _game_phase_exposure_ref, 3.0, 16.0, c=1.0, is_int=False)
     _p("GP_Child_Pull", _game_phase_child_pull, 0.0, 0.5, c=0.03, is_int=False)
-    _p("DL_Stability_GP_Tighten", float(_cfg.get("DL_Stability_GP_Tighten", 9)), -80.0, 80.0, c=4.0, is_int=False)
+    _p("DL_Stability_GP_Tighten", _cfloat(_cfg, "DL_Stability_GP_Tighten", 9), -80.0, 80.0, c=4.0, is_int=False)
 
     _p("Disagree_Eff_S_Boost_Score1",
        _scfg.disagree_eff_s_boost_score1,    1.0, 1.8, c=0.05, is_int=False)
@@ -25364,13 +26852,13 @@ def _spsa_default_params() -> list:
     _p("Tonshi_Guard_Min_Eff_S",    float(_scfg.tonshi_guard_min_eff_s),    0.5, 3.0, c=0.15, is_int=False)
 
 
-    _p("GP_Surge_Threshold",          float(_cfg.get("GP_Surge_Threshold", 0.0641)),
+    _p("GP_Surge_Threshold",          _cfloat(_cfg, "GP_Surge_Threshold", 0.0641),
                                                                     0.02, 0.15, c=0.01, is_int=False)
-    _p("GP_Surge_Eff_S_Boost",        float(_cfg.get("GP_Surge_Eff_S_Boost", 1.3129)),
+    _p("GP_Surge_Eff_S_Boost",        _cfloat(_cfg, "GP_Surge_Eff_S_Boost", 1.3129),
                                                                     1.0,  1.8,  c=0.05, is_int=False)
-    _p("GP_Surge_DL_Weight_Boost",    float(_cfg.get("GP_Surge_DL_Weight_Boost", 1.0574)),
+    _p("GP_Surge_DL_Weight_Boost",    _cfloat(_cfg, "GP_Surge_DL_Weight_Boost", 1.0574),
                                                                     1.0,  1.6,  c=0.04, is_int=False)
-    _p("GP_Surge_DL2_Timeout_Boost",  float(_cfg.get("GP_Surge_DL2_Timeout_Boost", 1.1744)),
+    _p("GP_Surge_DL2_Timeout_Boost",  _cfloat(_cfg, "GP_Surge_DL2_Timeout_Boost", 1.1744),
                                                                     1.0,  2.0,  c=0.06, is_int=False)
 
     _p("Council_Score_Discount_Scale", float(_scfg.council_score_discount_scale), 300, 900, c=40)
@@ -25379,8 +26867,8 @@ def _spsa_default_params() -> list:
     _p("DL_Conviction_Score_Threshold_cp", float(_scfg.dl_conviction_score_threshold_cp),
                                                                     800, 4000, c=150)
 
-    _p("DL_Gap_Lift_Score_Min",  float(int(_cfg.get("DL_Gap_Lift_Score_Min", 1452))),  800, 2500, c=100)
-    _p("DL_Gap_Lift_Spread_Max", float(int(_cfg.get("DL_Gap_Lift_Spread_Max", 53))), 20,  120,  c=8)
+    _p("DL_Gap_Lift_Score_Min",  float(_cint(_cfg, "DL_Gap_Lift_Score_Min", 1452)),  800, 2500, c=100)
+    _p("DL_Gap_Lift_Spread_Max", float(_cint(_cfg, "DL_Gap_Lift_Spread_Max", 53)), 20,  120,  c=8)
 
     _p("Eff_S_Fischer_Cap_Ratio", float(_eff_s_fischer_cap_ratio), 0.2, 0.9, c=0.04, is_int=False)
 
@@ -25418,9 +26906,9 @@ def _spsa_default_params() -> list:
     _p("Makebook_Bad_Cp",         float(_makebook_bad_cp),         -800.0, -50.0,  c=30.0, is_int=False)
 
     _p("Prefetch_Budget_Safety_Ratio",
-       float(_cfg.get("Prefetch_Budget_Safety_Ratio", 0.8)), 0.4, 1.0, c=0.05, is_int=False)
+       _cfloat(_cfg, "Prefetch_Budget_Safety_Ratio", 0.8), 0.4, 1.0, c=0.05, is_int=False)
     _p("Root_Park_VOI_Scale",
-       float(_cfg.get("Root_Park_VOI_Scale", 0.0)),           0.0, 2.0, c=0.1,  is_int=False)
+       _cfloat(_cfg, "Root_Park_VOI_Scale", 0.0),           0.0, 2.0, c=0.1,  is_int=False)
     _p("Voi_Norm_Cp", float(_scfg.voi_norm_cp), 200, 1200, c=50, is_int=True)
 
 
@@ -25467,17 +26955,16 @@ def _spsa_default_params() -> list:
 
 
     return params
-def spsa_step(state: SpsaState, win_plus: bool) -> None:
-    if win_plus is None:
+def spsa_step(state: SpsaState, score: float) -> None:
+    if score == 0.0:
         return
 
     ck = state.ck()
     rk = state.rk()
-    sign = +1.0 if win_plus else -1.0
 
     for i, p in enumerate(state.params):
         delta_i = state._deltas[i]
-        update  = sign * ck * rk * p.step * delta_i
+        update  = score * ck * rk * p.step * delta_i
         p.value = p.clamp(p.value + update)
 
     _polyak_start_k = max(state.A, int(state.total_iters * 0.75))
@@ -25770,8 +27257,8 @@ def _spsa_engine_argv(mode: str) -> list:
 
 class _SpsaUsiEngine:
 
-    _REAP_SEQ = 0
-    _DIAG_SEQ = 0
+    _REAP_SEQ = itertools.count(1)
+    _DIAG_SEQ = itertools.count(1)
 
     _HALVE_KEYS = [
         "nnue_1_Hash", "nnue_2_Hash",
@@ -25860,11 +27347,14 @@ class _SpsaUsiEngine:
         env = os.environ.copy()
         env["PYFAMATE_BASE_DIR"] = self._tmpdir
         env["SPSA_STATS_PATH"]   = stats_path
-        _SpsaUsiEngine._REAP_SEQ += 1
-        self._reap_key = "%dz%dz%d" % (os.getpid(), _SpsaUsiEngine._REAP_SEQ, time.time_ns())
+        _rseq = next(_SpsaUsiEngine._REAP_SEQ)
+        self._reap_key = "%dz%dz%d" % (os.getpid(), _rseq, time.time_ns())
         env["PYFAMATE_WSL_REAP_KEY"] = self._reap_key
+        env["PYFAMATE_GEN_ACK"] = "1"
+        env["PYFAMATE_REC_EMIT"] = "1"
 
-        argv = _spsa_engine_argv("--spsa-worker")
+        _test_argv = os.environ.get(f"PYFAMATE_TEST_CHILD_ARGV_{label}") or os.environ.get("PYFAMATE_TEST_CHILD_ARGV")
+        argv = _test_argv.split("\x1f") if _test_argv else _spsa_engine_argv("--spsa-worker")
         self._start_worker_process(argv, env, label)
 
     def _start_worker_process(self, argv, env, label, reader_name_prefix="spsa"):
@@ -25881,6 +27371,12 @@ class _SpsaUsiEngine:
         )
         self._lock = threading.Lock()
         self._alive = True
+        self._go_sent = 0
+        self._bm_seen = 0
+        self._last_ack_gen = None
+        self._bm_gen = None
+        self._last_rec = None
+        self._send_lock = threading.Lock()
         self._q = _queue.Queue()
         _self = self
         def _reader_thread(proc=self.proc, q=self._q):
@@ -25909,13 +27405,18 @@ class _SpsaUsiEngine:
             try:
                 self.proc.stdin.write(cmd + "\n")
                 self.proc.stdin.flush()
+                if cmd.startswith("go"):
+                    self._go_sent += 1
             except (BrokenPipeError, OSError):
                 self._alive = False
+
+    def setoption(self, key, val):
+        self.send(f"setoption name {key} value {val}")
 
     def readline(self, timeout: float = 60.0):
         import queue as _queue
         try:
-            line = self._q.get(timeout=timeout)
+            line = self._note_line(self._q.get(timeout=timeout))
             if line is None:
                 self._alive = False
                 self._q.put(None)
@@ -25938,6 +27439,9 @@ class _SpsaUsiEngine:
 
     flush_until_ready = USIEngine.flush_until_ready
     flush_with_stop   = USIEngine.flush_with_stop
+    _note_line    = USIEngine._note_line
+    bm_is_current     = USIEngine.bm_is_current
+    classify_bestmove = USIEngine.classify_bestmove
 
     def preserve_wedge_diag(self, tag: str = "WEDGE") -> None:
         if os.environ.get("SPSA_PRESERVE_CHILD_DIAG", "0").strip().lower() \
@@ -25951,10 +27455,10 @@ class _SpsaUsiEngine:
             if not os.path.isfile(_src):
                 return
             self._wedge_snaps = _n + 1
-            _SpsaUsiEngine._DIAG_SEQ += 1
+            _dseq = next(_SpsaUsiEngine._DIAG_SEQ)
             _dst = os.path.join(
                 _BASE_DIR, "spsa_child_diag_%s_%s_%04d.txt"
-                % (tag, self.name, _SpsaUsiEngine._DIAG_SEQ))
+                % (tag, self.name, _dseq))
             with open(_src, "rb") as _f:
                 _f.seek(0, os.SEEK_END)
                 _sz = _f.tell()
@@ -25977,8 +27481,8 @@ class _SpsaUsiEngine:
         except Exception:
             pass
         self._wsl_reap()
-        _SpsaUsiEngine._REAP_SEQ += 1
-        self._reap_key = "%dz%dz%d" % (os.getpid(), _SpsaUsiEngine._REAP_SEQ, time.time_ns())
+        _rseq = next(_SpsaUsiEngine._REAP_SEQ)
+        self._reap_key = "%dz%dz%d" % (os.getpid(), _rseq, time.time_ns())
         env = os.environ.copy()
         env["PYFAMATE_BASE_DIR"] = self._tmpdir
         env["SPSA_STATS_PATH"] = self._stats_path
@@ -25991,7 +27495,7 @@ class _SpsaUsiEngine:
             _flog("[%s] restart: usiok timeout" % self.name)
             return False
         if _spsa_ponder_enabled():
-            self.send("setoption name USI_Ponder value true")
+            self.setoption("USI_Ponder", "true")
         if not self.flush_until_ready(timeout=120.0):
             _flog("[%s] restart: readyok timeout" % self.name)
             return False
@@ -26005,7 +27509,7 @@ class _SpsaUsiEngine:
                 _src = os.path.join(self._tmpdir, "diagnosis.txt")
                 if os.path.exists(_src):
                     import shutil as _sh_diag
-                    _SpsaUsiEngine._DIAG_SEQ += 1
+                    _dseq = next(_SpsaUsiEngine._DIAG_SEQ)
                     _had_resign = False
                     try:
                         with open(_src, encoding="utf-8", errors="replace") as _df:
@@ -26016,7 +27520,7 @@ class _SpsaUsiEngine:
                     _dst = os.path.join(
                         _BASE_DIR,
                         "spsa_child_diag_%s%s_%04d.txt"
-                        % (_tag, self.name, _SpsaUsiEngine._DIAG_SEQ))
+                        % (_tag, self.name, _dseq))
                     _sh_diag.copy2(_src, _dst)
             except Exception as _de:
                 _flog("[ignored] child diag preserve: %r" % _de)
@@ -26127,7 +27631,7 @@ def _opponent_init(eng: "_OpponentEngine") -> bool:
         print("[!] opponent %s: usiok timeout" % eng.name, flush=True)
         return False
     for _k, _v in getattr(eng, "_opponent_opts", {}).items():
-        eng.send("setoption name %s value %s" % (_k, _v))
+        eng.setoption(_k, _v)
     eng.send("isready")
     if not eng.wait_for("readyok", timeout=120):
         _flog("[vs-OPPONENT][%s] readyok timeout" % eng.name)
@@ -26189,6 +27693,22 @@ def _sp_echo_reject(ctx, move: str, tag: str) -> bool:
     return False
 
 
+def _line_freshness(line: str, board, pv_seen: bool) -> tuple:
+    if "dl_live_policy" in line:
+        return False, pv_seen
+    if not line.startswith("info") or board is None:
+        return True, pv_seen
+    if " pv " in line:
+        m = _RE_PV_FULL.search(line)
+        if m:
+            try:
+                fresh = _bestmove_is_for_board(m.group(1).split()[0], board)
+            except Exception:
+                fresh = True
+            return fresh, (pv_seen or fresh)
+    return pv_seen, pv_seen
+
+
 def _spsa_init_engine(eng: "_SpsaUsiEngine") -> bool:
     eng.send("usi")
     if not eng.wait_for("usiok", timeout=60):
@@ -26197,7 +27717,7 @@ def _spsa_init_engine(eng: "_SpsaUsiEngine") -> bool:
         print("[!] engine %s: usiok timeout (engine failed to start)" % eng.name, flush=True)
         return False
     if _spsa_ponder_enabled():
-        eng.send("setoption name USI_Ponder value true")
+        eng.setoption("USI_Ponder", "true")
     eng.send("isready")
     if not eng.wait_for("readyok", timeout=120):
         _flog("[SPSA-W][%s] readyok timeout" % eng.name)
@@ -26217,6 +27737,9 @@ def _spsa_kifu_path() -> str:
     return _env
 
 
+_spsa_kifu_lock = threading.Lock()
+
+
 def _spsa_append_kifu(moves: list, result: str) -> None:
     path = _spsa_kifu_path()
     if not path or not moves:
@@ -26232,8 +27755,9 @@ def _spsa_append_kifu(moves: list, result: str) -> None:
         terminal = ""
     line = "startpos moves " + " ".join(moves) + ((" " + terminal) if terminal else "")
     try:
-        with open(path, "a", encoding="utf-8") as w:
-            w.write(line + "\n")
+        with _spsa_kifu_lock:
+            with open(path, "a", encoding="utf-8") as w:
+                w.write(line + "\n")
     except OSError as e:
         _flog(f"[SPSA-KIFU] append failed (ignored): {e}")
 
@@ -26254,6 +27778,40 @@ class _SpsaTimeControl:
         if self.kind == "fischer":
             return "fischer(main=%dms,inc=%dms)" % (self.main_ms, self.inc_ms)
         return "byoyomi(main=%dms,byo=%dms)" % (self.main_ms, self.byoyomi_ms)
+
+
+class _EngineSession:
+    __slots__ = ("state", "probe_s", "stop_window_s",
+                 "probe_stage", "last_fresh", "_stop_entered")
+
+    def __init__(self, probe_s: float, stop_window_s: float):
+        self.state = "SEARCHING"
+        self.probe_s = probe_s
+        self.stop_window_s = stop_window_s
+        self.probe_stage = 0
+        self.last_fresh = time.perf_counter()
+        self._stop_entered = 0.0
+
+    def note_fresh(self):
+        self.last_fresh = time.perf_counter()
+
+    def enter_stopping(self):
+        self.state = "STOPPING"
+        self._stop_entered = time.perf_counter()
+
+
+_SelfplayBudget = namedtuple("_SelfplayBudget",
+    ["budget_ms", "main_budget_ms", "stop_cushion_ms", "wait_s", "flag_limit_ms"])
+
+def _selfplay_derive_budget(tc, remaining_ms: float) -> _SelfplayBudget:
+    inc_grant_ms = tc.inc_ms if tc.kind == "fischer" else 0
+    budget_ms = remaining_ms + inc_grant_ms + tc.byoyomi_ms
+    stop_cushion_ms = max(50.0, float(tc.overhead_ms) + 300.0)
+    main_budget_ms = max(0.0, budget_ms - stop_cushion_ms)
+    wait_s = max(0.05, main_budget_ms / 1000.0)
+    flag_limit_ms = budget_ms + stop_cushion_ms
+    return _SelfplayBudget(budget_ms, main_budget_ms, stop_cushion_ms,
+                           wait_s, flag_limit_ms)
 
 
 def _spsa_default_tcs(overhead: int) -> list:
@@ -26357,6 +27915,7 @@ def _selfplay_game(eng_sente: "_SpsaUsiEngine",
     _start_is_sente = (_board.side == "b") if _board is not None else True
 
     _LIVE.reset()
+    _zenrei_live_reset()
     moves: list = []
     _restart_count = 0
 
@@ -26376,8 +27935,8 @@ def _selfplay_game(eng_sente: "_SpsaUsiEngine",
         else:
             _flog("[SPSA-W] kifu skipped (non-startpos opening)")
 
-    eng_sente.send("setoption name Book_Turn_Hint value +")
-    eng_gote.send("setoption name Book_Turn_Hint value -")
+    eng_sente.setoption("Book_Turn_Hint", "+")
+    eng_gote.setoption("Book_Turn_Hint", "-")
     eng_sente.send("usinewgame")
     eng_gote.send("usinewgame")
 
@@ -26434,16 +27993,29 @@ def _selfplay_game(eng_sente: "_SpsaUsiEngine",
             (" moves " + " ".join(_all_moves)) if _all_moves else "")
         _barrier_ok = True
         _t_hit = None
+        _sp_pre_drained = False
+        bestmove = ""
+        _ponder_hint = ""
         _was_preempted = thinker in _ponder_preempted
         _ponder_preempted.discard(thinker)
         if thinker in _ponder_map:
             _pred, _pred_key = _ponder_map[thinker]
             if (not _was_preempted) and _ponder_is_hit(_pred_key, _board):
                 _ponder_map.pop(thinker, None)
+                _sp_pre_drained = False
+                _sp_pre_bm, _sp_pre_pd, _sp_pre_ni = _drain_sp_early_bestmove(
+                    thinker, caller="sp-ponderhit-pre", grace_s=0.05)
+                if _sp_pre_bm:
+                    _sp_pre_drained = True
+                    if _board is not None and _bestmove_is_for_board(_sp_pre_bm, _board):
+                        _flog("[P6-1] SP pre-drain hit: %s — adopting directly" % _sp_pre_bm)
+                        bestmove = _sp_pre_bm
+                        _ponder_hint = _sp_pre_pd or ""
                 _t_hit = time.perf_counter()
                 _ponderhit_clock = _extract_clock_tokens(
                     _spsa_build_go_line(tc, btime_ms, wtime_ms))
-                thinker.send(("ponderhit " + _ponderhit_clock) if _ponderhit_clock else "ponderhit")
+                if not bestmove:
+                    thinker.send(("ponderhit " + _ponderhit_clock) if _ponderhit_clock else "ponderhit")
                 _ponder_hits += 1
             else:
                 _non_thinker = eng_gote if is_sente else eng_sente
@@ -26502,18 +28074,14 @@ def _selfplay_game(eng_sente: "_SpsaUsiEngine",
                 thinker.send(pos)
                 thinker.send(_spsa_build_go_line(tc, btime_ms, wtime_ms))
 
-        _inc_grant_ms = tc.inc_ms if tc.kind == "fischer" else 0
-        budget_ms = our_remaining + _inc_grant_ms + tc.byoyomi_ms
-        _stop_cushion_ms = max(50.0, float(tc.overhead_ms) + 300.0)
-        _main_budget_ms = max(0.0, budget_ms - _stop_cushion_ms)
-        wait_s = max(0.05, _main_budget_ms / 1000.0)
-        wait_s = _clamp(deadline - time.perf_counter(), 0.05, wait_s)
+        _spb = _selfplay_derive_budget(tc, our_remaining)
+        budget_ms = _spb.budget_ms
+        _stop_cushion_ms = _spb.stop_cushion_ms
+        _main_budget_ms = _spb.main_budget_ms
+        wait_s = _clamp(deadline - time.perf_counter(), 0.05, _spb.wait_s)
 
-        if _fast_first:
+        if _fast_first or bestmove:
             wait_s = 0
-        else:
-            bestmove = ""
-            _ponder_hint = ""
         _t_think0 = _t_hit if _t_hit is not None else time.perf_counter()
         _is_hit_path = (_t_hit is not None)
 
@@ -26539,7 +28107,8 @@ def _selfplay_game(eng_sente: "_SpsaUsiEngine",
             _sp_prev = _LIVE._think
             if _sp_prev is not None and isinstance(_sp_prev[0], dict):
                 _sp_prev_rec = _sp_prev[0]
-                for _ck in ("confidence", "sharpness", "momentum",
+                for _ck in ("confidence", "depth_quality", "confidence_dq",
+                            "sharpness", "momentum",
                             "council_wr_nnue",
                             "dl_top_score", "dl_used",
                             "nnue_score_cp", "nnue_depth",
@@ -26548,25 +28117,300 @@ def _selfplay_game(eng_sente: "_SpsaUsiEngine",
                         _sp_live_rec[_ck] = _sp_prev_rec[_ck]
             _LIVE.set_think(_sp_live_rec, _sp_live_pos, _sp_carry_policy,
                             live=True)
+            _sp_live_last_emit = 0.0
             _LIVE.show(_board, move_no=move_no,
                        sente_time=_sr_fmt_clock(btime_ms),
                        gote_time=_sr_fmt_clock(wtime_ms))
         dl2 = _t_think0 + wait_s
         _reader_revive_count = 0
+        try:
+            _use_session_fsm = _cfg_bool("Selfplay_Session_FSM")
+        except (ValueError, TypeError, AttributeError):
+            _use_session_fsm = False
+
+        if _use_session_fsm:
+            _fsm = _EngineSession(
+                probe_s=_clamp(0.25 * _main_budget_ms / 1000.0, 1.0, 10.0),
+                stop_window_s=max(0.4, 2.0 * float(tc.overhead_ms) / 1000.0),
+            )
+            if _is_hit_path and _sp_pre_drained:
+                _fsm.probe_s = min(_fsm.probe_s, 2.0)
+            _fsm_fresh_pv = False
+            _sp_live_fresh = False
+            while not bestmove:
+                _now_f = time.perf_counter()
+                if _fsm.state == "SEARCHING":
+                    if _now_f >= dl2:
+                        _flog("[WO-3][%s] budget expired — sending stop" % side)
+                        try:
+                            thinker.send("stop")
+                        except Exception:
+                            pass
+                        _fsm.enter_stopping()
+                        _ov_s = max(0.05, float(tc.overhead_ms) / 1000.0)
+                        _el_s = _now_f - _t_think0
+                        _rem_lim = max(0.0, (budget_ms + _stop_cushion_ms) / 1000.0
+                                       - _el_s - 0.05)
+                        _sw = min(_stop_cushion_ms / 1000.0 + 2.0 * _ov_s,
+                                  _rem_lim)
+                        dl2 = _now_f + max(_ov_s, min(
+                            _sw, max(0.0, deadline - _now_f)))
+                        continue
+                    if _now_f - _fsm.last_fresh >= _fsm.probe_s:
+                        if _fsm.probe_stage >= 2:
+                            _flog("[WO-3][%s] DEAD: no response after reissue"
+                                  % side)
+                            break
+                        _flog("[WO-3][%s] no fresh output %.1fs — stop probe"
+                              % (side, _now_f - _fsm.last_fresh))
+                        try:
+                            thinker.send("stop")
+                        except Exception as _fse:
+                            _flog("[WO-3][%s] stop probe failed: %s"
+                                  % (side, _fse))
+                        _fsm.enter_stopping()
+                        _fsm.probe_stage += 1
+                        continue
+                elif _fsm.state == "STOPPING":
+                    if _now_f >= dl2:
+                        break
+                    if _now_f - _fsm._stop_entered >= _fsm.stop_window_s:
+                        if _fsm.probe_stage < 2:
+                            _flog("[WO-3][%s] stop window expired — reissuing"
+                                  % side)
+                            _fsm.probe_stage = 2
+                            thinker.send(pos)
+                            thinker.send(_spsa_build_go_line(
+                                tc, btime_ms, wtime_ms))
+                            _is_hit_path = False
+                            _fsm_fresh_pv = False
+                            _fsm.state = "SEARCHING"
+                            _t_think0 = _now_f
+                            dl2 = _now_f + min(
+                                budget_ms / 1000.0,
+                                max(0.05, deadline - _now_f))
+                            _fsm.note_fresh()
+                            _flog("[WO-3][%s] reissue rebased "
+                                  "(fresh main=%.0fms)"
+                                  % (side, _main_budget_ms))
+                            continue
+                        break
+                elif _fsm.state == "DEAD":
+                    break
+                _rl_to = max(0.1, dl2 - _now_f)
+                if _fsm.state == "SEARCHING":
+                    _rl_to = max(0.1, min(
+                        _rl_to,
+                        _fsm.probe_s - (_now_f - _fsm.last_fresh)))
+                elif _fsm.state == "STOPPING":
+                    _rl_to = max(0.1, min(
+                        _rl_to,
+                        _fsm.stop_window_s - (_now_f - _fsm._stop_entered)))
+                line = thinker.readline(timeout=_rl_to)
+                if line is None:
+                    _thp_n = _get_proc(thinker)
+                    _nd = (_thp_n is not None
+                           and _thp_n.poll() is not None)
+                    _flog("[WO-3][%s] readline=None proc_dead=%s"
+                          % (side, _nd))
+                    if _nd:
+                        break
+                    _reader_revive_count += 1
+                    if _reader_revive_count > 3:
+                        _flog("[WO-3][%s] reader revive limit" % side)
+                        break
+                    import queue as _rq
+                    _fq = _rq.Queue()
+                    thinker._q = _fq
+                    thinker._alive = True
+                    _tp = thinker.proc
+                    _tself = thinker
+                    def _fsm_rr(_p=_tp, _q=_fq, _s=_tself):
+                        try:
+                            for _l in _p.stdout:
+                                _q.put(_l.rstrip("\n"))
+                        except Exception as _rre:
+                            try:
+                                _flog("[WO-3] recovery_reader: %s" % _rre)
+                            except Exception:
+                                pass
+                        finally:
+                            if _s.proc is _p:
+                                _s._alive = False
+                            _q.put(None)
+                    threading.Thread(target=_fsm_rr, daemon=True,
+                                    name="fsm_recovery_%s" % side).start()
+                    _flog("[WO-3][%s] reader revived (%d/3)"
+                          % (side, _reader_revive_count))
+                    time.sleep(0.1)
+                    continue
+                if not line:
+                    _thp_p = _get_proc(thinker)
+                    if (_thp_p is not None
+                            and _thp_p.poll() is not None):
+                        _flog("[WO-3][%s] engine dead (rc=%s)"
+                              % (side, _thp_p.returncode))
+                        break
+                    continue
+                _wf, _fsm_fresh_pv = _line_freshness(
+                    line, _board, _fsm_fresh_pv)
+                if _wf:
+                    _fsm.note_fresh()
+                if not line.startswith("bestmove"):
+                    if _sp_live_active and "dl_live_policy " in line:
+                        try:
+                            _dli = line.index("dl_live_policy ") + len("dl_live_policy ")
+                            _dlr = line[_dli:]
+                            _dlt = None
+                            if _dlr and not _dlr.startswith("["):
+                                _ste = _dlr.index(" ")
+                                _dlt = _dlr[:_ste]
+                                _dlr = _dlr[_ste + 1:]
+                            _dlp = json.loads(_dlr)
+                            _dph = hashlib.md5(
+                                (_sp_live_pos or "").encode()
+                                ).hexdigest()[:8] if _sp_live_pos else None
+                            if _dlt and _dph and _dlt == _dph:
+                                pass
+                            elif _dlp and _board is not None:
+                                _dlp = [
+                                    (m, s) for (m, s) in _dlp
+                                    if _bestmove_is_for_board(m, _board)
+                                ] or None
+                            if _dlp:
+                                _LIVE.update_think_pv(
+                                    policy=_dlp, pos=_sp_live_pos)
+                        except Exception:
+                            pass
+                    elif _sp_live_active and _is_scored_info(line):
+                        _sp_now = time.perf_counter()
+                        if _sp_now - _sp_live_last_emit < 0.2:
+                            continue
+                        _dm_sp = _RE_DEPTH.search(line)
+                        if _dm_sp:
+                            _scp_sp = 0
+                            _sm_sp = _RE_SCORE_CP.search(line)
+                            if _sm_sp:
+                                _scp_sp = int(_sm_sp.group(1))
+                            else:
+                                _mm_sp = _RE_MATE.search(line)
+                                if _mm_sp:
+                                    _scp_sp = _mate_sign_score(
+                                        int(_mm_sp.group(1)))
+                            _pv_sp = None
+                            if " pv " in line:
+                                _fpv_sp = _RE_PV_FULL.search(line)
+                                if _fpv_sp:
+                                    _pv_sp = _fpv_sp.group(1).split()
+                            if _pv_sp:
+                                _pv_n_ok = 0
+                                try:
+                                    _pv_wb = _board.clone()
+                                    for _pv_mv in _pv_sp:
+                                        if (_pv_mv in ("resign", "win")
+                                                or not _bestmove_is_for_board(
+                                                    _pv_mv, _pv_wb)):
+                                            break
+                                        _pv_wb.apply_usi(_pv_mv)
+                                        _pv_n_ok += 1
+                                except Exception:
+                                    pass
+                                if _pv_n_ok == 0:
+                                    continue
+                                if _pv_n_ok < len(_pv_sp):
+                                    _pv_sp = _pv_sp[:_pv_n_ok]
+                                _sp_live_fresh = True
+                            elif not _sp_live_fresh:
+                                continue
+                            try:
+                                _LIVE.update_think_pv(
+                                    pv=_pv_sp, score_cp=_scp_sp,
+                                    pos=_sp_live_pos)
+                                _sp_live_last_emit = _sp_now
+                            except Exception:
+                                pass
+                    continue
+                if not _consume_bestmove(line):
+                    continue
+                _bm_class = thinker.classify_bestmove()
+                _is_stale = (
+                    _bm_class == "stale"
+                    or (_bm_class == "unknown"
+                        and not _bestmove_is_for_board(bestmove, _board)))
+                if _is_stale:
+                    _sp_echo_seen = True
+                    _flog("[WO-3][%s] SP-echo drained (class=%s): %r"
+                          % (side, _bm_class, bestmove))
+                    bestmove = ""
+                    _ponder_hint = ""
+                    if _is_hit_path:
+                        _fsm.state = "SEARCHING"
+                        _fsm.probe_stage = 0
+                        _fsm_fresh_pv = False
+                        _fsm.note_fresh()
+                        continue
+                    thinker.send(pos)
+                    thinker.send(_spsa_build_go_line(
+                        tc, btime_ms, wtime_ms))
+                    _is_hit_path = False
+                    _nw = time.perf_counter()
+                    _rs = max(0.05,
+                              _main_budget_ms / 1000.0
+                              - (_nw - _t_think0))
+                    dl2 = _nw + min(
+                        _rs, max(0.05, deadline - _nw))
+                    _fsm.note_fresh()
+                    continue
+                if (_bm_class != "current"
+                        and bestmove in ("resign", "win")
+                        and not _barrier_ok):
+                    bestmove = ""
+                    _ponder_hint = ""
+                    continue
+                if _fsm.state == "STOPPING":
+                    _flog("[WO-3][%s] stop bestmove=%s"
+                          % (side, bestmove))
+                break
+            dl2 = 0
+
         _hit_lines_seen = 0
+        _wd_fresh_seen = False
         _hit_probe_stage = 0
         _hit_probe_s = _clamp(0.25 * _main_budget_ms / 1000.0, 1.0, 10.0)
+        if _is_hit_path and _sp_pre_drained:
+            _hit_probe_s = min(_hit_probe_s, 2.0)
         _hit_probe2_deadline = 0.0
         _hit_wd_base = _t_think0
         try:
-            _silence_wd_s = float(_cfg.get("Tuning_Silence_Watchdog_S", 120))
+            _silence_wd_s = _cfloat(_cfg, "Tuning_Silence_Watchdog_S", 120)
         except (ValueError, TypeError):
             _silence_wd_s = 120.0
+        if _silence_wd_s > 0:
+            _silence_wd_s = min(_silence_wd_s,
+                                max(10.0, 0.5 * _main_budget_ms / 1000.0))
         _silence_last_t = time.perf_counter()
         _silence_rescue_used = False
+        _heartbeat_interval_s = 15.0
+        _heartbeat_next_t = time.perf_counter() + _heartbeat_interval_s
+        _heartbeat_fail_count = 0
         _sp_live_fresh = False
         while not bestmove and time.perf_counter() < dl2:
             _rl_to = max(0.1, dl2 - time.perf_counter())
+            if (_silence_wd_s > 0 and not _is_hit_path
+                    and time.perf_counter() >= _heartbeat_next_t):
+                try:
+                    thinker.send("isready")
+                except Exception as _hb_e:
+                    _flog("[P6-2][%s] heartbeat send failed: %s" % (side, _hb_e))
+                _heartbeat_fail_count += 1
+                if _heartbeat_fail_count >= 2:
+                    _flog("[P6-2][%s] heartbeat: readyok 不達 (%d/2)"
+                          % (side, _heartbeat_fail_count))
+                _heartbeat_next_t = time.perf_counter() + _heartbeat_interval_s
+                if _heartbeat_fail_count >= 2:
+                    _flog("[P6-2][%s] heartbeat: 2 consecutive failures — "
+                          "triggering immediate rescue" % side)
+                    _silence_last_t = time.perf_counter() - _silence_wd_s
             if _silence_wd_s > 0 and (
                     not _is_hit_path
                     or (_hit_lines_seen > 0 and _hit_probe_stage == 0)):
@@ -26658,8 +28502,11 @@ def _selfplay_game(eng_sente: "_SpsaUsiEngine",
                     try:
                         for _rl in _p.stdout:
                             _rqq.put(_rl.rstrip("\n"))
-                    except Exception:
-                        pass
+                    except Exception as _rr_exc:
+                        try:
+                            _flog(f"[SPSA-W] recovery_reader error: {type(_rr_exc).__name__}: {_rr_exc!r}")
+                        except Exception:
+                            pass
                     finally:
                         if _ts.proc is _p:
                             _ts._alive = False
@@ -26677,13 +28524,30 @@ def _selfplay_game(eng_sente: "_SpsaUsiEngine",
                     break
                 continue
             _silence_last_t = time.perf_counter()
-            _hit_lines_seen += 1
+            _heartbeat_next_t = _silence_last_t + _heartbeat_interval_s
+            _heartbeat_fail_count = 0
+            _wd_line_fresh = True
+            if _is_hit_path and _hit_probe_stage == 0 and _board is not None:
+                _wd_line_fresh, _wd_fresh_seen = _line_freshness(
+                    line, _board, _wd_fresh_seen)
+            if _wd_line_fresh:
+                _hit_lines_seen += 1
             if not line.startswith("bestmove"):
                 if _sp_live_active and "dl_live_policy " in line:
                     try:
                         _dl_idx = line.index("dl_live_policy ") + len("dl_live_policy ")
-                        _dl_pol = json.loads(line[_dl_idx:])
-                        if _dl_pol and _board is not None:
+                        _dl_rest = line[_dl_idx:]
+                        _dl_tag_match = None
+                        if _dl_rest and not _dl_rest.startswith("["):
+                            _sp_tag_end = _dl_rest.index(" ")
+                            _dl_tag_match = _dl_rest[:_sp_tag_end]
+                            _dl_rest = _dl_rest[_sp_tag_end + 1:]
+                        _dl_pol = json.loads(_dl_rest)
+                        _dl_pos_hash = hashlib.md5(
+                            (_sp_live_pos or "").encode()).hexdigest()[:8] if _sp_live_pos else None
+                        if _dl_tag_match and _dl_pos_hash and _dl_tag_match == _dl_pos_hash:
+                            pass
+                        elif _dl_pol and _board is not None:
                             _dl_pol = [(m, s) for (m, s) in _dl_pol
                                        if _bestmove_is_for_board(m, _board)] or None
                         if _dl_pol:
@@ -26691,6 +28555,9 @@ def _selfplay_game(eng_sente: "_SpsaUsiEngine",
                     except Exception:
                         pass
                 elif _sp_live_active and _is_scored_info(line):
+                    _sp_now = time.perf_counter()
+                    if _sp_now - _sp_live_last_emit < 0.2:
+                        continue
                     _dm_sp = _RE_DEPTH.search(line)
                     if _dm_sp:
                         _scp_sp = 0
@@ -26732,16 +28599,21 @@ def _selfplay_game(eng_sente: "_SpsaUsiEngine",
                         try:
                             _LIVE.update_think_pv(pv=_pv_sp, score_cp=_scp_sp,
                                                   pos=_sp_live_pos)
+                            _sp_live_last_emit = _sp_now
                         except Exception:
                             pass
                 continue
             if not _consume_bestmove(line):
                 continue
-            if not _bestmove_is_for_board(bestmove, _board):
+            _bm_class = thinker.classify_bestmove()
+            _is_stale = (_bm_class == "stale" or
+                         (_bm_class == "unknown"
+                          and not _bestmove_is_for_board(bestmove, _board)))
+            if _is_stale:
                 _sp_echo_seen = True
-                _flog("[SPSA-W][%s] SP-echo drained%s: %r "
-                      "(not a move for current board)"
-                      % (side, " on ponderhit" if _is_hit_path else "", bestmove))
+                _flog("[SPSA-W][%s] SP-echo drained%s (class=%s): %r"
+                      % (side, " on ponderhit" if _is_hit_path else "",
+                         _bm_class, bestmove))
                 bestmove = ""
                 _ponder_hint = ""
                 if _is_hit_path:
@@ -26749,6 +28621,7 @@ def _selfplay_game(eng_sente: "_SpsaUsiEngine",
                           "drained — re-arming hit-watchdog (no immediate "
                           "reissue)" % side)
                     _hit_lines_seen = 0
+                    _wd_fresh_seen = False
                     _hit_wd_base = time.perf_counter()
                     continue
                 _flog("[SPSA-W][%s] SP-echo on miss: child consumed "
@@ -26764,11 +28637,11 @@ def _selfplay_game(eng_sente: "_SpsaUsiEngine",
                 dl2 = _now + min(
                     _rem_s, max(0.05, deadline - _now))
                 continue
-            if bestmove in ("resign", "win") and not _barrier_ok:
+            if _bm_class != "current" and bestmove in ("resign", "win") and not _barrier_ok:
                 _flog("[SPSA-W][%s] resign/win drained%s as SP-echo "
-                      "(sp_echo_seen=%s barrier_ok=%s): %r"
+                      "(class=%s sp_echo_seen=%s barrier_ok=%s): %r"
                       % (side, " on ponderhit" if _is_hit_path else "",
-                         _sp_echo_seen, _barrier_ok, bestmove))
+                         _bm_class, _sp_echo_seen, _barrier_ok, bestmove))
                 bestmove = ""
                 _ponder_hint = ""
                 continue
@@ -26814,27 +28687,35 @@ def _selfplay_game(eng_sente: "_SpsaUsiEngine",
                         continue
                     if not _consume_bestmove(_sline):
                         continue
-                    if not _bestmove_is_for_board(bestmove, _board):
+                    _sw_class = thinker.classify_bestmove()
+                    _sw_stale = (_sw_class == "stale" or
+                                 (_sw_class == "unknown"
+                                  and not _bestmove_is_for_board(bestmove, _board)))
+                    if _sw_stale:
                         _sp_echo_seen = True
-                        _flog("[SPSA-W][%s] SP-echo drained in stop window: %r"
-                              % (side, bestmove))
+                        _flog("[SPSA-W][%s] SP-echo drained in stop window "
+                              "(class=%s): %r" % (side, _sw_class, bestmove))
                         bestmove = ""
                         _ponder_hint = ""
                         continue
-                    if (bestmove in ("resign", "win")
+                    if (_sw_class != "current"
+                            and bestmove in ("resign", "win")
                             and not _barrier_ok):
                         _flog("[SPSA-W][%s] resign/win drained in stop window as "
-                              "SP-echo (sp_echo_seen=%s barrier_ok=%s): %r"
-                              % (side, _sp_echo_seen, _barrier_ok, bestmove))
+                              "SP-echo (class=%s barrier_ok=%s): %r"
+                              % (side, _sw_class, _barrier_ok, bestmove))
                         bestmove = ""
                         _ponder_hint = ""
                         continue
                     _flog("[SPSA-W][%s] stop bestmove=%s" % (side, bestmove))
                     break
+        if _use_session_fsm:
+            _hit_probe_stage = _fsm.probe_stage
+            _silence_rescue_used = (_fsm.probe_stage >= 1)
         elapsed_ms = int((time.perf_counter() - _t_think0) * 1000)
 
         if not bestmove:
-            _flag_limit = budget_ms + _stop_cushion_ms
+            _flag_limit = _spb.flag_limit_ms
             _thp = _get_proc(thinker)
             _proc_dead = (_thp is not None and _thp.poll() is not None)
             if _proc_dead:
@@ -26964,36 +28845,79 @@ def _selfplay_game(eng_sente: "_SpsaUsiEngine",
                 _flog("[SPSA-W][%s] is_legal_lite=False for %r "
                       "(board desync diagnostic — move applied anyway)"
                       % (side, bestmove))
-            _check_flags.append(_board.gives_check(bestmove))
-            try:
-                _ja_sp = _sr_usi_to_ja(_board, bestmove)
-            except Exception:
-                _ja_sp = bestmove
-            try:
-                _board_pre = _board.clone()
-            except Exception:
-                _board_pre = None
+            if sennichite_check:
+                _check_flags.append(_board.gives_check(bestmove))
+            _ja_sp = bestmove
+            _board_pre = None
+            if _sp_live_active:
+                try:
+                    _ja_sp = _sr_usi_to_ja(_board, bestmove)
+                except Exception:
+                    pass
+                try:
+                    _board_pre = _board.clone()
+                except Exception:
+                    pass
             _board.push(bestmove)
             try:
                 _sp_rec = {"source": "selfplay", "council_winner": bestmove,
                            "nnue_bestmove": bestmove}
-                _sp_stats = getattr(thinker, "_stats_path", None)
-                if _sp_stats and os.path.isfile(_sp_stats):
-                    try:
-                        _sp_ply_want = _count_moves(pos)
-                        _sp_ply_warned = False
-                        for _sp_poll in range(50):
-                            _sp_last_line = None
-                            with open(_sp_stats, "r", encoding="utf-8", errors="replace") as _sf:
-                                for _sln in _sf:
-                                    _sln = _sln.strip()
-                                    if _sln and not _sln.startswith("#"):
-                                        _sp_last_line = _sln
-                            if _sp_last_line is not None:
-                                _sp_cand = json.loads(_sp_last_line)
-                                if _sp_cand.get("council_winner") == bestmove:
+                _sp_pos_hash_want = _pos_hash8(pos)
+                _wo2_rec = getattr(thinker, "_last_rec", None)
+                _wo2_used = False
+                if isinstance(_wo2_rec, dict):
+                    _wo2_ph = _wo2_rec.get("pos_hash")
+                    if _wo2_ph and _wo2_ph == _sp_pos_hash_want:
+                        _sp_rec = dict(_wo2_rec)
+                        _sp_rec["_orig_source"] = _sp_rec.get("source")
+                        _sp_rec["source"] = "selfplay"
+                        _sp_rec.setdefault("council_winner", bestmove)
+                        _sp_rec.setdefault("nnue_bestmove", bestmove)
+                        _wo2_used = True
+                        _flog("[LIVE-BOARD][SELFPLAY] stats loaded via pyfa_rec: "
+                              "conf=%s shrp=%s mom=%s"
+                              % (("%.2f" % _sp_rec["confidence"]) if isinstance(_sp_rec.get("confidence"), (int, float)) else "—",
+                                 ("%.2f" % _sp_rec["sharpness"]) if isinstance(_sp_rec.get("sharpness"), (int, float)) else "—",
+                                 ("%.2f" % _sp_rec["momentum"]) if isinstance(_sp_rec.get("momentum"), (int, float)) else "—"))
+                thinker._last_rec = None
+                if not _wo2_used:
+                    _sp_stats = getattr(thinker, "_stats_path", None) if _sp_live_active else None
+                    if _sp_stats and os.path.isfile(_sp_stats):
+                        try:
+                            _sp_ply_want = _count_moves(pos)
+                            _sp_ply_warned = False
+                            for _sp_poll in range(80):
+                                _sp_candidates = []
+                                try:
+                                    with open(_sp_stats, "rb") as _sf_b:
+                                        _sf_b.seek(0, 2)
+                                        _fsize = _sf_b.tell()
+                                        _sf_b.seek(max(0, _fsize - 65536))
+                                        _tail = _sf_b.read().decode("utf-8", errors="replace")
+                                    for _sln in _tail.splitlines():
+                                        _sln = _sln.strip()
+                                        if _sln and not _sln.startswith("#") and _sln.endswith("}"):
+                                            _sp_candidates.append(_sln)
+                                except Exception:
+                                    pass
+                                _sp_found = False
+                                for _sln in reversed(_sp_candidates[-20:]):
+                                    try:
+                                        _sp_cand = json.loads(_sln)
+                                    except (json.JSONDecodeError, ValueError):
+                                        continue
+                                    _sp_cand_mv = (_sp_cand.get("council_winner")
+                                                   or _sp_cand.get("bestmove"))
+                                    if _sp_cand_mv != bestmove:
+                                        continue
+                                    _ph = _sp_cand.get("pos_hash")
+                                    if _ph and _ph == _sp_pos_hash_want:
+                                        _sp_rec = _sp_cand
+                                        _sp_found = True
+                                        break
                                     if _sp_cand.get("ply") == _sp_ply_want:
                                         _sp_rec = _sp_cand
+                                        _sp_found = True
                                         break
                                     if not _sp_ply_warned:
                                         _sp_ply_warned = True
@@ -27002,19 +28926,19 @@ def _selfplay_game(eng_sente: "_SpsaUsiEngine",
                                               "want=%d — fresh rec を待機"
                                               % (bestmove, _sp_cand.get("ply"),
                                                  _sp_ply_want))
-                            time.sleep(0.01)
-                        _sp_rec["_orig_source"] = _sp_rec.get("source")
-                        _sp_rec["source"] = "selfplay"
-                        _flog("[LIVE-BOARD][SELFPLAY] stats loaded: src=%s "
-                              "dl_policy=%s conf=%s shrp=%s mom=%s pv=%s"
-                              % (_sp_rec.get("_orig_source"),
-                                 ("yes" if _sp_rec.get("dl_display_policy") else "no"),
-                                 ("%.2f" % _sp_rec["confidence"]) if isinstance(_sp_rec.get("confidence"), (int, float)) else "—",
-                                 ("%.2f" % _sp_rec["sharpness"]) if isinstance(_sp_rec.get("sharpness"), (int, float)) else "—",
-                                 ("%.2f" % _sp_rec["momentum"]) if isinstance(_sp_rec.get("momentum"), (int, float)) else "—",
-                                 ("yes" if _sp_rec.get("nnue_pv") else "no")))
-                    except Exception as _sp_stats_err:
-                        _flog("[LIVE-BOARD][SELFPLAY] stats read error: %s" % _sp_stats_err)
+                                if _sp_found:
+                                    break
+                                time.sleep(0.01)
+                            _sp_rec["_orig_source"] = _sp_rec.get("source")
+                            _sp_rec["source"] = "selfplay"
+                            _flog("[LIVE-BOARD][SELFPLAY] stats loaded (file fallback): src=%s "
+                                  "conf=%s shrp=%s mom=%s"
+                                  % (_sp_rec.get("_orig_source"),
+                                     ("%.2f" % _sp_rec["confidence"]) if isinstance(_sp_rec.get("confidence"), (int, float)) else "—",
+                                     ("%.2f" % _sp_rec["sharpness"]) if isinstance(_sp_rec.get("sharpness"), (int, float)) else "—",
+                                     ("%.2f" % _sp_rec["momentum"]) if isinstance(_sp_rec.get("momentum"), (int, float)) else "—"))
+                        except Exception as _sp_stats_err:
+                            _flog("[LIVE-BOARD][SELFPLAY] stats read error: %s" % _sp_stats_err)
                 _sp_premoves = _base_moves + moves
                 _sp_pos = "position " + _prefix + (
                     (" moves " + " ".join(_sp_premoves)) if _sp_premoves else "")
@@ -27086,15 +29010,23 @@ def _selfplay_game(eng_sente: "_SpsaUsiEngine",
                     _result = "gote_win" if _checker_is_sente else "sente_win"
                     _flog("[SPSA-W] perpetual-check sennichite → %s loses (move %d)"
                           % ("sente" if _checker_is_sente else "gote", move_no + 1))
+                    _msg = ("[!] 連続王手の千日手 — %s の負け"
+                            % ("先手" if _checker_is_sente else "後手"))
+                    if _sp_live_active and hasattr(_LIVE, "safe_print"):
+                        _LIVE.safe_print(_msg)
+                    else:
+                        print(_msg, flush=True)
                     _LIVE.reset()
-                    print("[!] 連続王手の千日手 — %s の負け"
-                          % ("先手" if _checker_is_sente else "後手"), flush=True)
                     _kifu(_result)
                     _fill_info("perpetual_check", {"sennichite": True})
                     return _result
                 _flog("[SPSA-W] sennichite (4-fold) → draw (move %d)" % (move_no + 1))
+                _msg4 = "[!] 千日手 (同一局面4回) — 引き分け"
+                if _sp_live_active and hasattr(_LIVE, "safe_print"):
+                    _LIVE.safe_print(_msg4)
+                else:
+                    print(_msg4, flush=True)
                 _LIVE.reset()
-                print("[!] 千日手 (同一局面4回) — 引き分け", flush=True)
                 _kifu("draw")
                 _fill_info("sennichite", {"sennichite": True})
                 return "draw"
@@ -27139,11 +29071,17 @@ def _selfplay_game(eng_sente: "_SpsaUsiEngine",
                   % (_ponder_hits, _tot, 100.0 * _ponder_hits / _tot))
 
 
-
-def _spsa_game_plan_core(global_game_idx: int, n_tc: int, swap_colors: bool = True):
+def _spsa_game_plan_core(global_game_idx: int, n_tc: int,
+                         swap_colors: bool = True, tc_shuffle_seed: int = 0):
     _g = int(global_game_idx)
     _n = max(1, int(n_tc))
     tc_idx = _g % _n
+    if tc_shuffle_seed > 0 and _n > 1:
+        _round = _g // _n
+        _perm = list(range(_n))
+        import random as _rnd_tc
+        _rnd_tc.Random(tc_shuffle_seed + _round).shuffle(_perm)
+        tc_idx = _perm[tc_idx]
     swap = swap_colors and (((_g // _n) + tc_idx) % 2 == 1)
     return swap, tc_idx
 
@@ -27164,8 +29102,9 @@ def _spsa_builtin_worker(
     game_timeout_s = timeout_s / max(games_per_iter, 1)
 
     _tc_specs = _spsa_parse_tc_spec()
-    _flog("[SPSA-W] TC specs (%d): %s" % (
-        len(_tc_specs), ", ".join(t.label for t in _tc_specs)))
+    _tc_shuffle_seed = int(os.environ.get("SPSA_TC_SHUFFLE_SEED", "0"))
+    _flog("[SPSA-W] TC specs (%d): %s  shuffle_seed=%d" % (
+        len(_tc_specs), ", ".join(t.label for t in _tc_specs), _tc_shuffle_seed))
 
     plus_wins = minus_wins = 0
 
@@ -27204,7 +29143,8 @@ def _spsa_builtin_worker(
     _engine_dead = False
     for game_idx in range(games_per_iter):
         _g_global = game_offset + game_idx
-        swap, _tc_idx = _spsa_game_plan_core(_g_global, len(_tc_specs), swap_colors)
+        swap, _tc_idx = _spsa_game_plan_core(
+            _g_global, len(_tc_specs), swap_colors, tc_shuffle_seed=_tc_shuffle_seed)
         eng_s = eng_minus if swap else eng_plus
         eng_g = eng_plus  if swap else eng_minus
         s_lbl = "minus"   if swap else "plus"
@@ -27295,9 +29235,7 @@ def _spsa_builtin_worker(
     _dur_update_quit("spsa-worker", (time.perf_counter() - _t_quit) / 2.0)
 
     _flog("[SPSA-W] match: plus=%d minus=%d" % (plus_wins, minus_wins))
-    if plus_wins > minus_wins:  return True
-    if minus_wins > plus_wins:  return False
-    return None
+    return (plus_wins, minus_wins)
 
 
 def _spsa_salvage_stats(src_path: str, side: str, game_idx: int = -1,
@@ -27370,15 +29308,51 @@ def _spsa_run_match(cfg_plus: dict, cfg_minus: dict, match_cmd: str | None = Non
         env["SPSA_GAME_IDX"]     = str(game_idx)
 
         if match_cmd is None:
-            _flog("[SPSA-MATCH] no match_cmd → using built-in worker")
-            result = _spsa_builtin_worker(
-                plus_path, minus_path, stats_plus, stats_minus,
-                games_per_iter=games_per_iter,
-                timeout_s=timeout_s,
-                game_offset=game_idx,
-                _caller_manages_loop=True,
-            )
-            return result
+            import math as _math_d1
+            _spsa_groups = int(os.environ.get("SPSA_PARALLEL_GROUPS", "1"))
+            if _spsa_groups < 1:
+                _spsa_groups = 1
+            if _spsa_groups == 1:
+                _flog("[SPSA-MATCH] no match_cmd → using built-in worker")
+                _pw, _mw = _spsa_builtin_worker(
+                    plus_path, minus_path, stats_plus, stats_minus,
+                    games_per_iter=games_per_iter,
+                    timeout_s=timeout_s,
+                    game_offset=game_idx,
+                    _caller_manages_loop=True,
+                )
+            else:
+                _flog("[SPSA-MATCH] parallel groups=%d games=%d"
+                      % (_spsa_groups, games_per_iter))
+                _g_size = _math_d1.ceil(games_per_iter / _spsa_groups)
+                _g_results: list[tuple[int, int]] = [(0, 0)] * _spsa_groups
+                def _run_spsa_group(_gi):
+                    _g_games = min(_g_size, games_per_iter - _gi * _g_size)
+                    if _g_games <= 0:
+                        return
+                    _g_sp = os.path.join(_match_tmpdir, "stats_plus_g%d.jsonl" % _gi)
+                    _g_sm = os.path.join(_match_tmpdir, "stats_minus_g%d.jsonl" % _gi)
+                    _g_off = game_idx + _gi * _g_size
+                    _g_results[_gi] = _spsa_builtin_worker(
+                        plus_path, minus_path, _g_sp, _g_sm,
+                        games_per_iter=_g_games,
+                        timeout_s=timeout_s,
+                        game_offset=_g_off,
+                        _caller_manages_loop=True,
+                    )
+                _g_threads = []
+                for _gi in range(_spsa_groups):
+                    _gt = threading.Thread(target=_run_spsa_group, args=(_gi,),
+                                           daemon=True, name="spsa-g%d" % _gi)
+                    _g_threads.append(_gt)
+                for _gt in _g_threads:
+                    _gt.start()
+                for _gt in _g_threads:
+                    _gt.join()
+                _pw = sum(r[0] for r in _g_results)
+                _mw = sum(r[1] for r in _g_results)
+                _flog("[SPSA-MATCH] parallel total: plus=%d minus=%d" % (_pw, _mw))
+            return (_pw - _mw) / games_per_iter if games_per_iter > 0 else 0.0
 
         _flog("[SPSA-MATCH] launching: %s" % match_cmd)
 
@@ -27395,7 +29369,7 @@ def _spsa_run_match(cfg_plus: dict, cfg_minus: dict, match_cmd: str | None = Non
             _flog("[SPSA-MATCH] launch error: %s" % e)
             _LIVE.reset()
             print("[!] SPSA: external match launch error: %s" % e, flush=True)
-            return None
+            return 0.0
     
         try:
             stdout_data, stderr_data = proc.communicate(timeout=timeout_s)
@@ -27412,28 +29386,28 @@ def _spsa_run_match(cfg_plus: dict, cfg_minus: dict, match_cmd: str | None = Non
         except Exception as e:
             _flog("[SPSA-MATCH] communicate error: %s" % e)
             _spsa_kill_proc_tree(proc, sig=signal.SIGTERM, ctrl_break=True)
-            return None
-    
+            return 0.0
+
         if proc.returncode != 0:
             _flog("[SPSA-MATCH] non-zero exit: %d\nstderr: %s"
                   % (proc.returncode, (stderr_data or "")[:500]))
-            return None
-    
+            return 0.0
+
         output = stdout_data or ""
         _flog("[SPSA-MATCH] stdout (last 500): %s" % output[-500:])
-    
+
         for line_out in reversed(output.splitlines()):
             low = line_out.strip().lower()
             if "result:" in low:
                 if "plus" in low:
                     _flog("[SPSA-MATCH] result: PLUS wins")
-                    return True
+                    return 1.0
                 elif "minus" in low:
                     _flog("[SPSA-MATCH] result: MINUS wins")
-                    return False
+                    return -1.0
                 elif "draw" in low:
-                    _flog("[SPSA-MATCH] result: DRAW — treated as None")
-                    return None
+                    _flog("[SPSA-MATCH] result: DRAW — score=0")
+                    return 0.0
     
         if os.path.exists(stats_plus) and os.path.exists(stats_minus):
             try:
@@ -27442,8 +29416,8 @@ def _spsa_run_match(cfg_plus: dict, cfg_minus: dict, match_cmd: str | None = Non
             except Exception as e:
                 _flog("[SPSA-MATCH] A/B comparison error: %s" % e)
 
-        _flog("[SPSA-MATCH] no clear result parsed — returning None")
-        return None
+        _flog("[SPSA-MATCH] no clear result parsed — returning 0.0")
+        return 0.0
     finally:
         _spsa_salvage_stats(stats_plus,  "plus",  game_idx)
         _spsa_salvage_stats(stats_minus, "minus", game_idx)
@@ -27531,8 +29505,8 @@ def _grid_search_cli():
             _env["PYFAMATE_BASE_DIR"] = self._tmpdir
             self._stats_path = os.path.join(self._tmpdir, "stats.jsonl")
             _env["SPSA_STATS_PATH"]   = self._stats_path
-            _SpsaUsiEngine._REAP_SEQ += 1
-            self._reap_key = "%dz%dz%d" % (os.getpid(), _SpsaUsiEngine._REAP_SEQ, time.time_ns())
+            _rseq = next(_SpsaUsiEngine._REAP_SEQ)
+            self._reap_key = "%dz%dz%d" % (os.getpid(), _rseq, time.time_ns())
             _env["PYFAMATE_WSL_REAP_KEY"] = self._reap_key
             _argv = _spsa_engine_argv("--spsa-worker")
             self._start_worker_process(_argv, _env, label,
@@ -27744,6 +29718,55 @@ def _spsa_cli(setup_mode: bool = False):
                       % (p.name, p.value, p.min_val, p.max_val, p.step))
         return
 
+    if "--extract-openings" in args:
+        _eo_book_path = _next_arg(args, "--extract-openings", None)
+        if not _eo_book_path or not os.path.exists(_eo_book_path):
+            print("Usage: --spsa --extract-openings <book.db> [--out openings.sfen] "
+                  "[--max-cp 50] [--min-count 3] [--limit 500]")
+            return
+        _eo_out = _next_arg(args, "--out", "openings.sfen")
+        _eo_max_cp = int(_next_arg(args, "--max-cp", "50") or "50")
+        _eo_min_count = int(_next_arg(args, "--min-count", "3") or "3")
+        _eo_limit = int(_next_arg(args, "--limit", "500") or "500")
+        _eo_positions = []
+        try:
+            with open(_eo_book_path, "r", encoding="utf-8", errors="ignore") as _eof:
+                _eof.readline()
+                _eo_sfen = None
+                for _eo_raw in _eof:
+                    _eo_line = _eo_raw.strip()
+                    if not _eo_line:
+                        continue
+                    if _eo_line.startswith("sfen "):
+                        _eo_sfen = _eo_line[5:].strip()
+                        continue
+                    if _eo_sfen is None:
+                        continue
+                    _eo_toks = _eo_line.split()
+                    _eo_val = int(_eo_toks[2]) if len(_eo_toks) > 2 else 0
+                    _eo_cnt = int(_eo_toks[4]) if len(_eo_toks) > 4 else 1
+                    if abs(_eo_val) <= _eo_max_cp and _eo_cnt >= _eo_min_count:
+                        _eo_positions.append((_eo_sfen, _eo_cnt, abs(_eo_val)))
+                    _eo_sfen = None
+        except Exception as _eoe:
+            print("[extract-openings] book 読み込みエラー: %s" % _eoe)
+            return
+        _eo_positions.sort(key=lambda x: (-x[1], x[2]))
+        _eo_positions = _eo_positions[:_eo_limit]
+        _eo_seen = set()
+        with open(_eo_out, "w", encoding="utf-8") as _eow:
+            _eow.write("# extracted from %s  max_cp=%d min_count=%d\n"
+                        % (_eo_book_path, _eo_max_cp, _eo_min_count))
+            for _eo_sf, _eo_c, _eo_v in _eo_positions:
+                _eo_key = _eo_sf.rsplit(" ", 1)[0] if " " in _eo_sf else _eo_sf
+                if _eo_key in _eo_seen:
+                    continue
+                _eo_seen.add(_eo_key)
+                _eow.write("sfen %s\n" % _eo_sf)
+        print("[S-6] %d 互角局面を %s に書き出しました (|eval| <= %d cp, count >= %d)"
+              % (len(_eo_seen), _eo_out, _eo_max_cp, _eo_min_count))
+        return
+
     if not setup_mode and "--run" not in args:
         print("Usage: python engine.py --spsa "
               "{--run [--match-cmd CMD] | --report | --ab-report A B "
@@ -27783,6 +29806,9 @@ def _spsa_cli(setup_mode: bool = False):
         _out_cfg_path   = _SPSA_CONFIG_PATH
     _per_game_timeout_s = 1800.0
     match_timeout_s = _per_game_timeout_s * games_per_iter
+    _anchor_every = int(_next_arg(args, "--anchor-every", "0") or "0")
+    _anchor_games = int(_next_arg(args, "--anchor-games", "4") or "4")
+    _anchor_results = []
 
     _SPSA_RETIRED_KEYS = {
         "Resource_Threads_Share_NNUE1", "Resource_Threads_Share_DL1",
@@ -27832,6 +29858,58 @@ def _spsa_cli(setup_mode: bool = False):
     _flog("SPSA config: iterations=%d  games_per_iter=%d  A=%d  a0=%.4f  timeout_per_iter=%.0fs"
           % (n_iter, games_per_iter, state.A, state.a0, match_timeout_s))
 
+    try:
+        _tc_specs_check = _spsa_parse_tc_spec()
+        _n_tc_check = len(_tc_specs_check)
+        if _n_tc_check > 0 and games_per_iter % (2 * _n_tc_check) != 0:
+            _rec = ((games_per_iter // (2 * _n_tc_check)) + 1) * (2 * _n_tc_check)
+            print("[SPSA-W] games_per_iter=%d は 2×n_tc=%d の倍数でありません。"
+                  "イテレーション内の先後×TC が不均衡です。推奨: %d"
+                  % (games_per_iter, 2 * _n_tc_check, _rec), flush=True)
+            _flog("[S-4] TC coverage warning: gpi=%d 2*n_tc=%d recommended=%d"
+                  % (games_per_iter, 2 * _n_tc_check, _rec))
+    except Exception:
+        pass
+
+    _spsa_force = "--force" in args
+    _spsa_param_names = {p.name for p in state.params}
+    _shadow_collisions = []
+    for _layer_path, _layer_label in [
+        (os.path.join(_BASE_DIR, "config.txt"), "config.txt"),
+        (_SETUP_CONFIG_PATH, "setup_config.txt"),
+    ]:
+        if os.path.exists(_layer_path):
+            try:
+                with open(_layer_path, encoding="utf-8") as _lf:
+                    _layer_keys = set(json.load(_lf).keys())
+                _overlap = _spsa_param_names & _layer_keys
+                if _overlap:
+                    _shadow_collisions.append((_layer_label, sorted(_overlap)))
+            except Exception:
+                pass
+    if os.path.exists(_ENGINE_OPTIONS_PATH):
+        try:
+            _eo_keys = set(_load_engine_options(_ENGINE_OPTIONS_PATH).keys())
+            _eo_overlap = _spsa_param_names & _eo_keys
+            if _eo_overlap:
+                _shadow_collisions.append(("engine_options.txt", sorted(_eo_overlap)))
+        except Exception:
+            pass
+    if _shadow_collisions:
+        print("[SPSA-SHADOW] 警告: 以下の SPSA 対象キーが上位層で固定されています。"
+              "θ± の値が実対局に反映されず勾配が全てノイズになる恐れがあります:",
+              flush=True)
+        for _sl, _sk in _shadow_collisions:
+            print("  %s: %s" % (_sl, ", ".join(_sk)), flush=True)
+        _flog("[SPSA-SHADOW] 衝突検出: %s"
+              % "; ".join("%s=%s" % (_sl, ",".join(_sk))
+                          for _sl, _sk in _shadow_collisions))
+        if not _spsa_force:
+            raise SystemExit(
+                "[SPSA-SHADOW] 上位層との衝突があるため起動を拒否しました。"
+                "--force で警告のみに降格できます。")
+        print("[SPSA-SHADOW] --force 指定のため続行します。", flush=True)
+
     if _use_builtin_worker:
         _flog("  match mode : built-in")
     else:
@@ -27873,24 +29951,67 @@ def _spsa_cli(setup_mode: bool = False):
         )
         _g_global_idx += games_per_iter
 
-        if result is True:
+        if result > 0:
             wins_plus += 1
-            print("  → θ+  (total: +%d -%d =%d)" % (wins_plus, wins_minus, draws), flush=True)
-        elif result is False:
+            print("  → θ+ score=%.3f  (total: +%d -%d =%d)" % (result, wins_plus, wins_minus, draws), flush=True)
+        elif result < 0:
             wins_minus += 1
-            print("  → θ-  (total: +%d -%d =%d)" % (wins_plus, wins_minus, draws), flush=True)
+            print("  → θ- score=%.3f  (total: +%d -%d =%d)" % (result, wins_plus, wins_minus, draws), flush=True)
         else:
             draws += 1
             print("  → draw/error  (total: +%d -%d =%d)" % (wins_plus, wins_minus, draws), flush=True)
 
-        if result is not None:
-            spsa_step(state, win_plus=result)
+        if result != 0.0:
+            spsa_step(state, score=result)
 
         _spsa_save_state(state, state_save_path)
 
         if state.k % 10 == 0 and (wins_plus + wins_minus) > 0:
             spsa_save_config(state, cfg_path=_out_cfg_path)
             print("  [checkpoint] saved", flush=True)
+
+        if _anchor_every > 0 and state.k % _anchor_every == 0:
+            try:
+                _anc_cfg_current = {}
+                for p in state.params:
+                    _anc_cfg_current[p.name] = p.value
+                _anc_full_current = _merge_cfg_for_temp(_anc_cfg_current)
+                _anc_full_baseline = _merge_cfg_for_temp({})
+                _anc_result = _spsa_run_match(
+                    _anc_full_current, _anc_full_baseline, match_cmd,
+                    timeout_s=_per_game_timeout_s * _anchor_games,
+                    game_idx=_g_global_idx,
+                    games_per_iter=_anchor_games,
+                )
+                _g_global_idx += _anchor_games
+                _anc_w = 1 if _anc_result > 0 else 0
+                _anc_l = 1 if _anc_result < 0 else 0
+                _anc_d = 1 if _anc_result == 0 else 0
+                _anchor_results.append((_anc_w, _anc_d, _anc_l, _anc_result))
+                _anc_tw = sum(r[0] for r in _anchor_results)
+                _anc_td = sum(r[1] for r in _anchor_results)
+                _anc_tl = sum(r[2] for r in _anchor_results)
+                _anc_tn = _anc_tw + _anc_td + _anc_tl
+                _anc_score = (_anc_tw + _anc_td * 0.5) / _anc_tn if _anc_tn > 0 else 0.5
+                _anc_elo = _sprt_elo_from_score(_anc_score) if 0 < _anc_score < 1 else 0.0
+                print("  [ANCHOR iter %d] score=%.3f  累計 W%d-D%d-L%d  "
+                      "勝率 %.1f%%  Elo %+.1f"
+                      % (state.k, _anc_result, _anc_tw, _anc_td, _anc_tl,
+                         _anc_score * 100, _anc_elo), flush=True)
+                for _aw_size in (10, 20, 40, 80):
+                    if len(_anchor_results) >= _aw_size:
+                        _aw_tail = _anchor_results[-_aw_size:]
+                        _aw_w = sum(r[0] for r in _aw_tail)
+                        _aw_d = sum(r[1] for r in _aw_tail)
+                        _aw_l = sum(r[2] for r in _aw_tail)
+                        _aw_n = _aw_w + _aw_d + _aw_l
+                        _aw_s = (_aw_w + _aw_d * 0.5) / _aw_n if _aw_n > 0 else 0.5
+                        _aw_e = _sprt_elo_from_score(_aw_s) if 0 < _aw_s < 1 else 0.0
+                        print("    窓%d: W%d-D%d-L%d  %.1f%%  %+.1f Elo"
+                              % (_aw_size, _aw_w, _aw_d, _aw_l,
+                                 _aw_s * 100, _aw_e), flush=True)
+            except Exception as _ance:
+                _flog("[S-3] anchor error (non-fatal): %s" % _ance)
 
     if wins_plus + wins_minus == 0 and n_iter > 0:
         print("%s ABORTED: 勝敗が 1 つも付きませんでした (+0 -0 =%d) — "
@@ -28717,13 +30838,10 @@ def _corr_cli(args: list) -> None:
             eng.send("usinewgame")
             procs.append((nm, eng))
 
-        recs = _parse_psv_records(path, start + positions * stride)
-        idx = -1
+        recs = _parse_psv_records(path, positions,
+                                   start=start, stride=stride)
         used = 0
-        for sfen, label_mv, label_cp, _ply, _res in recs:
-            idx += 1
-            if idx < start or (idx - start) % stride != 0:
-                continue
+        for idx, sfen, label_mv, label_cp, _ply, _res in recs:
             row = {"idx": idx, "sfen": sfen,
                    "label_move": label_mv, "label_cp": label_cp,
                    "engines": {}}
@@ -28779,6 +30897,8 @@ def _corr_cli(args: list) -> None:
         print("[CORR] report → %s.report.txt" % out_path, flush=True)
     except OSError as e:
         _flog("[CORR] report write failed: %s" % e)
+
+
 
 
 
@@ -28841,7 +30961,7 @@ def _game_phase_param_view(vec=None) -> "_GpParamView":
     global _GP_PARAM_VIEW_CFG_CACHE
     if _GP_PARAM_VIEW_CFG_CACHE is None:
         _GP_PARAM_VIEW_CFG_CACHE = _game_phase_fit_make_view(
-            [float(_cfg.get(k, d))
+            [_cfloat(_cfg, k, d)
              for k, d in zip(_GAME_PHASE_FIT_KEYS, _GAME_PHASE_DEFAULT_VEC)])
     return _GP_PARAM_VIEW_CFG_CACHE
 
@@ -28850,16 +30970,6 @@ def _game_phase_value_state(board: "ShogiBoard", vec=None, ply: int = 0) -> floa
     whand, promoted, enemy_camp, king, exposure = _game_phase_state_counts_core(board)
     return _calc_state_phase(whand, promoted, enemy_camp, king, exposure,
                              cfg=_game_phase_param_view(vec), ply=ply)
-
-
-def _game_phase_band_core(game_phase: float, thresholds) -> int:
-    b = 0
-    for t in thresholds:
-        if game_phase >= t:
-            b += 1
-        else:
-            break
-    return b
 
 
 _NYUGYOKU_BIG = frozenset({"R", "B"})
@@ -28883,6 +30993,34 @@ _USI_TO_CSA_PIECE = {
 _CSA_PROMO = {"FU": "TO", "KY": "NY", "KE": "NK", "GI": "NG", "KA": "UM", "HI": "RY"}
 _CSA_PROMO_VALUES = frozenset(_CSA_PROMO.values())
 
+import random as _zb_random
+_zb_rng = _zb_random.Random(0xDEADBEEF_CAFE1234)
+
+_ZB_PIECES = [
+    "P", "L", "N", "S", "G", "B", "R", "K",
+    "+P", "+L", "+N", "+S", "+B", "+R",
+    "p", "l", "n", "s", "g", "b", "r", "k",
+    "+p", "+l", "+n", "+s", "+b", "+r",
+]
+_ZB_BOARD = {}
+for _zpc in _ZB_PIECES:
+    _ZB_BOARD[_zpc] = {}
+    for _zc in range(1, 10):
+        for _zr in range(1, 10):
+            _ZB_BOARD[_zpc][(_zc, _zr)] = _zb_rng.getrandbits(64)
+
+_ZB_HAND = {}
+for _zowner in ("b", "w"):
+    for _zhp in ("P", "L", "N", "S", "G", "B", "R"):
+        for _zn in range(1, 19):
+            _ZB_HAND[(_zowner, _zhp, _zn)] = _zb_rng.getrandbits(64)
+
+_ZB_SIDE_W = _zb_rng.getrandbits(64)
+
+_ZOBRIST_VERIFY = bool(os.environ.get("PYFAMATE_ZOBRIST_VERIFY", "").strip())
+
+del _zb_rng, _zb_random
+
 class ShogiBoard:
 
     _HIRATE = "lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL"
@@ -28905,7 +31043,11 @@ class ShogiBoard:
         self.gote_hand: dict[str, int] = {}
         self.ply: int = 1
         self._last_to = None
-        self._history: list[str] = []
+        self._history: list[int] = []
+        self._zhash: int = 0
+        self._hist_counter: dict[int, int] = {}
+        self._kpos: list = [None, None]
+        self._kzp_memo: dict = {}
 
         board_part = self._HIRATE
         side = start_side
@@ -28942,13 +31084,16 @@ class ShogiBoard:
         self.side = side
         self._parse_board(board_part)
         self._parse_hand(hand_part)
+        self._zhash = self._zhash_full()
         if getattr(self, "_track_history", True):
-            self._history.append(self._board_key())
+            self._history.append(self._zhash)
+            self._hist_counter[self._zhash] = self._hist_counter.get(self._zhash, 0) + 1
 
         for m in moves:
             self.apply_usi(m)
 
     def _parse_board(self, board_part: str) -> None:
+        self._kpos = [None, None]
         rows = board_part.split("/")
         for r_idx, row_str in enumerate(rows[:9]):
             col = 9
@@ -28965,6 +31110,10 @@ class ShogiBoard:
                     i += 2
                 else:
                     self.board[(col, r_idx + 1)] = ch
+                    if ch == "K":
+                        self._kpos[0] = (col, r_idx + 1)
+                    elif ch == "k":
+                        self._kpos[1] = (col, r_idx + 1)
                     col -= 1; i += 1
 
     def _parse_hand(self, hand_part: str) -> None:
@@ -28991,9 +31140,13 @@ class ShogiBoard:
         nb.sente_hand = self.sente_hand.copy()
         nb.gote_hand  = self.gote_hand.copy()
         nb.side       = self.side
+        nb._kpos      = list(self._kpos)
+        nb._kzp_memo  = {}
         nb.ply        = self.ply
         nb._last_to   = getattr(self, "_last_to", None)
         nb._history   = list(self._history)
+        nb._zhash = self._zhash
+        nb._hist_counter = self._hist_counter.copy()
         nb._track_history = getattr(self, "_track_history", True)
         return nb
 
@@ -29030,6 +31183,8 @@ class ShogiBoard:
     def apply_usi(self, usi_move: str) -> None:
         if usi_move in ("resign", "win", "", None):
             return
+        _trk = getattr(self, "_track_history", True)
+        _h = self._zhash if _trk else 0
         try:
             mover_is_sente = (self.side == "b")
             my_hand = self.sente_hand if mover_is_sente else self.gote_hand
@@ -29037,8 +31192,23 @@ class ShogiBoard:
                 piece_char, rest = usi_move.split("*", 1)
                 to_col, to_row = self._to_rc(rest)
                 base = piece_char.upper()
+                if _trk:
+                    _sc = "b" if mover_is_sente else "w"
+                    _cnt = my_hand.get(base, 0)
+                    if _cnt > 0:
+                        _h ^= _ZB_HAND.get((_sc, base, _cnt), 0)
+                    _old = self.board.get((to_col, to_row))
+                    if _old is not None:
+                        _t = _ZB_BOARD.get(_old)
+                        if _t:
+                            _h ^= _t.get((to_col, to_row), 0)
                 self._take_hand(my_hand, base)
-                self.board[(to_col, to_row)] = base if mover_is_sente else base.lower()
+                _pc_new = base if mover_is_sente else base.lower()
+                self.board[(to_col, to_row)] = _pc_new
+                if _trk:
+                    _t = _ZB_BOARD.get(_pc_new)
+                    if _t:
+                        _h ^= _t.get((to_col, to_row), 0)
             else:
                 promote = usi_move.endswith("+")
                 body = usi_move.rstrip("+")
@@ -29046,35 +31216,85 @@ class ShogiBoard:
                 to_col, to_row = self._to_rc(body[2:4])
                 piece = self.board.pop((from_col, from_row), "")
                 captured = self.board.pop((to_col, to_row), "")
+                if _trk:
+                    if piece:
+                        _t = _ZB_BOARD.get(piece)
+                        if _t:
+                            _h ^= _t.get((from_col, from_row), 0)
+                    if captured:
+                        _t = _ZB_BOARD.get(captured)
+                        if _t:
+                            _h ^= _t.get((to_col, to_row), 0)
                 if captured:
                     cap_base = captured.lstrip("+").upper()
                     if cap_base != "K":
                         self._add_hand(my_hand, cap_base)
+                        if _trk:
+                            _sc = "b" if mover_is_sente else "w"
+                            _h ^= _ZB_HAND.get((_sc, cap_base, my_hand.get(cap_base, 0)), 0)
                 if promote and piece:
                     piece = "+" + piece.lstrip("+")
                 if piece:
                     self.board[(to_col, to_row)] = piece
+                    if _trk:
+                        _t = _ZB_BOARD.get(piece)
+                        if _t:
+                            _h ^= _t.get((to_col, to_row), 0)
             self._last_to = (to_col, to_row)
+            _dest_pc = self.board.get((to_col, to_row), "")
+            if _dest_pc == "K":
+                self._kpos[0] = (to_col, to_row)
+            elif _dest_pc == "k":
+                self._kpos[1] = (to_col, to_row)
             self.side = "w" if mover_is_sente else "b"
+            if _trk:
+                self._zhash = _h ^ _ZB_SIDE_W
         except Exception:
+            self._kpos = [None, None]
             self.side = "w" if self.side == "b" else "b"
+            self._zhash = self._zhash_full()
+        self._kzp_memo.clear()
         self.ply += 1
         if getattr(self, "_track_history", True):
-            self._history.append(self._board_key())
+            if _ZOBRIST_VERIFY:
+                _ref = self._zhash_full()
+                if self._zhash != _ref:
+                    _flog(f"[ZOBRIST][WARN] incremental != full for {usi_move!r} "
+                          f"— full を採用 (要調査)")
+                    self._zhash = _ref
+            self._history.append(self._zhash)
+            self._hist_counter[self._zhash] = self._hist_counter.get(self._zhash, 0) + 1
 
     def push(self, move: str) -> None:
         self.apply_usi(move)
 
-    def _board_key(self) -> str:
+    def _board_key(self) -> int:
+        return self._zhash
+
+    def _board_key_str(self) -> str:
         b = sorted(f"{c}{r}{p}" for (c, r), p in self.board.items())
         h0 = "".join(f"{k}{v}" for k, v in sorted(self.sente_hand.items()))
         h1 = "".join(f"{k}{v}" for k, v in sorted(self.gote_hand.items()))
         return "|".join(["".join(b), h0, h1, self.side])
 
+    def _zhash_full(self) -> int:
+        h = 0
+        for (c, r), pc in self.board.items():
+            t = _ZB_BOARD.get(pc)
+            if t:
+                h ^= t.get((c, r), 0)
+        for owner, hand in (("b", self.sente_hand), ("w", self.gote_hand)):
+            for piece, cnt in hand.items():
+                for n in range(1, cnt + 1):
+                    h ^= _ZB_HAND.get((owner, piece, n), 0)
+        if self.side == "w":
+            h ^= _ZB_SIDE_W
+        return h
+
     def is_sennichite(self) -> bool:
         if len(self._history) < 8:
             return False
-        return self._history.count(self._history[-1]) >= 4
+        return self._hist_counter.get(self._history[-1], 0) >= 4
 
     def sfen(self) -> str:
         rows = []
@@ -29227,9 +31447,14 @@ class ShogiBoard:
             return ""
 
     def _king_pos(self, side: str):
+        _idx = 0 if side == "b" else 1
+        _kp = self._kpos[_idx]
+        if _kp is not None:
+            return _kp
         target = "K" if side == "b" else "k"
         for pos, pc in self.board.items():
             if pc == target:
+                self._kpos[_idx] = pos
                 return pos
         return None
 
@@ -29270,8 +31495,12 @@ class ShogiBoard:
             else (gote_total - sente_total)
 
     def _king_zone_pressure(self, defender_side: str) -> int:
+        _cached = self._kzp_memo.get(defender_side)
+        if _cached is not None:
+            return _cached
         kp = self._king_pos(defender_side)
         if kp is None:
+            self._kzp_memo[defender_side] = 0
             return 0
         kc, kr = kp
         attacker_is_sente = (defender_side == "w")
@@ -29289,7 +31518,9 @@ class ShogiBoard:
                     pressured.add((tc, tr))
             if len(pressured) == len(targets):
                 break
-        return len(pressured)
+        _result = len(pressured)
+        self._kzp_memo[defender_side] = _result
+        return _result
 
     def stance_signals(self, mover_is_sente: bool) -> dict:
         self_side = "b" if mover_is_sente else "w"
@@ -29396,8 +31627,22 @@ class ShogiBoard:
     def gives_check(self, usi_move: str) -> bool:
         if usi_move in self._NON_BOARD_MOVES:
             return False
+        nb = ShogiBoard.__new__(ShogiBoard)
+        nb.board      = self.board.copy()
+        nb.sente_hand = self.sente_hand.copy()
+        nb.gote_hand  = self.gote_hand.copy()
+        nb.side       = self.side
+        nb._kpos      = list(self._kpos)
+        nb._kzp_memo  = {}
+        nb.ply        = self.ply
+        nb._last_to   = self._last_to
+        nb._history   = []
+        nb._zhash     = 0
+        nb._hist_counter = {}
+        nb._track_history = False
+        nb.apply_usi(usi_move)
         opponent_side = "w" if self.side == "b" else "b"
-        return self._after_usi(usi_move)._is_king_attacked(opponent_side)
+        return nb._is_king_attacked(opponent_side)
 
     def would_be_sennichite(self, usi_move: str) -> bool:
         if usi_move in self._NON_BOARD_MOVES:
@@ -29410,7 +31655,7 @@ class ShogiBoard:
         scratch = self._after_usi(usi_move)
         if not scratch._history:
             return 0
-        return scratch._history.count(scratch._history[-1])
+        return scratch._hist_counter.get(scratch._history[-1], 0)
 
     def would_repeat_position(self, usi_move: str, min_count: int = 2) -> bool:
         return self.repetition_count_after(usi_move) >= min_count
@@ -29961,7 +32206,7 @@ class _CsaGame:
         self._bm_instant  = False
 
         self._zenrei = None
-        if globals().get('CSA_Zenrei_Enable', False):
+        if globals().get('CSA_Zenrei_Enable', False) and _LIVE._ready():
             try:
                 self._zenrei = _Shogidb2Zenrei(logger=_flog)
                 _s0 = self.csa_board.sfen()
@@ -30082,8 +32327,10 @@ class _CsaGame:
             _csa_signed = self.csa_board.usi_to_csa(usi_move)
         except Exception:
             _csa_signed = ""
-        _ja_disp = _sr_usi_to_ja(self.csa_board, usi_move)
-        self._live_last_move_ja = _ja_disp
+        _live_ready = _LIVE._ready()
+        if _live_ready:
+            _ja_disp = _sr_usi_to_ja(self.csa_board, usi_move)
+            self._live_last_move_ja = _ja_disp
         _mover_sign = "+" if getattr(self.csa_board, "side", "b") == "b" else "-"
         self.kifu_moves.append({
             "csa": _csa_signed,
@@ -30098,33 +32345,33 @@ class _CsaGame:
         self.move_count += 1
         self.csa_board.apply_usi(usi_move)
         self.csa_board._position_cmd = self._build_position()
-        if _LIVE._ready():
+        if _live_ready:
             _zt = self._zenrei_panel_text()
             if _zt is not None:
                 _LIVE.set_zenrei(_zt)
-        _mine = getattr(self, "my_remaining_ms", None)
-        _opp = getattr(self, "opponent_remaining_ms", None)
-        _s_ms = _mine if self.turn == "+" else _opp
-        _g_ms = _opp if self.turn == "+" else _mine
-        with self._wr_lock:
-            _wr_to_display = self._last_sente_wr
-        _LIVE.show(self.csa_board, move_no=self.move_count,
-                   last_move=_ja_disp, winrate=_wr_to_display,
-                   sente_time=_sr_fmt_clock(_s_ms),
-                   gote_time=_sr_fmt_clock(_g_ms))
-        _LIVE.start_clock(self.csa_board, _s_ms, _g_ms,
-                          active_sente=(self.csa_board.side == "b"),
-                          move_no=self.move_count,
-                          last_move=_ja_disp, winrate=_wr_to_display)
-        if self._zenrei is not None:
-            _sf = self.csa_board.sfen()
-            _pl = self.csa_board.ply
-            def _zenrei_cb(sf, cnt, _game=self):
-                _zt = _game._zenrei_panel_text()
-                if _zt is not None and _LIVE._ready():
-                    _LIVE.set_zenrei(_zt)
-                    _LIVE._redraw()
-            self._zenrei.prefetch(_sf, _pl, on_complete=_zenrei_cb)
+            _mine = getattr(self, "my_remaining_ms", None)
+            _opp = getattr(self, "opponent_remaining_ms", None)
+            _s_ms = _mine if self.turn == "+" else _opp
+            _g_ms = _opp if self.turn == "+" else _mine
+            with self._wr_lock:
+                _wr_to_display = self._last_sente_wr
+            _LIVE.show(self.csa_board, move_no=self.move_count,
+                       last_move=_ja_disp, winrate=_wr_to_display,
+                       sente_time=_sr_fmt_clock(_s_ms),
+                       gote_time=_sr_fmt_clock(_g_ms))
+            _LIVE.start_clock(self.csa_board, _s_ms, _g_ms,
+                              active_sente=(self.csa_board.side == "b"),
+                              move_no=self.move_count,
+                              last_move=_ja_disp, winrate=_wr_to_display)
+            if self._zenrei is not None:
+                _sf = self.csa_board.sfen()
+                _pl = self.csa_board.ply
+                def _zenrei_cb(sf, cnt, _game=self):
+                    _zt = _game._zenrei_panel_text()
+                    if _zt is not None and _LIVE._ready():
+                        _LIVE.set_zenrei(_zt)
+                        _LIVE._redraw()
+                self._zenrei.prefetch(_sf, _pl, on_complete=_zenrei_cb)
 
     def _kifu_bind_time(self, sign: str, consumed_units: int) -> None:
         try:
@@ -30200,32 +32447,38 @@ class _CsaGame:
         self._dispatch_go(self._build_position(), ponder=False)
         return self._wait_bestmove(timeout=self._move_relay_timeout())
 
+    def _send_instant_move(self, final_move, ponder_move) -> bool:
+        csa = self._convert_to_csa(final_move)
+        if not csa:
+            return False
+        if self.least_per_move_ms > 0 and self._turn_start_perf is not None:
+            _min_s   = self.least_per_move_ms / 1000.0
+            _elapsed = time.perf_counter() - self._turn_start_perf
+            _wait_s  = _min_s - _elapsed
+            if _wait_s > 0:
+                _flog(f"[CSA] least-time guard (instant): holding {_wait_s:.2f}s")
+                _deadline = time.perf_counter() + _wait_s
+                while not self.stop_event.is_set():
+                    _r = _deadline - time.perf_counter()
+                    if _r <= 0:
+                        break
+                    time.sleep(min(0.1, _r))
+        self._my_echo_pending = csa
+        self._safe_send(csa)
+        self._kifu_pending_comment = None
+        self._commit_move(final_move)
+        self._t_route = "instant"
+        self._trace_move(final_move, csa, self._move_relay_timeout())
+        if ponder_move:
+            self._start_ponder(ponder_move)
+        return True
+
     def _send_move_to_server(self, final_move, ponder_move) -> bool:
         if (getattr(self, "_bm_instant", False)
                 and final_move is not None
                 and final_move not in ("resign", "win", "", None)):
             self._bm_instant = False
-            csa = self._convert_to_csa(final_move)
-            if csa:
-                if self.least_per_move_ms > 0 and self._turn_start_perf is not None:
-                    _min_s   = self.least_per_move_ms / 1000.0
-                    _elapsed = time.perf_counter() - self._turn_start_perf
-                    _wait_s  = _min_s - _elapsed
-                    if _wait_s > 0:
-                        _flog(f"[CSA] least-time guard (book): holding {_wait_s:.2f}s")
-                        _deadline = time.perf_counter() + _wait_s
-                        while not self.stop_event.is_set():
-                            _r = _deadline - time.perf_counter()
-                            if _r <= 0:
-                                break
-                            time.sleep(min(0.1, _r))
-                self._my_echo_pending = csa
-                self._safe_send(csa)
-                self._kifu_pending_comment = None
-                self._commit_move(final_move)
-                self._trace_move(final_move, csa, self._move_relay_timeout())
-                if ponder_move:
-                    self._start_ponder(ponder_move)
+            if self._send_instant_move(final_move, ponder_move):
                 return True
         self._bm_instant = False
         if final_move is None:
@@ -30888,6 +33141,8 @@ class _CsaGame:
                     _flog("[CSA] server/opponent appears hung — abandoning game")
                     self.result = "draw"
                     self._cleanup_search()
+                    _dispatch(self.ctx, "gameover draw")
+                    self.gameover = True
                     _csa_finalize_kifu_on_disconnect(self.ctx)
                     break
                 continue
@@ -30896,6 +33151,8 @@ class _CsaGame:
                 _flog("[CSA] connection lost during game")
                 self.result = "draw"
                 self._cleanup_search()
+                _dispatch(self.ctx, "gameover draw")
+                self.gameover = True
                 _csa_finalize_kifu_on_disconnect(self.ctx)
                 break
 
@@ -30997,13 +33254,13 @@ def _csa_ensure_engines_idle(ctx, reason: str) -> None:
                     and getattr(_eng, "_bat_path", None) is not None):
                 _orig = getattr(_eng, "_dyn_hash_original", None)
                 if _orig is None:
-                    _orig = int(_cfg.get(f"{_eng_attr}_Hash",
-                                         _cfg.get("USI_Hash", 256)))
+                    _orig = _cint(_cfg, f"{_eng_attr}_Hash",
+                                _cfg.get("USI_Hash", 256))
                     _eng._dyn_hash_original = _orig
                 _wsl_shrink.append((_eng_attr, _eng, _orig))
         if _wsl_shrink:
             def _wsl_shrink_one(_attr, _e, _o):
-                _e.send("setoption name USI_Hash value 1")
+                _e.setoption("USI_Hash", 1)
                 _e.send("isready")
                 _e.flush_until_ready(timeout=10.0)
                 _flog(f"[WSL-HASH-SHRINK] {_attr} Hash {_o}→1MB (idle shrink)")
@@ -31023,7 +33280,6 @@ def _csa_ensure_engines_idle(ctx, reason: str) -> None:
               "no search running; children parked until next game")
     except Exception as _ie:
         _flog(f"[CSA] ensure-idle ({reason}) raised (ignored): {_ie}")
-
 
 
 
@@ -31072,7 +33328,7 @@ def _csa_main(args: list, existing_ctx=None) -> None:
     _profile = _norm_str(_cfg.get("CSA_Server_Profile", _CONFIG_DEFAULTS["CSA_Server_Profile"]))
     if _profile == "dr":
         _p_host = str(_cfg.get("Denryusen_Host",     _CONFIG_DEFAULTS["Denryusen_Host"]))
-        _p_port = int(_cfg.get("Denryusen_Port",     _CONFIG_DEFAULTS["Denryusen_Port"]))
+        _p_port = _cint(_cfg, "Denryusen_Port", _CONFIG_DEFAULTS["Denryusen_Port"])
         _p_id   = str(_cfg.get("Denryusen_ID",       _CONFIG_DEFAULTS["Denryusen_ID"]))
         _p_pw   = str(_cfg.get("Denryusen_Password", _CONFIG_DEFAULTS["Denryusen_Password"]))
         _is_floodgate = False
@@ -31080,7 +33336,7 @@ def _csa_main(args: list, existing_ctx=None) -> None:
         if _profile not in ("floodgate", ""):
             _flog(f"[CSA] 未知の CSA_Server_Profile={_profile!r} — floodgate として扱う")
         _p_host = str(_cfg.get("Floodgate_Host",     _CONFIG_DEFAULTS["Floodgate_Host"]))
-        _p_port = int(_cfg.get("Floodgate_Port",     _CONFIG_DEFAULTS["Floodgate_Port"]))
+        _p_port = _cint(_cfg, "Floodgate_Port", _CONFIG_DEFAULTS["Floodgate_Port"])
         _p_id   = str(_cfg.get("Floodgate_ID",       _CONFIG_DEFAULTS["Floodgate_ID"]))
         _p_pw   = str(_cfg.get("Floodgate_Password", _CONFIG_DEFAULTS["Floodgate_Password"]))
         _is_floodgate = True
@@ -31363,7 +33619,6 @@ def _csa_wait_summary(sock, stop_event):
     return _parse_game_summary(summary_lines)
 
 
-
 def _csa_wait_start(sock, stop_event) -> bool:
     _START_RECV_SLICE_S = 30.0
     while not stop_event.is_set():
@@ -31450,18 +33705,15 @@ def _book_move_rank_key(item):
 
 
 def _book_score_from_info_line(line, best_value, best_depth):
-    _md = _RE_DEPTH.search(line)
-    if _md is None:
+    if line.depth is None:
         return best_value, best_depth
-    _d = int(_md.group(1))
+    _d = line.depth
     if _d < best_depth:
         return best_value, best_depth
-    _mm = _RE_MATE.search(line)
-    if _mm is not None:
-        return (_BOOK_MATE_CP if int(_mm.group(1)) > 0 else -_BOOK_MATE_CP), _d
-    _mc = _RE_SCORE_CP.search(line)
-    if _mc is not None:
-        return int(_mc.group(1)), _d
+    if line.mate is not None:
+        return (_BOOK_MATE_CP if line.mate > 0 else -_BOOK_MATE_CP), _d
+    if line.score_cp is not None:
+        return line.score_cp, _d
     return best_value, best_depth
 
 
@@ -31720,7 +33972,7 @@ def _makebook_save_book(path, book, transitions, full_backup_max_pos,
 
     def _writer(mb):
         mb.write("#YANEURAOU-DB2016 1.00\n")
-        for b in book:
+        for b in sorted(book.keys()):
             if skip_keys is not None and b in skip_keys:
                 continue
             if only_keys is not None and b not in only_keys:
@@ -31747,6 +33999,78 @@ def _makebook_save_book(path, book, transitions, full_backup_max_pos,
                         entry, _best_val, _best_dep, _i == 0)
                     mb.write(_book_format_move_line(mv, entry, _ov))
     _atomic_write_file(path, _writer, "_save_book")
+    try:
+        _bk_dir = os.path.join(os.path.dirname(path) or ".", "backup")
+        _bk_max_gen = _cint(_cfg, "Makebook_Backup_Max_Generations", 10)
+        _bk_max_mb = _cfloat(_cfg, "Makebook_Backup_Max_Size_MB", 500)
+        if _bk_max_gen > 0 and os.path.exists(path):
+            os.makedirs(_bk_dir, exist_ok=True)
+            _bk_ts = time.strftime("%Y%m%d%H%M%S")
+            _bk_npos = len(book)
+            _bk_name = "pyfamate_book-%s_%d.db" % (_bk_ts, _bk_npos)
+            _bk_path = os.path.join(_bk_dir, _bk_name)
+            import shutil
+            shutil.copy2(path, _bk_path)
+            _bk_files = sorted(
+                [f for f in os.listdir(_bk_dir) if f.startswith("pyfamate_book-") and f.endswith(".db")],
+                reverse=True)
+            if len(_bk_files) > _bk_max_gen:
+                for _old in _bk_files[_bk_max_gen:]:
+                    try:
+                        os.remove(os.path.join(_bk_dir, _old))
+                    except OSError:
+                        pass
+            _bk_total = sum(
+                os.path.getsize(os.path.join(_bk_dir, f))
+                for f in os.listdir(_bk_dir)
+                if f.startswith("pyfamate_book-") and f.endswith(".db")
+                and os.path.isfile(os.path.join(_bk_dir, f)))
+            _bk_limit = _bk_max_mb * 1024 * 1024
+            if _bk_total > _bk_limit:
+                _bk_files2 = sorted(
+                    [f for f in os.listdir(_bk_dir) if f.startswith("pyfamate_book-") and f.endswith(".db")])
+                while _bk_total > _bk_limit and len(_bk_files2) > 1:
+                    _rm = _bk_files2.pop(0)
+                    _rm_path = os.path.join(_bk_dir, _rm)
+                    _bk_total -= os.path.getsize(_rm_path)
+                    os.remove(_rm_path)
+    except Exception as _bke:
+        _flog("[M-5] backup error (non-fatal): %s" % _bke)
+
+
+def _makebook_external_peta_shock(book_path, engine_path, threads=1):
+    import subprocess, tempfile
+    _out_fd, _out_path = tempfile.mkstemp(suffix=".db", prefix="peta_out_")
+    os.close(_out_fd)
+    try:
+        _cmd = [engine_path, "makebook", "peta_shock",
+                book_path, _out_path, "fast"]
+        if threads > 1:
+            _cmd.extend(["Threads", str(threads)])
+        print("[M-6] external peta_shock: %s" % " ".join(_cmd), flush=True)
+        _proc = subprocess.run(_cmd, capture_output=True, text=True, timeout=3600)
+        if _proc.returncode != 0:
+            print("[M-6] peta_shock failed (rc=%d): %s"
+                  % (_proc.returncode, _proc.stderr[:500]), flush=True)
+            return False
+        if os.path.exists(_out_path) and os.path.getsize(_out_path) > 0:
+            import shutil
+            shutil.copy2(_out_path, book_path)
+            print("[M-6] peta_shock 完了 → %s に上書き" % book_path, flush=True)
+            return True
+        print("[M-6] peta_shock 出力が空 — 元の book を保持", flush=True)
+        return False
+    except subprocess.TimeoutExpired:
+        print("[M-6] peta_shock タイムアウト (3600s)", flush=True)
+        return False
+    except Exception as _pse:
+        print("[M-6] peta_shock エラー: %s" % _pse, flush=True)
+        return False
+    finally:
+        try:
+            os.remove(_out_path)
+        except OSError:
+            pass
 
 
 def _makebook_save_kif(path, kif):
@@ -31970,6 +34294,219 @@ def _makebook_collect_leaves(book: dict) -> list:
             leaves.append((key, best_move, child_key,
                            _book_entry_count(best_entry)))
     return leaves
+
+
+def _makebook_fetch_kif(fetch_spec, out_dir=None):
+    parts = fetch_spec.split(":", 1)
+    source = parts[0].strip().lower()
+    param = parts[1].strip() if len(parts) > 1 else ""
+    if not param:
+        print(f"[makebook][K-1] fetch_kif: パラメータが不足 (例: floodgate:<player>)")
+        return []
+    if out_dir is None:
+        out_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_kif")
+    os.makedirs(out_dir, exist_ok=True)
+    script_map = {
+        "floodgate": "KifManager.floodgate_downloader",
+        "denryusen": "KifManager.denryusen_downloader",
+        "wcsc": "KifManager.wcsc_downloader",
+    }
+    module = script_map.get(source)
+    if module is None:
+        print(f"[makebook][K-1] fetch_kif: 不明なソース '{source}' "
+              f"(対応: {', '.join(script_map.keys())})")
+        return []
+    cmd = [sys.executable, "-m", module, "--player", param, "--out", out_dir]
+    print(f"[makebook][K-1] fetch_kif: {' '.join(cmd)}")
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        if result.returncode != 0:
+            print(f"[makebook][K-1] fetch_kif 失敗 (rc={result.returncode}): "
+                  f"{result.stderr[:500]}")
+            if "No module named" in result.stderr:
+                print("[makebook][K-1] ScriptCollection / KifManager が未導入です。"
+                      "pip install YaneuraOu-ScriptCollection で導入してください。")
+            return []
+        print(f"[makebook][K-1] fetch_kif 完了: {result.stdout[:200]}")
+    except FileNotFoundError:
+        print("[makebook][K-1] Python 実行ファイルが見つかりません")
+        return []
+    except subprocess.TimeoutExpired:
+        print("[makebook][K-1] fetch_kif タイムアウト (300s)")
+        return []
+    collected = []
+    for ext in ("*.csa", "*.kif", "*.sfen"):
+        collected.extend(glob.glob(os.path.join(out_dir, ext)))
+    if not collected:
+        collected.extend(
+            glob.glob(os.path.join(out_dir, "**", "*.csa"), recursive=True))
+        collected.extend(
+            glob.glob(os.path.join(out_dir, "**", "*.kif"), recursive=True))
+    print(f"[makebook][K-1] 取得棋譜: {len(collected)} ファイル")
+    return collected
+
+
+def _makebook_target_refutation(book, transitions, pq,
+                                margin_cp=50, base_priority=90.0):
+    edges = {}
+    for key, bucket in book.items():
+        for move in bucket:
+            child = _book_child_key(key, move)
+            if child and child in book:
+                edges[(key, move)] = child
+    for (key, move) in transitions:
+        if (key, move) not in edges:
+            child = transitions[(key, move)]
+            if child in book:
+                edges[(key, move)] = child
+    pre_best = {}
+    for key, bucket in book.items():
+        items = [(m, e) for m, e in bucket.items() if not _book_entry_is_bad(e)]
+        if items:
+            items.sort(key=_book_move_rank_key)
+            pre_best[key] = (items[0][0], _book_entry_value(items[0][1]))
+    backed = {}
+    for (parent, move), child in edges.items():
+        child_best = _book_position_best(book.get(child))
+        if child_best is None:
+            continue
+        bv = -int(child_best[0])
+        backed.setdefault(parent, {})[move] = bv
+    seeded = 0
+    for key, bk_moves in backed.items():
+        bucket = book.get(key)
+        if not bucket:
+            continue
+        sim = {}
+        for m, e in bucket.items():
+            if _book_entry_is_bad(e):
+                continue
+            v = bk_moves.get(m, _book_entry_value(e))
+            sim[m] = v
+        if not sim:
+            continue
+        new_best_move = max(sim, key=sim.__getitem__)
+        new_best_val = sim[new_best_move]
+        old = pre_best.get(key)
+        if old is None:
+            continue
+        old_move, old_val = old
+        if new_best_move != old_move and new_best_val - old_val >= margin_cp:
+            for m, e in bucket.items():
+                if _book_entry_is_bad(e):
+                    continue
+                child = _book_child_key(key, m)
+                if child and child not in book:
+                    pq.push(child, base_priority)
+                    seeded += 1
+    return seeded
+
+
+def _makebook_target_depthgap(book, pq, eval_per_ply=15,
+                              base_priority=80.0):
+    seeded = 0
+    for key, bucket in book.items():
+        items = [(m, e) for m, e in bucket.items() if not _book_entry_is_bad(e)]
+        if len(items) < 2:
+            continue
+        items.sort(key=_book_move_rank_key)
+        best_move, best_entry = items[0]
+        best_val = _book_entry_value(best_entry)
+        best_dep = _book_entry_depth(best_entry)
+        for m, e in items[1:]:
+            cand_val = _book_entry_value(e)
+            cand_dep = _book_entry_depth(e)
+            depth_diff = best_dep - cand_dep
+            if depth_diff <= 0:
+                continue
+            if depth_diff * eval_per_ply >= best_val - cand_val:
+                child = _book_child_key(key, m)
+                if child and child not in book:
+                    pq.push(child, base_priority)
+                    seeded += 1
+    return seeded
+
+
+def _makebook_target_unsolved(book, kif_paths, pq, base_priority=85.0):
+    seeded = 0
+    for kpath in kif_paths:
+        try:
+            with open(kpath, encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    if line.startswith("position "):
+                        line = line[9:]
+                    if line.startswith("startpos"):
+                        moves_part = line.split("moves")
+                        if len(moves_part) < 2:
+                            continue
+                        move_list = moves_part[1].split()
+                    elif line.startswith("sfen "):
+                        parts = line.split("moves")
+                        if len(parts) < 2:
+                            continue
+                        move_list = parts[1].split()
+                    else:
+                        continue
+                    b = ShogiBoard()
+                    for mv in move_list:
+                        mv = mv.strip()
+                        if not mv:
+                            continue
+                        sfen_key = _book_key_from_sfen(b.sfen())
+                        if sfen_key and sfen_key in book:
+                            bucket = book[sfen_key]
+                            items = [(m, e) for m, e in bucket.items()
+                                     if not _book_entry_is_bad(e)]
+                            if items:
+                                items.sort(key=_book_move_rank_key)
+                                best_move = items[0][0]
+                                child = _book_child_key(sfen_key, best_move)
+                                if child and child not in book:
+                                    pq.push(child, base_priority)
+                                    seeded += 1
+                        try:
+                            b.push(mv)
+                        except Exception:
+                            break
+        except OSError as e:
+            print(f"[makebook][M-4] unsolved: ファイル読込失敗 {kpath}: {e}")
+    return seeded
+
+
+def _makebook_target_opponent(book, opponent_db_path, pq, base_priority=85.0):
+    try:
+        opp = _db_load_book(opponent_db_path)
+    except Exception as e:
+        print(f"[makebook][M-4] opponent: 相手定跡読込失敗 {opponent_db_path}: {e}")
+        return 0
+    if not opp:
+        print(f"[makebook][M-4] opponent: 相手定跡が空 {opponent_db_path}")
+        return 0
+    seeded = 0
+    for key, opp_moves in opp.items():
+        if key not in book:
+            continue
+        for usi, _val, _cnt in opp_moves:
+            child = _book_child_key(key, usi)
+            if child is None:
+                continue
+            if child not in book:
+                pq.push(child, base_priority)
+                seeded += 1
+            else:
+                child_bucket = book[child]
+                child_items = [(m, e) for m, e in child_bucket.items()
+                               if not _book_entry_is_bad(e)]
+                if child_items:
+                    child_items.sort(key=_book_move_rank_key)
+                    grandchild = _book_child_key(child, child_items[0][0])
+                    if grandchild and grandchild not in book:
+                        pq.push(grandchild, base_priority * 0.8)
+                        seeded += 1
+    return seeded
 
 
 def _makebook_eval_position(eng, sfen_key: str, byoyomi_ms: int,
@@ -32303,10 +34840,24 @@ def _makebook_cli(extra_args: list) -> None:
         "").strip()
     if readbook and not readbook.endswith(".db"):
         if readbook.lower().endswith(".ybb"):
-            print(f"[makebook] '{readbook}' は .ybb (バイナリ定跡) です。makebook の "
-                  f"ローダはテキスト .db 専用のため直接読めません。"
-                  f"convert_ybb_to_db.py で .db へ変換してから readbook= に渡して"
-                  f"ください。空の定跡から開始します。")
+            try:
+                _ybb_raw = _db_parse_ybb(readbook)
+                _ybb_loaded = 0
+                for _ybb_key, _ybb_moves in _ybb_raw.items():
+                    for _usi, _val, _cnt in _ybb_moves:
+                        if _ybb_key in book:
+                            book[_ybb_key][_usi] = _book_make_entry(_val, 0, max(_cnt, 1))
+                        else:
+                            book[_ybb_key] = {_usi: _book_make_entry(_val, 0, max(_cnt, 1))}
+                        _ybb_loaded += 1
+                print(f"[makebook][M-2] .ybb 読込完了: {len(_ybb_raw)} 局面, "
+                      f"{_ybb_loaded} 手 from '{readbook}'")
+            except Exception as _ybb_err:
+                print(f"[makebook] .ybb 読込失敗: {_ybb_err}")
+                if _unattended:
+                    raise SystemExit(
+                        f"makebook: .ybb 読込失敗 (無人モード): {_ybb_err}")
+                print("空の定跡から開始します。")
         else:
             print(f"[makebook] '{readbook}' は .db 形式ではないため読み込めません "
                   f"(.bin 等のバイナリ定跡は未対応)。空の定跡から開始します。")
@@ -32406,6 +34957,30 @@ def _makebook_cli(extra_args: list) -> None:
         "読込後 .consumed へ退避。空欄=無効）\n",
         "").strip()
     blunder_seeds_path = _bt5
+
+    _target_mode = _mb_setting(
+        "target",
+        "掘削ターゲット選定器 (refutation/depthgap/unsolved/opponent, 空=通常)\n",
+        "").strip().lower()
+    _target_param = _mb_setting(
+        "target_param",
+        "ターゲットパラメータ (unsolved=棋譜パス, opponent=相手DB, その他=空)\n",
+        "").strip()
+    if _target_mode and _target_mode not in ("refutation", "depthgap", "unsolved", "opponent"):
+        print(f"[makebook][M-4] 不明なターゲット '{_target_mode}' — 通常モードで続行")
+        _target_mode = ""
+
+    _fetch_kif_spec = _mb_setting(
+        "fetch_kif",
+        "棋譜取得 (floodgate:<player>/denryusen:<event>/wcsc:<event>, 空=無効)\n",
+        "").strip()
+    if _fetch_kif_spec:
+        _fetched_files = _makebook_fetch_kif(_fetch_kif_spec)
+        if _fetched_files and not _target_mode:
+            _target_mode = "unsolved"
+            _target_param = ",".join(_fetched_files)
+            print(f"[makebook][K-1] 取得棋譜 → target=unsolved に自動連動 "
+                  f"({len(_fetched_files)} ファイル)")
 
     draw = _mb_setting(
         "draw",
@@ -32628,8 +35203,9 @@ def _makebook_cli(extra_args: list) -> None:
                       "投入 → %s へ退避" % (len(_seeds), _bk))
             except OSError as _be:
                 try:
-                    with open(_off_path, "w", encoding="utf-8") as _of:
-                        _of.write(str(_consumed_off))
+                    _atomic_write_file(_off_path,
+                                       lambda f, _v=_consumed_off: f.write(str(_v)),
+                                       label="makebook-seed-offset")
                     print("[makebook][B8] シード退避失敗 (継続・offset=%d 記録"
                           "済み — 再投入は防止): %s" % (_consumed_off, _be))
                 except OSError as _oe:
@@ -32637,6 +35213,30 @@ def _makebook_cli(extra_args: list) -> None:
                           "(次回重複投入の可能性): %s / %s" % (_be, _oe))
         else:
             print("[makebook][B8] 対局側悪手シード: 有効なレコードなし")
+
+    if _target_mode:
+        _t4_seeded = 0
+        if _target_mode == "refutation":
+            _t4_margin = int(_cli_kv.get("refutation_margin_cp", "50"))
+            _t4_seeded = _makebook_target_refutation(
+                book, transitions, pq, margin_cp=_t4_margin)
+        elif _target_mode == "depthgap":
+            _t4_epp = int(_cli_kv.get("depthgap_eval_per_ply", "15"))
+            _t4_seeded = _makebook_target_depthgap(
+                book, pq, eval_per_ply=_t4_epp)
+        elif _target_mode == "unsolved":
+            _t4_paths = [p.strip() for p in _target_param.split(",") if p.strip()]
+            if _t4_paths:
+                _t4_seeded = _makebook_target_unsolved(book, _t4_paths, pq)
+            else:
+                print("[makebook][M-4] unsolved: target_param= に棋譜パスを指定してください")
+        elif _target_mode == "opponent":
+            if _target_param:
+                _t4_seeded = _makebook_target_opponent(book, _target_param, pq)
+            else:
+                print("[makebook][M-4] opponent: target_param= に相手定跡パスを指定してください")
+        if _t4_seeded:
+            print(f"[makebook][M-4] target={_target_mode}: {_t4_seeded} 局面を優先キューへ投入")
 
     _game_phase_cfg = None
     if bad_cp_game_phase_coef != 0.0:
@@ -32780,7 +35380,10 @@ def _makebook_cli(extra_args: list) -> None:
                 else:
                     print("[makebook][B5] 優先局面起点の局 — 連勝カウント対象外")
 
-                _ = _apply_book_result(book, tempbook, _book_turn_of_key(sfen))
+                _bp = _apply_book_result(book, tempbook, _book_turn_of_key(sfen))
+                if _bp["killed"]:
+                    print("[makebook] book_pass: killed=%s evaporated=%s"
+                          % (_bp["killed"], _bp["evaporated"]))
                 end = 1
 
             elif board.is_sennichite():
@@ -32789,7 +35392,10 @@ def _makebook_cli(extra_args: list) -> None:
                     win = 0
                 print("千日手")
                 if draw == "b" or draw == "w":
-                    _ = _apply_book_result(book, tempbook, draw)
+                    _bp = _apply_book_result(book, tempbook, draw)
+                    if _bp["killed"]:
+                        print("[makebook] book_pass: killed=%s evaporated=%s"
+                              % (_bp["killed"], _bp["evaporated"]))
                 end = 1
 
             elif max_book_ply > 0 and len(tempbook) >= max_book_ply:
@@ -32866,6 +35472,10 @@ def _makebook_cli(extra_args: list) -> None:
                   + " ".join(f"{k}={v}" for k, v in sorted(_bs.items())))
 
         _makebook_save_book(bookfile, book, transitions, _full_backup_max_pos, drop_bad=True)
+        _ps_engine = _cli_kv.get("peta_shock_engine", "")
+        if _ps_engine and os.path.exists(_ps_engine):
+            _ps_threads = int(_cli_kv.get("peta_shock_threads", "1"))
+            _makebook_external_peta_shock(bookfile, _ps_engine, threads=_ps_threads)
         _makebook_save_kif(kiffile, kif)
         print("[makebook][B11] book/kif を先行保存しました (検証前確定):")
         print("           " + bookfile)
@@ -34983,30 +37593,6 @@ def _game_phase_fit_cli(extra_args):
 
 
 
-class _BitStream:
-    __slots__ = ("_data", "_cur")
-
-    def __init__(self, data: bytes):
-        self._data = data
-        self._cur  = 0
-
-    def read_one_bit(self) -> int:
-        b = (self._data[self._cur >> 3] >> (self._cur & 7)) & 1
-        self._cur += 1
-        return b
-
-    def read_n_bit(self, n: int) -> int:
-        result = 0
-        for i in range(n):
-            result |= self.read_one_bit() << i
-        return result
-
-    @property
-    def cursor(self) -> int:
-        return self._cur
-
-
-
 _HUF_BOARD = [
     (0x00, 1),
     (0x01, 2),
@@ -35158,120 +37744,10 @@ def _fast_psfen_to_sfen(data32):
     return _svboard_to_sfen(sb)
 
 
-
-def _read_board_piece(bs: _BitStream):
-    code = 0
-    bits = 0
-    while True:
-        code |= bs.read_one_bit() << bits
-        bits += 1
-        for pt, (c, b) in enumerate(_HUF_BOARD):
-            if c == code and b == bits:
-                if pt == 0:
-                    return 0, False, 0
-                promote = False if pt == 7 else bool(bs.read_one_bit())
-                color   = bs.read_one_bit()
-                return pt, promote, color
-
-
-
-def _read_hand_piece(bs: _BitStream):
-    code = 0
-    bits = 0
-    while True:
-        code |= bs.read_one_bit() << bits
-        bits += 1
-        for pt in range(1, 8):
-            hc, hb = _HUF_HAND_MATCH[pt]
-            if hc == code and hb == bits:
-                if pt == 7:
-                    color = bs.read_one_bit()
-                    return pt, False, color
-                promote = bool(bs.read_one_bit())
-                color   = bs.read_one_bit()
-                return pt, promote, color
-
-
-
-_PT_TO_USI = {
-    1: "P",
-    2: "L",
-    3: "N",
-    4: "S",
-    5: "B",
-    6: "R",
-    7: "G",
-    8: "K",
-}
-
 def _sq_to_usi(sq: int) -> str:
     file_idx = sq // 9
     rank_idx = sq % 9
     return f"{file_idx + 1}{'abcdefghi'[rank_idx]}"
-
-
-def _decode_packed_sfen(data32: bytes) -> str:
-    bs = _BitStream(data32)
-
-    turn = bs.read_one_bit()
-
-    board = [None] * 81
-    for color in range(2):
-        sq = bs.read_n_bit(7)
-        if sq < 81:
-            board[sq] = (8, False, color)
-
-    for sq in range(81):
-        if board[sq] is not None:
-            continue
-        pt, promote, color = _read_board_piece(bs)
-        if pt != 0:
-            board[sq] = (pt, promote, color)
-
-    hand = [[0] * 8, [0] * 8]
-    while bs.cursor < 256:
-        pt, promote, color = _read_hand_piece(bs)
-        if promote:
-            continue
-        hand[color][pt] += 1
-
-    ranks = []
-    for rank_idx in range(9):
-        row = ""
-        empty = 0
-        for file_idx in range(8, -1, -1):
-            sq = file_idx * 9 + rank_idx
-            cell = board[sq]
-            if cell is None:
-                empty += 1
-            else:
-                if empty:
-                    row += str(empty)
-                    empty = 0
-                pt, promote, color = cell
-                ch = _PT_TO_USI.get(pt, "?")
-                if promote and pt not in (7, 8):
-                    ch = "+" + ch
-                row += ch if color == 0 else ch.lower()
-        if empty:
-            row += str(empty)
-        ranks.append(row)
-    board_str = "/".join(ranks)
-
-    hand_str = ""
-    for color in range(2):
-        for pt in [6, 5, 7, 4, 3, 2, 1]:
-            n = hand[color][pt]
-            if n > 0:
-                ch = _PT_TO_USI[pt]
-                if color == 1:
-                    ch = ch.lower()
-                hand_str += (str(n) if n > 1 else "") + ch
-    if not hand_str:
-        hand_str = "-"
-
-    turn_str = "b" if turn == 0 else "w"
-    return f"{board_str} {turn_str} {hand_str} 1"
 
 
 
@@ -35297,13 +37773,21 @@ def _move16_to_usi(move16: int) -> str:
 _PSV_RECORD_SIZE = 40
 _PSV_FMT = "<32shHHbB"
 
-def _parse_psv_records(path: str, max_records: int):
+def _parse_psv_records(path: str, max_records: int,
+                       start: int = 0, stride: int = 1):
     with open(path, "rb") as f:
         count = 0
+        idx = 0
+        _use_stride = stride > 1
         while count < max_records:
             raw = f.read(_PSV_RECORD_SIZE)
             if len(raw) < _PSV_RECORD_SIZE:
                 break
+            if _use_stride and (idx < start or (idx - start) % stride != 0):
+                idx += 1
+                continue
+            cur_idx = idx
+            idx += 1
             data32, score, move16, gamePly, result, _ = _struct.unpack(_PSV_FMT, raw)
             try:
                 sfen = _fast_psfen_to_sfen(data32)
@@ -35312,20 +37796,15 @@ def _parse_psv_records(path: str, max_records: int):
                 count += 1
                 continue
             move_usi = _move16_to_usi(move16)
-            yield sfen, move_usi, score, gamePly, result
+            if _use_stride:
+                yield cur_idx, sfen, move_usi, score, gamePly, result
+            else:
+                yield sfen, move_usi, score, gamePly, result
             count += 1
 
 
 
 _TEACHER_DEFAULT_PSV_DIR = r"E:\New folder"
-
-
-def _teacher_find_bin(psv_dir: str):
-    for root, _dirs, files in os.walk(psv_dir):
-        for fn in files:
-            if fn.lower().endswith(".bin"):
-                return os.path.join(root, fn)
-    return None
 
 
 
@@ -35648,7 +38127,7 @@ def _dlponder_cli(args):
             _DLPONDER_STATE["opponent_s_ema"] = float(opponent_s)
             _dlponder_save_state()
             _g = _dlponder_gain_core(_DLPONDER_STATE.get("nps_ema"), opponent_s,
-                                int(_cfg.get("POLICY_NODES", 2043)))
+                                _cint(_cfg, "POLICY_NODES", 2043))
             print(f"[dlp-cal] saved: nps_ema="
                   f"{_DLPONDER_STATE.get('nps_ema') and round(_DLPONDER_STATE['nps_ema'])} "
                   f"opponent_s={opponent_s} samples={_DLPONDER_STATE.get('samples')} "
@@ -36487,6 +38966,109 @@ def _flip_setup_cli(args):
           "強制ON)。" % _FLIP_FONT_NAME, flush=True)
 
 
+
+def _ensure_lint_tools():
+    for _mod, _pkg in (("mypy", "mypy==1.11.*"), ("ruff.__main__", "ruff")):
+        try:
+            __import__(_mod)
+        except ImportError:
+            if _auto_install_ok():
+                _pip_install([_pkg])
+            else:
+                print(f"[lint] {_pkg} が見つかりません (PYFAMATE_NO_AUTO_INSTALL=1)")
+                return False
+    return True
+
+
+def _lint_cli(rest):
+    _me = os.path.abspath(__file__)
+    _base = os.path.dirname(_me)
+    _baseline_path = os.path.join(_base, "lint_baseline.json")
+
+    if not _ensure_lint_tools():
+        sys.exit(1)
+
+    import subprocess as _sp
+
+    print("[lint] ruff check …")
+    _ruff_rc = _sp.call([sys.executable, "-m", "ruff", "check",
+                         "--select", "F821,F811,F841", _me])
+    if _ruff_rc != 0:
+        print(f"[lint] ruff: {_ruff_rc} error(s)")
+
+    print("[lint] mypy check …")
+    _mypy_args = [
+        sys.executable, "-m", "mypy", _me,
+        "--python-version", "3.11",
+        "--check-untyped-defs",
+        "--ignore-missing-imports",
+        "--allow-redefinition",
+        "--cache-dir", os.path.join(_base, ".mypy_cache"),
+        "--enable-error-code", "used-before-def",
+        "--enable-error-code", "possibly-undefined",
+        "--disable-error-code", "assignment",
+        "--disable-error-code", "arg-type",
+        "--disable-error-code", "union-attr",
+        "--disable-error-code", "index",
+        "--disable-error-code", "operator",
+        "--disable-error-code", "var-annotated",
+        "--no-error-summary",
+    ]
+    _mypy_proc = _sp.run(_mypy_args, capture_output=True, text=True)
+    _mypy_lines = [ln for ln in (_mypy_proc.stdout or "").strip().splitlines()
+                   if ln.strip() and ": error" in ln]
+
+    _code_counts = {}
+    for _ln in _mypy_lines:
+        _ec = "unknown"
+        if "  [" in _ln and _ln.rstrip().endswith("]"):
+            _ec = _ln.rstrip().rsplit("[", 1)[1].rstrip("]")
+        _code_counts[_ec] = _code_counts.get(_ec, 0) + 1
+
+    _baseline = {}
+    if os.path.isfile(_baseline_path):
+        try:
+            with open(_baseline_path, encoding="utf-8") as _f:
+                _baseline = json.loads(_f.read())
+        except Exception:
+            pass
+
+    _regressed = False
+    for _c, _n in _code_counts.items():
+        _b = _baseline.get(_c, 0)
+        if _n > _b:
+            print(f"[lint] REGRESSION: [{_c}] {_b}→{_n} (+{_n - _b})")
+            _regressed = True
+
+    _updated = False
+    for _c, _n in list(_code_counts.items()):
+        if _n < _baseline.get(_c, _n + 1):
+            _updated = True
+    for _c in list(_baseline):
+        if _c not in _code_counts:
+            _updated = True
+
+    if _updated or not _baseline:
+        try:
+            with open(_baseline_path, "w", encoding="utf-8") as _f:
+                _f.write(json.dumps(_code_counts, indent=2, sort_keys=True) + "\n")
+            print(f"[lint] baseline 更新: {_baseline_path}")
+        except Exception as _e:
+            print(f"[lint] baseline 書き込み失敗: {_e}")
+
+    _total = sum(_code_counts.values())
+    print(f"[lint] mypy: {_total} error(s) "
+          + " ".join(f"[{c}]={n}" for c, n in sorted(_code_counts.items())))
+    if _ruff_rc != 0:
+        print("[lint] ruff: FAIL")
+    if _regressed:
+        print("[lint] baseline 超過: FAIL")
+        sys.exit(1)
+    if _ruff_rc != 0:
+        sys.exit(1)
+    print("[lint] OK")
+
+
 _CLI_DISPATCH = {
     "game":      _cli_game,
     "flip-font": _flip_setup_cli,
@@ -36504,7 +39086,12 @@ _CLI_DISPATCH = {
     "wdl":       _wdl_fit_cli,
     "--spsa-worker": lambda rest: main(),
     "learn":     lambda rest: sv_learn_main(rest),
+    "export-onnx": _svonnx_export_cli,
+    "check-model": _svcheck_cli,
+    "--lint":    _lint_cli,
+    "lint":      _lint_cli,
 }
+
 
 if __name__ == "__main__":
     _mp.freeze_support()
