@@ -31025,6 +31025,7 @@ class ShogiBoard:
 
     _HIRATE = "lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL"
 
+    # [MyDeacy] 非着手トークン / 利き判定の方向テーブル (frozenset = O(1) 判定)。
     _NON_BOARD_MOVES = (None, "", "resign", "win")
     _ORTHO_STEPS = frozenset(((0, 1), (0, -1), (1, 0), (-1, 0)))
     _DIAG_STEPS = frozenset(((1, 1), (1, -1), (-1, 1), (-1, -1)))
