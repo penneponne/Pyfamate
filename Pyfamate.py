@@ -140,6 +140,11 @@ def _config_txt_io_enabled():
             or os.environ.get("PYFAMATE_CONFIG_TXT_IO", "").strip().lower()
                 in ("1", "true", "yes", "on"))
 
+def _config_txt_write_enabled():
+    if os.environ.get("PYFAMATE_BASE_DIR", ""):
+        return False
+    return _config_txt_io_enabled()
+
 _SPSA_HW_PATTERNS = (
     "Eff_S",
     "Time",
@@ -185,17 +190,17 @@ _game_thread_started: bool = False
 _csa_stop_event = None
 _suppress_info_print: bool = False
 
-CSA_Comment_Enable: bool = True
+CSA_Comment_Enable: bool = False
 CSA_Comment_Mode: str = "text"
 CSA_Kifu_Enable: bool = True
 CSA_Kifu_Dir: str = ""
-CSA_Kifu_Comments: bool = True
+CSA_Kifu_Comments: bool = False
 SFEN_Kifu_Enable: bool = True
 SFEN_Kifu_Path: str = ""
 CSA_Zenrei_Enable: bool = False
 CSA_Comment_Show_Eval_Text: bool = False
 
-CSA_Force_Comment: str = "auto"
+CSA_Force_Comment: str = "never"
 
 CSA_Encoding: str = "cp932"
 
@@ -426,7 +431,8 @@ def _sr_flip_font_active() -> bool:
 _SR_LW = 4
 _SR_RULE = 30
 _SR_MULTIPV_MAX = 8
-_SR_PV_FOLD_MAX = 3
+_SR_PV_FOLD_MAX = None
+_ADJ_WR_TH = 0.70
 _clamp_log_t = [0.0]
 _SR_WIDE_MARK = frozenset("▲△▼▽")
 _SR_JA_FILE = "１２３４５６７８９"
@@ -525,10 +531,12 @@ def _sr_hand_pieces(hand: dict) -> list:
     return out if out else ["な", "し"]
 
 
-def _sr_eval_bar(winrate: float, n: int = 10) -> str:
-    frac = _clamp01((winrate - 45.0) / 10.0)
+def _sr_eval_bar(sente_wr: float, n: int = 10) -> str:
+    if not isinstance(sente_wr, (int, float)):
+        return "□" * n
+    frac = _clamp01((float(sente_wr) - 45.0) / 10.0)
     filled = int(frac * n + 0.5)
-    return "■" * filled + "□" * (n - filled)
+    return "□" * (n - filled) + "■" * filled
 
 
 def _sr_fmt_clock(ms) -> str:
@@ -630,7 +638,7 @@ def _sr_render_board(board, *, move_no=None, last_move="", winrate=None, mark=No
         out.extend(header.splitlines())
         if winrate is not None:
             sp = int(round(winrate))
-            out.append(f"{sp}% {_sr_eval_bar(winrate, bar_len)} {100 - sp}%")
+            out.append(f"{100 - sp}% {_sr_eval_bar(winrate, bar_len)} {sp}%")
     else:
         if mark is None:
             mark = "△" if side == "b" else "▲"
@@ -643,7 +651,7 @@ def _sr_render_board(board, *, move_no=None, last_move="", winrate=None, mark=No
             out.append(start_label)
         if winrate is not None:
             sp = int(round(winrate))
-            out.append(f"{sp}% {_sr_eval_bar(winrate, bar_len)} {100 - sp}%")
+            out.append(f"{100 - sp}% {_sr_eval_bar(winrate, bar_len)} {sp}%")
 
     for i in range(total):
         cl = center[i] if 0 <= i < nb else _sr_pad("", _cw)
@@ -1031,7 +1039,7 @@ def _sr_pv_fold(out, pvlist, label, tail="", annot=""):
     _nlines = 0
     for _pi in range(0, len(pvlist), 6):
         _nlines += 1
-        if _nlines > _SR_PV_FOLD_MAX:
+        if _SR_PV_FOLD_MAX is not None and _nlines > _SR_PV_FOLD_MAX:
             if out:
                 out[-1] += " …"
             break
@@ -1169,31 +1177,57 @@ def _sr_multipv_lines(policy, ja):
     return out
 
 
-def _sr_linger_lines(hold_rec, hold_pos, hold_policy):
+def _sr_linger_split(hold_rec, hold_pos, hold_policy, cur_side=None):
     try:
         b = _board_for_position(hold_pos)
     except Exception:
         b = None
     _smk = ("▲" if getattr(b, "side", "b") == "b" else "△") if b is not None else ""
+    _wr_flip = (cur_side is not None and b is not None
+                and getattr(b, "side", "b") != cur_side)
 
     def _ja(mv):
         if not mv or mv in ("resign", "win"):
             return mv or "—"
+        if b is not None and not _bestmove_is_for_board(mv, b):
+            return mv
         return _smk + (_sr_usi_to_ja(b, mv) if b is not None else mv)
 
     _rec = hold_rec if isinstance(hold_rec, dict) else {}
-    out = []
+    head = []
     _dmv = _rec.get("dl_top_move")
+    if (_dmv and isinstance(_dmv, str) and not _dmv.startswith("(")
+            and b is not None and not _bestmove_is_for_board(_dmv, b)):
+        _dmv = None
     if _dmv and isinstance(_dmv, str) and not _dmv.startswith("("):
         _dwr = _sr_dl_wr(_rec)
+        if _wr_flip and isinstance(_dwr, (int, float)):
+            _dwr = 1.0 - _dwr
         _w = ("%3.0f%%" % (_dwr * 100)) if isinstance(_dwr, (int, float)) else ""
-        out.append(" " + _sr_pad("DL₁残", 5) + _sr_pad(_ja(_dmv), 11) + _w)
-    out.extend(_sr_pred_ease_lines(_rec, b, hold_policy, _ja, multi_engine=True))
-    out.extend(_sr_multipv_lines(hold_policy, _ja))
-    return out
+        head.append(" " + _sr_pad("DL₁", 5) + _sr_pad(_ja(_dmv), 11) + _w)
+    _d2mv = _rec.get("dl_2_top_move")
+    if (_d2mv and isinstance(_d2mv, str) and not _d2mv.startswith("(")
+            and b is not None and not _bestmove_is_for_board(_d2mv, b)):
+        _d2mv = None
+    if _d2mv and isinstance(_d2mv, str) and not _d2mv.startswith("("):
+        _d2wr = _rec.get("council_wr_dl2")
+        if _wr_flip and isinstance(_d2wr, (int, float)):
+            _d2wr = 1.0 - _d2wr
+        _w2 = ("%3.0f%%" % (_d2wr * 100)) if isinstance(_d2wr, (int, float)) else ""
+        _lbl2 = ("DL₃" if (_rec.get("_orig_source") or _rec.get("source"))
+                 == "light_council" else "DL₂")
+        head.append(" " + _sr_pad(_lbl2, 5) + _sr_pad(_ja(_d2mv), 11) + _w2)
+    head.extend(_sr_pred_ease_lines(_rec, b, hold_policy, _ja, multi_engine=True))
+    return head, _sr_multipv_lines(hold_policy, _ja)
 
 
-def _sr_render_endgame(rec, b, ja, clock, zenrei, dgp_ema, *, gp_ema=None, pv=None, policy=None):
+def _sr_linger_lines(hold_rec, hold_pos, hold_policy):
+    _h, _m = _sr_linger_split(hold_rec, hold_pos, hold_policy)
+    return _h + _m
+
+
+def _sr_render_endgame(rec, b, ja, clock, zenrei, dgp_ema, *, gp_ema=None, pv=None,
+                       policy=None, hold_head=(), hold_mpv=()):
     status, final, voices = _sr_status_voices(rec, "endgame")
     sc = rec.get("nnue_score_cp")
     _egd = dgp_ema if isinstance(dgp_ema, (int, float)) else rec.get("game_phase_delta")
@@ -1218,6 +1252,7 @@ def _sr_render_endgame(rec, b, ja, clock, zenrei, dgp_ema, *, gp_ema=None, pv=No
         out.append(" " + _sr_pad("DL₃", 5) + _sr_pad(ja(_d3mv), 11)
                    + (("%3.0f%%" % (_d3wr * 100)) if isinstance(_d3wr, (int, float)) else ""))
     out.extend(_sr_pred_ease_lines(rec, b, policy, ja, multi_engine=bool(policy)))
+    out.extend(hold_head)
     _is_mate = bool(rec.get("mate_detected")) or (isinstance(sc, (int, float)) and abs(sc) >= _MATE_CP)
     _pvja = _sr_pv_ja(b, pv)
     _lbl = ("被詰" if (_is_mate and isinstance(sc, (int, float)) and sc < 0) else ("詰" if _is_mate else "ツリー"))
@@ -1251,13 +1286,14 @@ def _sr_render_endgame(rec, b, ja, clock, zenrei, dgp_ema, *, gp_ema=None, pv=No
     _meta = _sr_meta_line(rec)
     if _meta:
         out.append(" " + _meta)
-    out.extend(_sr_multipv_lines(policy, ja))
+    _mpv = _sr_multipv_lines(policy, ja)
+    out.extend(_mpv if _mpv else list(hold_mpv))
     return "\n".join(out)
 
 
 def _sr_render_think(rec, pos, policy=None, pv=None, clock=None,
                      zenrei=None, dgp_ema=None,
-                     gp_ema=None, mode=None) -> str:
+                     gp_ema=None, mode=None, hold=None) -> str:
     try:
         b = _board_for_position(pos)
     except Exception:
@@ -1267,15 +1303,26 @@ def _sr_render_think(rec, pos, policy=None, pv=None, clock=None,
     def _ja(mv):
         if not mv or mv in ("resign", "win"):
             return mv or "—"
+        if b is not None and not _bestmove_is_for_board(mv, b):
+            return mv
         return _smk + (_sr_usi_to_ja(b, mv) if b is not None else mv)
 
     def _fmt_wr(v):
         return ("%3.0f%%" % (v * 100)) if isinstance(v, (int, float)) else ""
 
     _mode = mode or ("ponderhit" if (isinstance(rec, dict) and rec.get("handler") == "ponderhit") else None)
+    _hold_head, _hold_mpv = [], []
+    if hold is not None and not policy:
+        try:
+            _hold_head, _hold_mpv = _sr_linger_split(
+                hold[0], hold[1], hold[2],
+                cur_side=(getattr(b, "side", "b") if b is not None else None))
+        except Exception:
+            pass
     if _mode == "endgame":
         return _sr_render_endgame(rec, b, _ja, clock, zenrei, dgp_ema,
-                                  gp_ema=gp_ema, pv=pv, policy=policy)
+                                  gp_ema=gp_ema, pv=pv, policy=policy,
+                                  hold_head=_hold_head, hold_mpv=_hold_mpv)
 
     status, final, voices = _sr_status_voices(rec, _mode)
     _gp_st = rec.get("game_phase") if isinstance(rec, dict) else None
@@ -1293,6 +1340,7 @@ def _sr_render_think(rec, pos, policy=None, pv=None, clock=None,
         else:
             _disp = _ja(mv)
         out.append(" " + _sr_pad(lbl, 5) + _sr_pad(_disp, 11) + _fmt_wr(w))
+    out.extend(_hold_head)
     out.extend(_sr_pred_ease_lines(rec, b, policy, _ja, multi_engine=True))
     _sc = rec.get("nnue_score_cp")
     _is_mate = bool(rec.get("mate_detected")) or (isinstance(_sc, (int, float)) and abs(_sc) >= _MATE_CP)
@@ -1318,7 +1366,8 @@ def _sr_render_think(rec, pos, policy=None, pv=None, clock=None,
     _meta = _sr_meta_line(rec)
     if _meta:
         out.append(" " + _meta)
-    out.extend(_sr_multipv_lines(policy, _ja))
+    _mpv = _sr_multipv_lines(policy, _ja)
+    out.extend(_mpv if _mpv else _hold_mpv)
     return "\n".join(out)
 
 
@@ -1637,9 +1686,47 @@ def _flip_ensure_installed() -> None:
     def _work():
         try:
             engine_dir = os.path.dirname(os.path.abspath(__file__))
-            try:
-                import fontTools
-            except Exception:
+            _ft_marker = os.path.join(_BASE_DIR, ".fonttools_installed")
+
+            def _ft_import_ok():
+                try:
+                    import fontTools
+                    return True
+                except Exception:
+                    return False
+
+            _ft_ok = _ft_import_ok()
+            if not _ft_ok and _IS_FROZEN:
+                try:
+                    _sys_py = _find_system_python()
+                    if _sys_py:
+                        _r = subprocess.run(
+                            _sys_py + ["-c", "import sys; print('\\n'.join(sys.path))"],
+                            capture_output=True, text=True, timeout=10)
+                        for _ln in (_r.stdout or "").strip().splitlines():
+                            if _ln and _ln not in sys.path:
+                                sys.path.append(_ln)
+                except Exception:
+                    pass
+                _ft_ok = _ft_import_ok()
+            if _ft_ok:
+                if not os.path.exists(_ft_marker):
+                    try:
+                        with open(_ft_marker, "w") as _mf:
+                            _mf.write("1")
+                    except Exception:
+                        pass
+            elif os.path.exists(_ft_marker):
+                _note("fontTools import 不可 (導入済みマーカーあり) — pip 再実行は"
+                      "スキップし、導入済みなら既存フォントをそのまま使用します。")
+                if os.path.exists(_flip_installed_font_path()):
+                    if os.name == "nt":
+                        _note(_flip_setup_windows_terminal(engine_dir))
+                        _activate_user_machine_native()
+                    elif sys.platform.startswith("linux"):
+                        _note(_flip_setup_fontconfig_fallback())
+                return
+            else:
                 _note("fontTools 未導入 — 自動インストール中…")
                 if not _pip_install(["fonttools"]):
                     _note("fontTools の自動インストールに失敗。"
@@ -1657,6 +1744,11 @@ def _flip_ensure_installed() -> None:
                 except Exception:
                     _note("fontTools のインストール後もインポート不可。")
                     return
+                try:
+                    with open(_ft_marker, "w") as _mf:
+                        _mf.write("1")
+                except Exception:
+                    pass
 
             if os.path.exists(_flip_installed_font_path()):
                 if not _font_needs_rebuild(_flip_installed_font_path()):
@@ -1777,12 +1869,14 @@ class _LiveConsole:
                 and isinstance(self._think[0], dict) and isinstance(rec, dict)):
             for _k in ("dl_top_move", "council_wr_dl", "dl_used", "sharpness",
                        "dl_display_policy", "confidence", "momentum",
-                       "dl_top_score", "dl_1_gap_top_move"):
+                       "dl_top_score", "dl_1_gap_top_move",
+                       "dl_2_top_move", "council_wr_dl2", "dl_2_invoked"):
                 if rec.get(_k) is None and self._think[0].get(_k) is not None:
                     rec[_k] = self._think[0][_k]
         if (self._think is not None and self._think[1] != pos
                 and (self._think[2] or (isinstance(self._think[0], dict)
-                                        and self._think[0].get("dl_top_move")))):
+                                        and (self._think[0].get("dl_top_move")
+                                             or self._think[0].get("dl_2_top_move"))))):
             self._think_hold = (self._think[0], self._think[1], self._think[2],
                                 time.monotonic())
         self._think = (rec, pos, policy, pv, clock)
@@ -1812,7 +1906,8 @@ class _LiveConsole:
                 pos = _cur_pos
             if _cur is None or _cur_pos != pos:
                 if (_cur is not None and (_cur[2] or (isinstance(_cur[0], dict)
-                                                      and _cur[0].get("dl_top_move")))):
+                                                      and (_cur[0].get("dl_top_move")
+                                                           or _cur[0].get("dl_2_top_move"))))):
                     self._think_hold = (_cur[0], _cur_pos, _cur[2], time.monotonic())
                 _rec, _pol, _pv, _clk = {}, None, None, None
             else:
@@ -1898,9 +1993,9 @@ class _LiveConsole:
                 kw["winrate"] = _win_rate * 100.0
             except Exception:
                 pass
-        if "winrate" in kw and kw["winrate"] is not None:
+        if kw.get("winrate") is not None:
             self._last_winrate = kw["winrate"]
-        elif self._last_winrate is not None and "winrate" not in kw:
+        elif self._last_winrate is not None:
             kw = dict(kw)
             kw["winrate"] = self._last_winrate
         text = _sr_render_board(board, **kw)
@@ -1909,20 +2004,14 @@ class _LiveConsole:
             if self._think_live and self._last_rich_panel is not None:
                 _panel = self._last_rich_panel
             else:
+                _hold = self._think_hold
+                _hold_arg = None
+                if (_hold is not None and not _think_disp[2]
+                        and _hold[1] != _think_disp[1]):
+                    _hold_arg = (_hold[0], _hold[1], _hold[2])
                 _panel = _sr_render_think(
                     *_think_disp, zenrei=self._zenrei, dgp_ema=self._dgp_ema,
-                    gp_ema=self._gp_ema, mode=self._mode)
-                _hold = self._think_hold
-                if _hold is not None:
-                    if (time.monotonic() - _hold[3]) >= _LIVE_VOICE_LINGER_S:
-                        self._think_hold = None
-                    elif not _think_disp[2] and _hold[1] != _think_disp[1]:
-                        try:
-                            _hl = _sr_linger_lines(_hold[0], _hold[1], _hold[2])
-                            if _hl:
-                                _panel = _panel + "\n" + "\n".join(_hl)
-                        except Exception:
-                            pass
+                    gp_ema=self._gp_ema, mode=self._mode, hold=_hold_arg)
                 if not self._think_live:
                     self._last_rich_panel = _panel
             if _LIVE_PV_LEAF_ENABLE:
@@ -2119,18 +2208,82 @@ def _popen_utf8(args, **kw):
     kw.setdefault("errors", "replace")
     return subprocess.Popen(args, **kw)
 
-_flog_lock = threading.Lock()
+_flog_lock = threading.RLock()
 _FLOG_FH = None
 
-def _flog(msg):
-    if globals().get("_log_diagnosis", True) is False:
-        return
-    if _MP_LIGHT_IMPORT and not any(
-            k in str(msg) for k in ("FATAL", "Error", "error", "失敗",
-                                    "Exception", "Traceback", "WARN")):
-        return
+_IO_RATE_BPS     = [0]
+_IO_RATE_BURST   = 262144
+_IO_RATE_FLUSH_S = 2.0
+_IO_RATE_LOCK    = threading.Lock()
+_IO_RATE_BUCKET  = {"tokens": float(_IO_RATE_BURST), "ts": 0.0}
+_IO_RATE_PENDING = {}
+_IO_RATE_THREAD  = [None]
+
+def _io_rate_gate(key, text, meta=None):
+    if _IO_RATE_BPS[0] <= 0:
+        return True
+    n = len(text)
+    with _IO_RATE_LOCK:
+        rec = _IO_RATE_PENDING.get(key)
+        if rec is None:
+            b = _IO_RATE_BUCKET
+            now = time.monotonic()
+            if b["ts"]:
+                b["tokens"] = min(float(_IO_RATE_BURST),
+                                  b["tokens"] + (now - b["ts"]) * _IO_RATE_BPS[0])
+            b["ts"] = now
+            if b["tokens"] >= n:
+                b["tokens"] -= n
+                return True
+            rec = _IO_RATE_PENDING[key] = {"meta": meta, "items": []}
+            if _IO_RATE_THREAD[0] is None:
+                _t = threading.Thread(target=_io_rate_flusher,
+                                      name="io-rate-flush", daemon=True)
+                _IO_RATE_THREAD[0] = _t
+                _t.start()
+        rec["items"].append(text)
+        return False
+
+def _io_rate_drain(key=None):
+    import contextlib
+    with _IO_RATE_LOCK:
+        _keys = (list(_IO_RATE_PENDING) if key is None
+                 else ([key] if key in _IO_RATE_PENDING else []))
+    for _k in _keys:
+        try:
+            with _IO_RATE_LOCK:
+                _rec = _IO_RATE_PENDING.get(_k)
+                if _rec is None:
+                    continue
+                _outer = (_flog_lock if _k == "_flog"
+                          else (_rec["meta"][1] or contextlib.nullcontext()))
+            with _outer:
+                with _IO_RATE_LOCK:
+                    _rec = _IO_RATE_PENDING.pop(_k, None)
+                    if _rec is None:
+                        continue
+                    _IO_RATE_BUCKET["tokens"] -= sum(len(_t) for _t in _rec["items"])
+                _joined = "".join(_rec["items"])
+                if _k == "_flog":
+                    _flog_write_raw(_joined)
+                else:
+                    _atomic_append(_rec["meta"][0], _joined, lock=None, fsync=False,
+                                   os_write=True, _rate_exempt=True)
+        except Exception:
+            pass
+
+def _io_rate_flusher():
+    while True:
+        time.sleep(_IO_RATE_FLUSH_S)
+        try:
+            _io_rate_drain()
+        except Exception:
+            pass
+
+atexit.register(_io_rate_drain)
+
+def _flog_write_raw(_line):
     global _FLOG_FH
-    _line = f"[{time.strftime('%H:%M:%S')}] {msg}\n"
     try:
         with _flog_lock:
             if _FLOG_FH is None:
@@ -2148,6 +2301,18 @@ def _flog(msg):
                 _FLOG_FH.flush()
     except Exception:
         pass
+
+def _flog(msg):
+    if globals().get("_log_diagnosis", True) is False:
+        return
+    if _MP_LIGHT_IMPORT and not any(
+            k in str(msg) for k in ("FATAL", "Error", "error", "失敗",
+                                    "Exception", "Traceback", "WARN")):
+        return
+    _line = f"[{time.strftime('%H:%M:%S')}] {msg}\n"
+    if not _io_rate_gate("_flog", _line):
+        return
+    _flog_write_raw(_line)
 
 def _safe_format_exc(exc_type=None, exc_value=None, exc_tb=None):
     if exc_type is None and exc_value is None and exc_tb is None:
@@ -2182,8 +2347,14 @@ def _thread_safe_target(name):
     return _wrap
 
 
-def _atomic_append(path, text, lock=None, fsync=True, os_write=False):
+def _atomic_append(path, text, lock=None, fsync=True, os_write=False,
+                   _rate_exempt=False):
     import contextlib
+    if not _rate_exempt and _IO_RATE_BPS[0] > 0:
+        if fsync or not isinstance(text, str):
+            _io_rate_drain(path)
+        elif not _io_rate_gate(path, text, meta=(path, lock)):
+            return
     ctx_mgr = lock if lock else contextlib.nullcontext()
     with ctx_mgr:
         if os_write:
@@ -2403,6 +2574,7 @@ class _Shogidb2Zenrei:
         self._lock = threading.Lock()
         self._cache = {}
         self._inflight = set()
+        self._pending_cbs = {}
         self._latest = None
         self._sem = threading.Semaphore(3)
 
@@ -2410,10 +2582,26 @@ class _Shogidb2Zenrei:
         key = _zenrei_position_key(sfen)
         if ply is None:
             ply = _zenrei_sfen_ply(sfen)
+        _cached_cnt = None
+        _cached_hit = False
         with self._lock:
-            if key in self._cache or key in self._inflight:
+            _hit = self._cache.get(key)
+            if _hit is not None:
+                _cached_cnt = _hit[0]
+                _cached_hit = True
+            elif key in self._inflight:
+                if on_complete is not None:
+                    self._pending_cbs.setdefault(key, []).append(on_complete)
                 return
-            self._inflight.add(key)
+            else:
+                self._inflight.add(key)
+        if _cached_hit:
+            if on_complete is not None:
+                try:
+                    on_complete(sfen, _cached_cnt)
+                except Exception:
+                    pass
+            return
         threading.Thread(target=self._worker, args=(sfen, key, ply, on_complete),
                          daemon=True, name="zenrei-fetch").start()
 
@@ -2465,9 +2653,34 @@ class _Shogidb2Zenrei:
                     _snip = _snip.replace("\n", " ").replace("\r", " ")
                     self._log(f"[ZENREI-DIAG] ply={ply} count={count} "
                               f"html_around_件={_snip!r}")
+                if count == 0 and not getattr(self, "_selfcheck_done", False):
+                    self._selfcheck_done = True
+                    try:
+                        _sc_sfen = ("lnsgkgsnl/1r5b1/pppppp1pp/6p2/9/2P6/"
+                                    "PP1PPPPPP/1B5R1/LNSGKGSNL b - 3")
+                        _sc_req = _zenrei_urlreq.Request(
+                            _zenrei_same_url(_sc_sfen),
+                            headers={"User-Agent": self._ua})
+                        with _zenrei_urlreq.urlopen(
+                                _sc_req, timeout=self._timeout) as _sc_resp:
+                            _sc_cs = (_sc_resp.headers.get_content_charset()
+                                      or "utf-8")
+                            _sc_html = _sc_resp.read().decode(
+                                _sc_cs, errors="replace")
+                        _sc_count = _zenrei_parse_count(_sc_html)
+                        if not _sc_count:
+                            self._log("[ZENREI][WARN] self-check: 定跡局面でも "
+                                      "count=0 — 符号化/サイト仕様変更を疑う "
+                                      "(本局の 0 は信用しない)")
+                        else:
+                            self._log(f"[ZENREI] self-check OK: 定跡局面 "
+                                      f"count={_sc_count} — 本局の 0 は真の新手")
+                    except Exception as _sc_e:
+                        self._log(f"[ZENREI] self-check failed: {_sc_e!r}")
         except Exception as e:
             self._log(f"[ZENREI] fetch failed ply={ply}: {e!r}")
         finally:
+            _extra_cbs = []
             with self._lock:
                 self._inflight.discard(key)
                 if _fetch_ok:
@@ -2480,11 +2693,18 @@ class _Shogidb2Zenrei:
                     if len(self._cache) > self._max_cache:
                         for k in list(self._cache)[: self._max_cache // 4]:
                             self._cache.pop(k, None)
+                _extra_cbs = self._pending_cbs.pop(key, [])
             if _fetch_ok and on_complete is not None:
                 try:
                     on_complete(sfen, count)
                 except Exception:
                     pass
+            if _fetch_ok:
+                for _cb in _extra_cbs:
+                    try:
+                        _cb(sfen, count)
+                    except Exception:
+                        pass
 
 
 _zenrei_live_ref = [None]
@@ -2934,31 +3154,22 @@ if sys.platform == "win32":
         _argv += ["--", "pkill", "-9", "-f", _pat]
         _killed = False
         for _attempt in range(2):
-            try:
-                _r = subprocess.run(
-                    _argv,
-                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                    creationflags=0x08000000,
-                    timeout=5,
-                )
-                if _r.returncode == 0:
-                    _flog(f"[wsl-kill] pkill -9 -f {_desc} succeeded "
-                          f"(distro={_distro or 'default'} attempt={_attempt})")
-                    _killed = True
-                    break
-                else:
-                    _flog(f"[wsl-kill] pkill -9 -f {_desc} rc={_r.returncode} "
-                          f"(distro={_distro or 'default'} attempt={_attempt} "
-                          f"— no matching process)")
-                    _killed = True
-                    break
-            except subprocess.TimeoutExpired:
-                _flog(f"[wsl-kill] pkill timeout (5s) {_desc} "
+            _pk_rc, _ = _hp_run(_argv, 6)
+            if _pk_rc == 0:
+                _flog(f"[wsl-kill] pkill -9 -f {_desc} succeeded "
+                      f"(distro={_distro or 'default'} attempt={_attempt})")
+                _killed = True
+                break
+            elif _pk_rc is not None:
+                _flog(f"[wsl-kill] pkill -9 -f {_desc} rc={_pk_rc} "
+                      f"(distro={_distro or 'default'} attempt={_attempt} "
+                      f"— no matching process)")
+                _killed = True
+                break
+            else:
+                _flog(f"[wsl-kill] pkill timeout (6s) {_desc} "
                       f"(distro={_distro or 'default'} attempt={_attempt} "
                       f"— WSL が無応答の可能性)")
-            except Exception as e:
-                _flog(f"[wsl-kill] pkill failed ({e}) "
-                      f"(distro={_distro or 'default'} attempt={_attempt})")
             if _attempt == 0:
                 time.sleep(0.5)
         if _killed:
@@ -2967,14 +3178,11 @@ if sys.platform == "win32":
                 if _distro:
                     _pgrep_argv += ["-d", _distro]
                 _pgrep_argv += ["--", "pgrep", "-f", _pat]
-                _pr = subprocess.run(
-                    _pgrep_argv,
-                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                    creationflags=0x08000000, timeout=3)
-                if _pr.returncode == 0 and _pr.stdout.strip():
+                _pr_rc, _pr_out = _hp_run(_pgrep_argv, 4, capture=True)
+                if _pr_rc == 0 and _pr_out.strip():
                     _flog(f"[wsl-kill] WARNING: pgrep still finds process after "
                           f"pkill {_desc} — zombie risk "
-                          f"(pids={_pr.stdout.decode(errors='replace').strip()})")
+                          f"(pids={_pr_out.decode(errors='replace').strip()})")
                     _killed = False
             except Exception:
                 pass
@@ -3016,6 +3224,66 @@ else:
     def _job_close(h):            return None
     def _resume_process_main_thread(pid): return True
     def _wsl_kill_by_batpath(bat_path, tag=None): return False
+
+
+def _hp_run(args, wait_s, capture=False):
+    import tempfile as _hp_tempfile
+    _out_f = None
+    _out_path = None
+    _p = None
+    try:
+        if capture:
+            _hp_fd, _out_path = _hp_tempfile.mkstemp(prefix="pyf_hp_")
+            _out_f = os.fdopen(_hp_fd, "wb")
+        _p = subprocess.Popen(
+            args, stdin=subprocess.DEVNULL,
+            stdout=(_out_f if capture else subprocess.DEVNULL),
+            stderr=subprocess.DEVNULL,
+            creationflags=(0x08000000 if sys.platform == "win32" else 0))
+    except Exception as _hp_e:
+        _flog(f"[hp-run] spawn failed {args[:2]}: {_hp_e!r}")
+    if _p is None:
+        if _out_f is not None:
+            try:
+                _out_f.close()
+            except Exception:
+                pass
+        if _out_path:
+            try:
+                os.unlink(_out_path)
+            except Exception:
+                pass
+        return None, b""
+    _hp_end = time.monotonic() + wait_s
+    _hp_rc = None
+    while time.monotonic() < _hp_end:
+        _hp_rc = _p.poll()
+        if _hp_rc is not None:
+            break
+        time.sleep(0.25)
+    if _hp_rc is None:
+        try:
+            _p.kill()
+        except Exception:
+            pass
+    _hp_out = b""
+    if _out_f is not None:
+        try:
+            _out_f.close()
+        except Exception:
+            pass
+        if _hp_rc is not None and _out_path:
+            try:
+                with open(_out_path, "rb") as _hp_rf:
+                    _hp_out = _hp_rf.read()
+            except Exception:
+                pass
+        if _out_path:
+            try:
+                os.unlink(_out_path)
+            except Exception:
+                pass
+    return _hp_rc, _hp_out
 
 
 
@@ -3149,6 +3417,7 @@ _CONFIG_DEFAULTS = {
     "nnue_1_Engine_Index":            1,
     "nnue_2_Engine_Index":            0,
     "SPSA_Tune_Pool_Params":          False,
+    "IO_Rate_Limit_KBps":             "256",
     "mate_solver_Path":               "Zyfamate",
     "DL_3_Path":                      _DEFAULT_DL_POOL["c"],
     "nnue_1_Threads":                 "4",
@@ -3556,6 +3825,7 @@ _CONFIG_DEFAULTS = {
     "Resource_Reserved_MB":            1536,
     "Resource_DL_CPU_Reserve_Factor":  2.5,
     "Resource_DL_CPU_Reserve_Fallback_MB": 2048,
+    "Resource_DL_CPU_Reserve_Per_Instance_MB": 512,
     "Resource_Threads_Share_NNUE1":    8.0,
     "Resource_Threads_Share_DL1":      3.0,
     "Resource_Threads_Share_DL2":      3.0,
@@ -3852,7 +4122,7 @@ def _load_config():
               "(_CONFIG_TXT_IO_ENABLE=False) — defaults + spsa_config + "
               "setup_config のみで動作")
     else:
-        if not os.path.exists(user_path):
+        if not os.path.exists(user_path) and _config_txt_write_enabled():
             try:
                 with open(user_path, "w", encoding="utf-8") as f:
                     json.dump(_build_config_txt_defaults(), f, indent=2, ensure_ascii=False)
@@ -3893,7 +4163,7 @@ def _load_config():
 
     cfg, user_cfg_keys, migrated_keys = _normalize_auto_managed_config(cfg, user_cfg_keys)
 
-    if (migrated_keys and _config_txt_io_enabled() and os.path.exists(user_path)
+    if (migrated_keys and _config_txt_write_enabled() and os.path.exists(user_path)
             and not locals().get("_user_cfg_parse_failed", False)):
         try:
             out_cfg = dict(_annot_payload)
@@ -3926,6 +4196,11 @@ if _MP_LIGHT_IMPORT:
     _user_cfg_keys = {}
 else:
     _cfg, _user_cfg_keys = _load_config()
+
+try:
+    _IO_RATE_BPS[0] = max(0, int(float(_cfg.get("IO_Rate_Limit_KBps", 0) or 0))) * 1024
+except Exception:
+    _IO_RATE_BPS[0] = 0
 
 for _bk, _bv in (list(_cfg.items()) if not _MP_LIGHT_IMPORT else []):
     if not (isinstance(_bk, str) and _bk.endswith("_Path")):
@@ -4272,6 +4547,18 @@ def _dlponder_load_state(path=None):
                   "mpon_hits", "mpon_misses"):
             if k in d:
                 _DLPONDER_STATE[k] = d[k]
+        try:
+            _opp_ema = _DLPONDER_STATE.get("opponent_s_ema")
+            if isinstance(_opp_ema, (int, float)):
+                _min = _cfloat(_cfg, "DLP_Ponder_Min_Opp_S", 1.5)
+                if float(_opp_ema) < float(_min):
+                    _flog(f"[DLP-EMA LOAD-CLAMP] discarded poisoned opponent_s_ema="
+                          f"{_opp_ema:.3f}s (< {_min}s) — reset to None")
+                    _DLPONDER_STATE["opponent_s_ema"] = None
+        except Exception as _ce:
+            _flog(f"[ignored] DLP-EMA LOAD-CLAMP: {_ce!r}")
+    except FileNotFoundError:
+        _flog("[info] _dlponder_load_state: state file not found (first run)")
     except Exception as _ie:
         _flog(f"[ignored] _dlponder_load_state: {_ie!r}")
 
@@ -4316,6 +4603,21 @@ def _strip_skip(args):
     return [a for a in (args or []) if _norm_str(a) != "skip"]
 
 
+_DLP_MODE_TOKENS = ("ponder", "prefetch", "auto")
+
+
+def _args_dlp_mode(args):
+    for a in (args or []):
+        if _norm_str(a) in _DLP_MODE_TOKENS:
+            return _norm_str(a)
+    return None
+
+
+def _strip_prereq_tokens(args):
+    return [a for a in (args or [])
+            if _norm_str(a) != "skip" and _norm_str(a) not in _DLP_MODE_TOKENS]
+
+
 def _ensure_prereqs(command: str, args) -> bool:
     for _bat_p in {nnue_1_PATH, nnue_2_PATH}:
         try:
@@ -4331,10 +4633,18 @@ def _ensure_prereqs(command: str, args) -> bool:
                         f"末尾に `%*` を追加してから再実行してください: {_bat_p}")
                 _flog("[PREREQ][BAT-GATE] " + _msg)
                 print("info string [setup] " + _msg, flush=True)
-                if command != "game":
+                if command not in ("game", "match"):
                     return False
         except Exception as _bge:
             _flog(f"[PREREQ][BAT-GATE] check failed (ignored): {_bge!r}")
+
+    _dlp_mode_arg = _args_dlp_mode(args)
+    if _dlp_mode_arg:
+        _dlponder_apply_mode(_dlp_mode_arg)
+        _flog(f"[PREREQ] '{command} {_dlp_mode_arg}' — DLP モード直接指定・前提工程 (DLP/Setup) をスキップ")
+        print(f"info string [setup] {command}: DLP モード={_dlp_mode_arg} を直接指定 — "
+              f"前提工程 (DLP/Setup) を省略します", flush=True)
+        return True
 
     if _args_has_skip(args):
         _flog(f"[PREREQ] '{command} skip' — DLP/Setup 前提工程をスキップ")
@@ -4419,6 +4729,50 @@ if _dl_ponder_enable:
           f"{_norm_str(_cfg.get('DL_2_Stochastic_Ponder', 'true'))})")
 
 
+def _dlponder_apply_mode(mode: str) -> None:
+    global _dl_ponder_enable, _dlponder_mode_cfg, _multi_ponder_enable
+    global _DL1_PONDER_OPTS, _DL2_PONDER_OPTS, _DL3_PONDER_OPTS
+    mode = _norm_str(mode)
+    if mode not in _DLPONDER_VALID_MODES:
+        _flog(f"[DLP-MODE-ARG] unknown mode {mode!r} — ignored")
+        return
+    _cfg["DL_Ponder_Mode"] = mode
+    _dlponder_mode_cfg = mode
+    if mode in ("ponder", "prefetch"):
+        _dl_ponder_enable = (mode == "ponder")
+        _flog(f"[DLP-MODE-ARG] mode={mode} (コマンド引数による強制指定)")
+    else:
+        _dlponder_load_state()
+        _g = _dlponder_gain_core(_DLPONDER_STATE["nps_ema"],
+                                 _DLPONDER_STATE["opponent_s_ema"],
+                                 _cint(_cfg, "POLICY_NODES", 2043))
+        _dec = _dlponder_decide_core(
+            _g, _cfloat(_cfg, "DLP_Gain_Min", 2.0),
+            int(_DLPONDER_STATE.get("samples", 0)),
+            _cint(_cfg, "DLP_Min_Samples", 3),
+            prev_mode=str(_DLPONDER_STATE.get("mode", "prefetch")))
+        _dl_ponder_enable = (_dec == "ponder")
+        _DLPONDER_STATE["mode"] = _dec
+        _flog(f"[DLP-MODE-ARG] mode=auto → {_dec} "
+              f"(gain={None if _g is None else round(_g, 2)} "
+              f"samples={_DLPONDER_STATE.get('samples')})")
+    _p = _PONDER_DL_ACTIVE if _dl_ponder_enable else _PONDER_NEVER
+    _DL1_PONDER_OPTS = _p
+    _DL2_PONDER_OPTS = _p
+    _DL3_PONDER_OPTS = _p
+    _multi_ponder_enable = (_cfg_bool("Multi_Ponder_Enable", True)
+                            and _dl_ponder_enable)
+    try:
+        for _d in (_dl_1_opts, _dl_2_opts, _dl_3_opts):
+            _d.update(_p)
+    except NameError:
+        pass
+    print(f"info string [DLP] DL_Ponder_Mode={mode} を適用しました "
+          f"(dl_ponder_enable={_dl_ponder_enable}, multi_ponder={_multi_ponder_enable})。"
+          f"※起動済みの子エンジンには反映されません — isready/対局開始前の指定を推奨",
+          flush=True)
+
+
 def _sys_ram_info():
     try:
         if os.name == "nt":
@@ -4483,6 +4837,8 @@ def _parse_nvidia_smi_csv(line):
 
 _VRAM_PROBE_DISABLED = [False]
 _VRAM_PROBE_OK_ONCE = [False]
+
+_DIRECTML_SHARED_RAM = False
 
 
 def _sys_vram_info(timeout_s=2.0):
@@ -4560,10 +4916,12 @@ def _sys_gpu_count(timeout_s=2.0):
 
 
 def _budget_dl_cpu_reserve_core(vram_total_mb, model_mbs, factor,
-                                fallback_mb, gpu_count=1, n_dl_engines=None):
+                                fallback_mb, gpu_count=1, n_dl_engines=None,
+                                per_instance_mb=512):
     if vram_total_mb is not None:
         _n_dl = n_dl_engines if n_dl_engines else max(1, len(model_mbs or []))
-        return int(max(1, int(_n_dl)) * max(1, int(gpu_count)) * 512)
+        return int(max(1, int(_n_dl)) * max(1, int(gpu_count))
+                   * int(per_instance_mb))
     _valid = [float(m) for m in (model_mbs or []) if m and float(m) > 0]
     if _valid:
         return int(sum(_valid) * float(factor))
@@ -4793,13 +5151,15 @@ if not _MP_LIGHT_IMPORT:
     _rb_n_dl_engines = (1
                         + (1 if _cfg_bool("DL_2_Enable", True) else 0)
                         + (1 if _cfg_bool("DL_3_Enable", True) else 0))
+    _per_inst_mb = _cint(_cfg, "Resource_DL_CPU_Reserve_Per_Instance_MB", 512)
     _rb_dl_cpu_reserve = _budget_dl_cpu_reserve_core(
         _rb_vram_t_early,
         _rb_dl_model_mbs,
         _cfloat(_cfg, "Resource_DL_CPU_Reserve_Factor", 2.5),
         _cint(_cfg, "Resource_DL_CPU_Reserve_Fallback_MB", 2048),
         gpu_count=_sys_gpu_count(),
-        n_dl_engines=_rb_n_dl_engines)
+        n_dl_engines=_rb_n_dl_engines,
+        per_instance_mb=_per_inst_mb)
     _rb_reserved = (_cint(_cfg, "Resource_Reserved_MB", 1536)
                     + _rb_arb_reserve + _rb_dl_cpu_reserve)
     if _rb_dl_cpu_reserve:
@@ -4807,12 +5167,19 @@ if not _MP_LIGHT_IMPORT:
             _flog(f"[BUDGET-DLCPU] DL ホスト側 CPU 実メモリ "
                   f"{_rb_dl_cpu_reserve}MB を予約に上乗せ "
                   f"([DL-HOST-RESERVE] VRAM 検出済: DL {_rb_n_dl_engines} 基 × "
-                  f"GPU {_sys_gpu_count()} 基 × 512MB — CUDA ctx/ホストバッファ分)")
+                  f"GPU {_sys_gpu_count()} 基 × {_per_inst_mb}MB — "
+                  f"CUDA ctx/ホストバッファ分)")
         else:
             _flog(f"[BUDGET-DLCPU] DL ホスト側 CPU 実メモリ "
                   f"{_rb_dl_cpu_reserve}MB を予約に上乗せ "
                   f"(models={_rb_dl_model_mbs or 'n/a→fallback'} "
                   f"factor={_cfg.get('Resource_DL_CPU_Reserve_Factor', 2.5)})")
+    if _VRAM_PROBE_DISABLED[0] and os.name == "nt" and _rb_basis_mb is not None:
+        _DIRECTML_SHARED_RAM = True
+        _rb_basis_old = _rb_basis_mb
+        _rb_basis_mb = _rb_basis_mb // 2
+        _flog(f"[DIRECTML-RAM-HALVE] DirectML 検出 (nvidia-smi 不在 + Windows): "
+              f"RAM basis {_rb_basis_old}→{_rb_basis_mb}MB (半減)")
     _hash_shares = {
         "nnue_1_Hash": 1.0,
     }
@@ -4820,25 +5187,28 @@ if not _MP_LIGHT_IMPORT:
         _rb_basis_mb, 1.0, _rb_reserved,
         _hash_shares,
         floor_units=64, pct_lo=1.0, pct_hi=1.0)
-    if (_rb_hash and "nnue_1_Hash" in _rb_hash
-            and _tuning_mode and _tuning_worker_count > 1):
+    if _rb_hash and "nnue_1_Hash" in _rb_hash:
         try:
+            _cap_workers = (_tuning_worker_count
+                            if _tuning_mode and _tuning_worker_count > 1
+                            else 1)
             _pool_mem = _wsl_total_mem_mb(nnue_1_PATH)
             _pool_label = "WSL VM"
-            if _pool_mem is None and sys.platform != "win32":
+            if (_pool_mem is None and sys.platform != "win32"
+                    and _cap_workers > 1):
                 _pool_mem, _ = _sys_ram_info()
                 _pool_label = "Physical"
             if _pool_mem is not None:
                 _pool_per = max(64,
-                                (_pool_mem - 512)
-                                // _tuning_worker_count)
+                                (_pool_mem - 1024 - 768 * _cap_workers)
+                                // _cap_workers)
                 if _rb_hash["nnue_1_Hash"] > _pool_per:
                     _tag = ("BUDGET-WSL" if _pool_label == "WSL VM"
                             else "BUDGET-MEM")
                     _flog(f"[{_tag}] nnue_1_Hash "
                           f"{_rb_hash['nnue_1_Hash']}→{_pool_per}MB "
                           f"({_pool_label}={_pool_mem}MB "
-                          f"workers={_tuning_worker_count})")
+                          f"workers={_cap_workers})")
                     _rb_hash["nnue_1_Hash"] = _pool_per
         except Exception as _e:
             _flog(f"[BUDGET-MEM] check failed (ignored): {_e}")
@@ -4961,6 +5331,12 @@ if not _MP_LIGHT_IMPORT:
             _rb_applied.append(f"nnue_1_Threads={_nnue_cap}(spare-clamp)")
     except Exception as _se:
         _flog(f"[BUDGET-SPARE] 初期値計算失敗 ({type(_se).__name__}: {_se}) — 据え置き")
+    def _budget_dedup_applied(items):
+        seen = {}
+        for item in items:
+            k = item.split("=", 1)[0] if "=" in item else item
+            seen[k] = item
+        return list(seen.values())
     try:
         _rb_vram_t, _rb_vram_u = _sys_vram_info()
         _flog(f"[BUDGET] system ram={_rb_avail_mb}/{_rb_total_mb}MB free "
@@ -4970,7 +5346,7 @@ if not _MP_LIGHT_IMPORT:
               f"reserved={_rb_reserved}MB "
               + (f"vram={_rb_vram_u}/{_rb_vram_t}MB " if _rb_vram_t is not None
                  else "vram=n/a ")
-              + "→ " + (" ".join(_rb_applied) or "(導出適用なし)"))
+              + "→ " + (" ".join(_budget_dedup_applied(_rb_applied)) or "(導出適用なし)"))
         if _rb_vram_t is None:
             _flog("[BUDGET] VRAM 実測不可 (nvidia-smi 不在/非NVIDIA) — DL モデルの"
                   "載り先が CPU/共有メモリの可能性。DL 系の所要は [MON] の RSS で確認を。")
@@ -5697,7 +6073,7 @@ def _zero_main_fischer_core(active, remaining_ms, inc_ms, resume_inc_ratio):
     if inc_ms is None or inc_ms <= 0 or remaining_ms is None:
         return "neutral"
     if not active:
-        return "activate" if remaining_ms == 0 else "neutral"
+        return "activate" if remaining_ms < inc_ms else "neutral"
     if resume_inc_ratio > 0.0 and remaining_ms < inc_ms * resume_inc_ratio:
         return "hold"
     return "neutral"
@@ -5773,6 +6149,8 @@ if _pv_mate_override_max_step % 2 != 0:
 
 
 _monitor_interval_s      = _cfloat(_cfg, "Monitor_Interval_S", 60, lo=5.0)
+_monitor_sample_s        = min(_cfloat(_cfg, "Monitor_Sample_S", 10, lo=2.0),
+                               _monitor_interval_s)
 _monitor_low_ram_warn_mb = _cint(_cfg, "Monitor_Low_Ram_Warn_MB", 4096, lo=0)
 
 _revive_max_attempts      = _cint(_cfg, "Revive_Max_Attempts", 2, lo=0)
@@ -5815,6 +6193,8 @@ class USIEngine:
         self._last_ack_gen: int | None = None
         self._bm_gen: int | None = None
         self._last_rec: dict | None = None
+        self._last_drained_bm: str | None = None
+        self._dup_drained_bm: bool = False
         self._start_gen: int = 0
 
     def start(self):
@@ -5853,6 +6233,8 @@ class USIEngine:
             self._last_ack_gen = None
             self._bm_gen = None
             self._last_rec = None
+            self._last_drained_bm = None
+            self._dup_drained_bm = False
 
         _popen_kwargs = dict(
             stdin=subprocess.PIPE,
@@ -6105,6 +6487,12 @@ class USIEngine:
         except queue.Empty:
             return ""
 
+    def _force_accept_resync(self):
+        with self._send_lock:
+            self._bm_seen = self._go_sent
+            self._last_ack_gen = None
+            self._bm_gen = None
+
     def flush_until_ready(self, timeout=30.0, max_stale_lines=500, relay_cb=None):
         if not self._alive or not self.proc or not self.proc.stdin:
             return False
@@ -6116,8 +6504,14 @@ class USIEngine:
             if not _drained_tail:
                 return ""
             return " tail=" + " | ".join(_l[:120] for _l in _drained_tail[-8:])
+        _found_bestmove = False
         while True:
             if _drained_count >= max_stale_lines:
+                if _found_bestmove:
+                    _flog(f"[{self.name}] flush_until_ready: stale line limit "
+                          f"reached but bestmove was recovered — barrier OK")
+                    self._force_accept_resync()
+                    return True
                 _flog(f"[{self.name}] flush_until_ready: stale line limit "
                       f"({max_stale_lines}) exceeded — treating as error "
                       f"(elapsed={time.perf_counter() - (deadline - timeout):.1f}s)"
@@ -6125,6 +6519,12 @@ class USIEngine:
                 return False
             remaining = deadline - time.perf_counter()
             if remaining <= 0:
+                if _found_bestmove:
+                    _flog(f"[{self.name}] flush_until_ready: timeout but "
+                          f"bestmove was recovered during drain — barrier OK"
+                          f"{_tail_dump()}")
+                    self._force_accept_resync()
+                    return True
                 _flog(f"[{self.name}] flush_until_ready: timeout "
                       f"after draining {_drained_count} stale line(s)"
                       f"{_tail_dump()}")
@@ -6134,6 +6534,11 @@ class USIEngine:
             except queue.Empty:
                 continue
             if line is None:
+                if _found_bestmove:
+                    _flog(f"[{self.name}] flush_until_ready: process exited "
+                          f"but bestmove was recovered — barrier OK")
+                    self._force_accept_resync()
+                    return True
                 _flog(f"[{self.name}] flush_until_ready: process exited "
                       f"after draining {_drained_count} stale line(s)"
                       f"{_tail_dump()}")
@@ -6145,9 +6550,7 @@ class USIEngine:
                 elif _drained_count > 0:
                     _dlog(f"[{self.name}] flush_until_ready: drained "
                           f"{_drained_count} stale line(s) before readyok")
-                self._bm_seen = self._go_sent
-                self._last_ack_gen = None
-                self._bm_gen = None
+                self._force_accept_resync()
                 return True
             if relay_cb is not None and ("dl_live_policy " in line or
                                          "info " in line and " score " in line):
@@ -6155,6 +6558,16 @@ class USIEngine:
                     relay_cb(line)
                 except Exception:
                     pass
+            if line.startswith("bestmove") and not _found_bestmove:
+                _found_bestmove = True
+                if (" ponder " in line
+                        and line == getattr(self, "_last_drained_bm", None)):
+                    self._dup_drained_bm = True
+                self._last_drained_bm = line
+                _flog(f"[{self.name}] flush_until_ready: bestmove observed "
+                      f"during drain (line {_drained_count}) — stop-flush 経由"
+                      f"では ponder/停止応答の正常な読み捨て (取り逃しではない)"
+                      f": {line[:80]}")
             _drained_count += 1
             _drained_tail.append(line)
             if len(_drained_tail) > 8:
@@ -6267,8 +6680,8 @@ class USIEngine:
                 if self.proc.stdin and not self.proc.stdin.closed:
                     self.proc.stdin.write("quit\n")
                     self.proc.stdin.flush()
-        except (BrokenPipeError, ValueError, OSError) as e:
-            _flog(f"[{self.name}] quit write skipped: {e}")
+        except (BrokenPipeError, ValueError, OSError):
+            pass
         try:
             with self._send_lock:
                 if self.proc.stdin and not self.proc.stdin.closed:
@@ -6337,6 +6750,7 @@ class PonderState:
     handover_game_phase:       float                 = 1.0
     active:            bool                  = False
     position:          str | None          = None
+    last_go_position:  object                = None
     tree_invalid:      bool                  = False
     mate_skip_pending: bool                  = False
     dl2_ponder_sent:   bool                  = False
@@ -6355,6 +6769,7 @@ class PonderState:
         self.handover_game_phase       = handover_default
         self.active            = False
         self.position          = None
+        self.last_go_position  = None
         self.tree_invalid      = False
         self.mate_skip_pending = False
         self.nnue1_ponder_sent = False
@@ -7861,6 +8276,11 @@ def _book_start_engine(ctx) -> bool:
     return True
 
 def _book_begin_game(ctx, turn: str = "") -> None:
+    if getattr(ctx, "shitei_active", False):
+        _flog("[bookloader] 指定局面戦 — 本局は定跡なしで続行 "
+              "([SHITEIKYOKUMEN-FIX 2026-07-10])")
+        ctx.book_state.active = False
+        return
     if not _eng_alive(ctx.book):
         if _book_enabled:
             _flog("[bookloader] usinewgame: Book エンジンが不在/死亡 — 再起動を試みます。")
@@ -8631,6 +9051,9 @@ def _parse_go_clock_base(go_line, our_side_ply=None, cfg=None):
             positives = [v for v in (binc_val, winc_val) if v > 0]
             inc_ms = min(positives) if len(positives) == 2 else (positives[0] if positives else 0)
         _inc_floor = int(inc_ms * _inc_spend_ratio)
+        if remaining_ms > 0 and remaining_ms < 2 * inc_ms:
+            _crisis_scale = 0.5 + 0.5 * (remaining_ms / (2.0 * inc_ms))
+            _inc_floor = int(_inc_floor * _crisis_scale)
         floor_ms = max(floor_ms, _inc_floor)
 
     if remaining_ms == 0 and floor_ms == 0:
@@ -11007,12 +11430,21 @@ def relay_until_bestmove(eng, timeout=120, intercept_bestmove=False,
               f"MO_floor={_relay_min_floor:.2f}"
               + (f" rem_ceil={_rem_ceiling:.2f}" if _rem_ceiling is not None else "")
               + ")")
+    elif remaining_ms is not None and remaining_ms > 0:
+        _rem_ceiling0 = max(0.05, remaining_ms / 1000.0 - _move_overhead_s)
+        if timeout > _rem_ceiling0:
+            _flog(f"relay cap (eff_s==0): timeout {timeout:.2f}s -> "
+                  f"{_rem_ceiling0:.2f}s (remaining={remaining_ms}ms — "
+                  f"sudden-death emergency ceiling)")
+            timeout = _rem_ceiling0
+            _relay_binding_layer = "remaining_ms(eff_s0)"
     ponder_move = None
     nnue_info   = {"bestmove": "", "score_cp": 0, "depth": 0, "seldepth": 0,
                    "relay_binding_layer": _relay_binding_layer,
                    "scored_info_seen": False,
                    "book_info_seen": False,
                    "relay_elapsed_s": 0.0}
+    nnue_info["relay_effective_s"] = timeout
     _best_depth = -1
     _caller     = threading.current_thread().name
     _t_start    = time.perf_counter()
@@ -11157,6 +11589,7 @@ def relay_until_bestmove(eng, timeout=120, intercept_bestmove=False,
                                   f"(non-fatal): {_ll_kill_e}")
                         eng._alive = False
                         eng._empty_relay_streak = 0
+                        nnue_info["score_stale"] = True
                         break
                     _flog(f"relay_until_bestmove: no bestmove after stop but "
                           f"{eng.name} is responsive (isready→readyok, probe={_probe_to:.2f}s) — "
@@ -11176,6 +11609,7 @@ def relay_until_bestmove(eng, timeout=120, intercept_bestmove=False,
                 except Exception as _kill_e:
                     _flog(f"relay_until_bestmove: kill failed (non-fatal): {_kill_e}")
                 eng._alive = False
+                nnue_info["score_stale"] = True
                 _flog(f"{eng.name} killed (unresponsive) — will auto-restart on next go/ponderhit")
             break
         if not eng._alive and eng._q.empty():
@@ -11197,6 +11631,7 @@ def relay_until_bestmove(eng, timeout=120, intercept_bestmove=False,
         out = eng.readline(timeout=_rl_timeout)
         if out is None:
             _flog(f"relay_until_bestmove: {eng.name} readline=None (engine died)" + _ctx())
+            nnue_info["score_stale"] = True
             break
         if not out:
             continue
@@ -11711,6 +12146,7 @@ def _write_game_stats(game_log, game_meta, cfg=None):
             game_log, game_meta, moves_out, formula_out, _summ, blunders,
         )
         try:
+            _io_rate_drain(_STATS_PATH)
             with _stats_write_lock:
                 with open(_STATS_PATH, "a", encoding="utf-8") as f:
                     f.write(json.dumps(record, ensure_ascii=False) + "\n")
@@ -11739,6 +12175,7 @@ def _write_game_stats(game_log, game_meta, cfg=None):
                 "moves_count": len(game_log),
                 "meta": dict(game_meta),
             }
+            _io_rate_drain(_STATS_PATH)
             with _stats_write_lock:
                 with open(_STATS_PATH, "a", encoding="utf-8") as f:
                     f.write(json.dumps(_fallback, ensure_ascii=False) + "\n")
@@ -12178,9 +12615,11 @@ _ACTIVE_BESTMOVE_SINK = None
 _BESTMOVE_IS_INSTANT = False
 _GEN_ACK_ENABLED = os.environ.get("PYFAMATE_GEN_ACK") == "1"
 _REC_EMIT_ENABLED = os.environ.get("PYFAMATE_REC_EMIT") == "1"
+_REC_EMIT_LAST_CSM: dict = {}
 _GO_RECV_GEN = 0
 _BM_SENT_GEN = 0
 _STOP_REARM = False
+_META_RESIGN_LABEL_BLACKLIST = frozenset({"stop-ponder-miss"})
 _GO_EMITTED = False
 
 
@@ -12234,7 +12673,10 @@ def _safe_bestmove(final_move, ponder_move=None, label="", nnue_info=None):
                     ponder_move = None
     if (final_move not in ("resign", "win", "")
             and nnue_info is not None
-            and not _SPSA_MODE):
+            and not _SPSA_MODE
+            and _ACTIVE_BESTMOVE_SINK is None
+            and label not in _META_RESIGN_LABEL_BLACKLIST
+            and not nnue_info.get("score_stale")):
         _meta_cp = nnue_info.get("score_cp")
         if _meta_cp is not None and _meta_cp <= -300:
             _meta_mc = 0
@@ -12245,8 +12687,13 @@ def _safe_bestmove(final_move, ponder_move=None, label="", nnue_info=None):
                 except Exception:
                     pass
             if _meta_mc > 10:
+                _mr_nnue_bm = (nnue_info.get("bestmove") or "")
+                if _mr_nnue_bm and _mr_nnue_bm != final_move:
+                    _flog(f"[META-RESIGN-OBS] nnue_info bestmove {_mr_nnue_bm!r} != "
+                          f"final_move {final_move!r} (label={label!r}) score_cp={_meta_cp}"
+                          f" — 別手評価の可能性; 今は発火継続 (観測)")
                 _flog(f"[META-RESIGN] score_cp={_meta_cp} <= -300 at ply {_meta_mc}"
-                      f" — meta resign (child move was {final_move!r})")
+                      f" (label={label!r}) — meta resign (child move was {final_move!r})")
                 final_move = "resign"
                 ponder_move = None
     if nnue_info is not None and final_move not in ("resign", "win"):
@@ -12306,12 +12753,16 @@ def _safe_bestmove(final_move, ponder_move=None, label="", nnue_info=None):
         _sink_depth    = (nnue_info.get("depth",    0) or 0) if nnue_info else 0
         _sink_score_cp = (nnue_info.get("score_cp", 0) or 0) if nnue_info else 0
         _sink_pv = (nnue_info.get("pv", "") or "") if nnue_info else ""
+        _sink_relay_eff = (nnue_info.get("relay_effective_s") if nnue_info else None)
+        _sink_adopted_wr = (nnue_info.get("adopted_wr_sente") if nnue_info else None)
         try:
-            _sink(final_move, ponder_move, _sink_depth, _sink_score_cp, _sink_pv)
+            _sink(final_move, ponder_move, _sink_depth, _sink_score_cp, _sink_pv,
+                  relay_eff_s=_sink_relay_eff, adopted_wr_sente=_sink_adopted_wr)
         except Exception as _se:
             _flog(f"[CSA] bestmove sink raised — retrying once: {_se!r}")
             try:
-                _sink(final_move, ponder_move, _sink_depth, _sink_score_cp, _sink_pv)
+                _sink(final_move, ponder_move, _sink_depth, _sink_score_cp, _sink_pv,
+                      relay_eff_s=_sink_relay_eff, adopted_wr_sente=_sink_adopted_wr)
             except Exception as _se2:
                 _flog(f"[CSA] CRITICAL: bestmove sink retry failed: {_se2!r} "
                       f"— falling back to USI stdout: {bm_line!r}")
@@ -12625,7 +13076,7 @@ else:
 _MON_ENGINE_ATTRS = ("dl_1", "dl_2", "dl_3", "nnue_1", "nnue_2", "mate_solver")
 
 
-def _mon_snapshot_line(ctx, cpu_pct):
+def _mon_snapshot_line(ctx, cpu_pct, gpu_ema=None):
     total_mb, avail_mb = _mon_sample_system()
     parts = []
     if total_mb is not None:
@@ -12637,7 +13088,16 @@ def _mon_snapshot_line(ctx, cpu_pct):
         try:
             if _eng_alive(eng) and eng.proc is not None:
                 rss = _mon_proc_rss(eng.proc.pid)
-                if rss is not None:
+                _cpu = None
+                try:
+                    import psutil as _psutil
+                    _p = _psutil.Process(eng.proc.pid)
+                    _cpu = _p.cpu_percent(interval=None)
+                except Exception:
+                    _cpu = None
+                if rss is not None and _cpu is not None:
+                    parts.append(f"{attr}={rss}MB/{_cpu:.0f}%")
+                elif rss is not None:
                     parts.append(f"{attr}={rss}MB")
         except Exception as _ie:
             _flog(f"[ignored] _mon_snapshot_line: {_ie!r}")
@@ -12661,7 +13121,10 @@ def _mon_snapshot_line(ctx, cpu_pct):
         parts.append(f"vram={vu}/{vt}MB")
     _gpu_pct = _sys_gpu_util()
     if _gpu_pct is not None:
-        parts.append(f"gpu={_gpu_pct}%")
+        if gpu_ema is not None:
+            parts.append(f"gpu={_gpu_pct}%~ema{gpu_ema:.0f}%")
+        else:
+            parts.append(f"gpu={_gpu_pct}%")
     warn = (total_mb is not None and avail_mb is not None
             and _monitor_low_ram_warn_mb > 0
             and avail_mb < _monitor_low_ram_warn_mb)
@@ -12672,23 +13135,49 @@ def _mon_snapshot_line(ctx, cpu_pct):
 _mon_idle_cores = None
 _mon_avail_mb = None
 _mon_gpu_util = None
+_mon_gpu_util_raw = None
 _mon_vram_free_mb = None
 
 def _mon_loop(ctx):
     global _mon_idle_cores, _mon_avail_mb, _mon_gpu_util, _mon_vram_free_mb
+    global _mon_gpu_util_raw
     prev_idle, prev_total = _mon_sample_cpu()
+    _alpha = max(0.05, min(1.0, _monitor_sample_s / _monitor_interval_s))
+    _gpu_ema = None
+    _avail_ema = None
+    def _ema(old, new):
+        return float(new) if old is None else old + _alpha * (float(new) - old)
+    _next_log = time.monotonic() + _monitor_interval_s
     while True:
         try:
-            time.sleep(_monitor_interval_s)
+            time.sleep(_monitor_sample_s)
             idle, total = _mon_sample_cpu()
             cpu = _mon_cpu_pct_core(prev_idle, prev_total, idle, total)
             prev_idle, prev_total = idle, total
             if cpu is not None:
-                _mon_idle_cores = _safe_cpu_count() * (100.0 - cpu) / 100.0
-            line, warn, avail, _g_pct, _vf = _mon_snapshot_line(ctx, cpu)
-            _mon_avail_mb = avail
+                _idle_now = _safe_cpu_count() * (100.0 - cpu) / 100.0
+                _mon_idle_cores = _ema(_mon_idle_cores, _idle_now)
+            _t_mb, _a_mb = _mon_sample_system()
+            if _a_mb is not None:
+                _avail_ema = _ema(_avail_ema, _a_mb)
+                _mon_avail_mb = int(_avail_ema)
+            if time.monotonic() < _next_log:
+                _g_raw = _sys_gpu_util()
+                if _g_raw is not None:
+                    _mon_gpu_util_raw = _g_raw
+                    _gpu_ema = _ema(_gpu_ema, _g_raw)
+                    _mon_gpu_util = int(round(_gpu_ema))
+                continue
+            _next_log = time.monotonic() + _monitor_interval_s
+            line, warn, avail, _g_pct, _vf = _mon_snapshot_line(
+                ctx, cpu, gpu_ema=_gpu_ema)
+            if avail is not None:
+                _avail_ema = _ema(_avail_ema, avail)
+                _mon_avail_mb = int(_avail_ema)
             if _g_pct is not None:
-                _mon_gpu_util = _g_pct
+                _mon_gpu_util_raw = _g_pct
+                _gpu_ema = _ema(_gpu_ema, _g_pct)
+                _mon_gpu_util = int(round(_gpu_ema))
             if _vf is not None:
                 _mon_vram_free_mb = _vf
             _flog(line)
@@ -12759,8 +13248,33 @@ def _restart_child_budget_s(clock_base):
         return None
 
 
+def _nnue2_wake_allowed_core(separate, promote_in_place, endgame_mode,
+                             unstable_2):
+    if not separate:
+        return False
+    if unstable_2:
+        return False
+    return bool(endgame_mode) and not promote_in_place
+
+
+def _restart_nnue_2(ctx, caller, readyok_timeout=None, async_launch=False,
+                    force=False):
+    if not force and not _nnue2_wake_allowed_core(
+            _endgame_separate,
+            _endgame_promote_in_place,
+            ctx.endgame_mode,
+            ctx.nnue_health.unstable_2_mode):
+        _flog(f"[NNUE2-GATE] {caller}: nnue_2 wake DENIED "
+              f"(promote={int(_endgame_promote_in_place)} "
+              f"endgame={int(bool(ctx.endgame_mode))} "
+              f"separate={int(_endgame_separate)})")
+        return False
+    return _restart_nnue_impl(ctx, caller, slot="nnue_2",
+                              readyok_timeout=readyok_timeout, async_launch=async_launch)
+
+
 def _restart_nnue_impl(ctx, caller, *, slot, readyok_timeout=None, async_launch=False):
-    assert slot == "nnue_1", f"_restart_nnue_impl: only nnue_1 supported, got {slot!r}"
+    assert slot in ("nnue_1", "nnue_2"), f"_restart_nnue_impl: unsupported slot {slot!r}"
 
     if readyok_timeout is None:
         readyok_timeout = _restart_readyok_budget_s(ctx)
@@ -12855,6 +13369,8 @@ def _restart_nnue_impl(ctx, caller, *, slot, readyok_timeout=None, async_launch=
                     ctx.nnue_health.hash_original = _h_cur
                     _flog(f"{caller}: [HASH-DEGRADE] nnue_1 running at Hash={_h_new} "
                           f"(original={_h_cur}); will restore at next usinewgame")
+                eng._dyn_hash_last = _h_new
+                eng._dyn_hash_avail0 = None
                 _on_restart_success()
                 return True
             _flog(f"{caller}: {label} restart readyok timeout (Hash={_h_new})")
@@ -12888,6 +13404,13 @@ def _restart_nnue_impl(ctx, caller, *, slot, readyok_timeout=None, async_launch=
             return _fail(f"{caller}: {label} lower-Hash retry did not recover")
         eng.send("usinewgame")
         _flog(f"{caller}: {label} restarted OK")
+        try:
+            _h_boot = int(opts.get(opts_key, "0"))
+            if _h_boot > 0:
+                eng._dyn_hash_last = _h_boot
+                eng._dyn_hash_avail0 = None
+        except Exception:
+            pass
         setattr(ctx.nnue_health, streak_attr, 0)
         _on_restart_success()
         return True
@@ -14801,9 +15324,24 @@ def _append_move_record(ctx, rec):
                 _ev = rec.get(_ek)
                 if _ev is not None:
                     _emit[_ek] = _ev
+            _emit.setdefault("nnue_bestmove",
+                             rec.get("council_winner") or rec.get("bestmove"))
             if "pos_hash" not in _emit:
                 _pos = getattr(ctx, "current_position", None) or ""
                 _emit["pos_hash"] = _pos_hash8(_pos)
+            for _csm_k in ("confidence", "sharpness", "momentum"):
+                if _emit.get(_csm_k) is None:
+                    _prev = _REC_EMIT_LAST_CSM.get(_csm_k)
+                    if _prev is not None:
+                        _emit[_csm_k] = _prev
+                else:
+                    _REC_EMIT_LAST_CSM[_csm_k] = _emit[_csm_k]
+            for _rk in ("nnue_bestmove", "confidence", "sharpness",
+                        "momentum", "pos_hash"):
+                if _emit.get(_rk) is None:
+                    _flog("[REC-EMIT-GAP] key=%s source=%s handler=%s"
+                          % (_rk, rec.get("source", "?"),
+                             rec.get("handler", "?")))
             _js = json.dumps(_emit, ensure_ascii=True, separators=(",", ":"), default=str)
             for _victim in ("dl_display_policy", "nnue_pv", "dl_1_pv", "regime_label"):
                 if len(_js) <= 8192:
@@ -14899,8 +15437,9 @@ def _dyn_apply_nnue_threads(ctx, eng, path):
                if _tuning_mode and not _tuning_is_solo and _tuning_worker_count > 1
                else 1)
         _my_idle = _idle / _wc
-        _nnue_now = getattr(eng, "_dyn_threads_last",
-                            _cint(_cfg, "nnue_1_Threads", 4))
+        _nnue_now = getattr(eng, "_dyn_threads_last", None)
+        if _nnue_now is None:
+            _nnue_now = _cint(_cfg, "nnue_1_Threads", 4)
         _target = max(1, int(_nnue_now + _my_idle - _spare))
         _target = min(_target, _effective_cores())
         if _target == getattr(eng, "_dyn_threads_last", None):
@@ -15003,16 +15542,26 @@ def _dyn_apply_nnue_hash(eng, eng_name, readyok_budget_s=None):
                if _tuning_mode and not _tuning_is_solo
                and _tuning_worker_count > 1 else 1)
         _my_avail = _avail // max(1, _wc)
-        _margin = 512
-        if _my_avail < _margin:
-            _target = max(64, _current - (_margin - _my_avail))
-        elif _current < _orig:
-            _target = min(_orig, _current + (_my_avail - _margin) // 2)
-            if _target - _current < max(1024, _current // 4):
-                return
-        else:
-            return
+        _margin = 2048
+        _avail0 = getattr(eng, "_dyn_hash_avail0", None)
+        if _avail0 is None:
+            eng._dyn_hash_avail0 = _my_avail
+            _avail0 = _my_avail
+        _resident = min(_current, max(0, _avail0 - _my_avail))
+        _target = max(64, min(_orig, _resident + _my_avail - _margin))
         if _target == _current:
+            return
+        _crisis_mb = 2048
+        if (abs(_target - _current) < max(1024, _current // 4)
+                and not (_target < _current and _my_avail < _crisis_mb)):
+            _skip = getattr(eng, "_dyn_hash_skip_n", 0) + 1
+            eng._dyn_hash_skip_n = _skip
+            if abs(_target - _current) > 256 and _skip % 10 == 1:
+                _flog(f"[BUDGET-DYN] {eng_name} Hash {_current}MB 維持 "
+                      f"(目標 {_target}MB / 差 {_target - _current:+d}MB "
+                      f"< 不感帯 {max(1024, _current // 4)}MB; "
+                      f"avail={_avail}MB per_worker={_my_avail}MB "
+                      f"見送り {_skip} 回目)")
             return
         eng.setoption("USI_Hash", _target)
         eng.send("isready")
@@ -15023,6 +15572,8 @@ def _dyn_apply_nnue_hash(eng, eng_name, readyok_budget_s=None):
               f"{_current}→{_target}MB "
               f"(avail={_avail}MB per_worker={_my_avail}MB)")
         eng._dyn_hash_last = _target
+        eng._dyn_hash_avail0 = _my_avail + _resident
+        eng._dyn_hash_skip_n = 0
     except Exception as _e:
         _flog(f"[BUDGET-DYN] Hash adjust failed (ignored): {_e}")
 
@@ -15874,12 +16425,24 @@ def _run_council_search(ctx, line, move_count, dl_timeout,
         ctx.game_progress.disagree_boost_emergency = False
 
     _nnue1_book_absolute = False
+    _relay_es = float(nnue_info.get("relay_elapsed_s", 0.0) or 0.0)
+    _nnue_depth_now = int(nnue_info.get("depth", 0) or 0)
     if (nnue_info.get("book_info_seen")
+            and not nnue_info.get("scored_info_seen")
+            and _nnue_depth_now == 0
+            and _relay_es < 0.5
             and nnue_top_vote
             and nnue_top_vote not in ("resign", "win")):
         _nnue1_book_absolute = True
         _dlog(f"[NNUE1-BOOK] nnue_1 定跡手 (absolute) move={nnue_top_vote!r} "
-              f"— council をバイパスし即採用")
+              f"— council をバイパスし即採用 (elapsed={_relay_es:.3f}s depth={_nnue_depth_now})")
+    elif (nnue_info.get("book_info_seen")
+            and nnue_top_vote
+            and nnue_top_vote not in ("resign", "win")):
+        _flog(f"[NNUE1-BOOK/REJECT] book_info_seen=True だが scored_info_seen="
+              f"{bool(nnue_info.get('scored_info_seen'))} depth={_nnue_depth_now} "
+              f"elapsed={_relay_es:.3f}s → 本探索と判断し council 投票を実施 "
+              f"(false-positive gate; move={nnue_top_vote!r} ply={move_count})")
     if (ctx.game_progress.book_seed_move is None
             and _eng_alive(ctx.book2)
             and ctx.book2_state.active and ctx.book2_state.initialized):
@@ -16567,6 +17130,25 @@ def _run_council_search(ctx, line, move_count, dl_timeout,
                    if v and v == final_move) if _n_voices > 0 else 0
     ctx.game_progress.last_child_agreement = (_n_agree / _n_voices) if _n_voices > 0 else None
 
+    try:
+        _awr_fam = None
+        _awr_cp = None
+        if final_move and final_move not in ("resign", "win"):
+            if final_move == nnue_top_vote:
+                _awr_fam, _awr_cp = 'nnue', nnue_info.get("score_cp")
+            elif policy:
+                for _pe in policy:
+                    if _pe and _pe[0] == final_move:
+                        _awr_fam, _awr_cp = 'dl', _pe[1]
+                        break
+        if _awr_fam is not None and isinstance(_awr_cp, (int, float)):
+            _awr_sl, _awr_a = _win_rate_params_for_phase(_game_phase_value, _awr_fam, ctx.cfg)
+            _awr_our = _cp_to_winrate(_awr_cp, _awr_sl, game_phase=_game_phase_value, a=_awr_a)
+            _awr_sente = _awr_our if _side_to_move(move_count) == "sente" else (1.0 - _awr_our)
+            nnue_info["adopted_wr_sente"] = _awr_sente
+    except Exception as _awe:
+        _flog(f"[ignored] adopted_wr_sente injection: {_awe!r}")
+
     final_move, ponder_move = _safe_bestmove(final_move, ponder_move, label="council",
                                              nnue_info=nnue_info)
     if _dl_late_bm_sent is not None:
@@ -16954,12 +17536,24 @@ def _run_light_council_search(ctx, line, move_count, go_clock, dl_timeout_s=0.0)
         return
 
     _lc_nnue1_book_absolute = False
+    _lc_relay_es = float(nnue_info.get("relay_elapsed_s", 0.0) or 0.0)
+    _lc_nnue_depth_now = int(nnue_info.get("depth", 0) or 0)
     if (nnue_info.get("book_info_seen")
+            and not nnue_info.get("scored_info_seen")
+            and _lc_nnue_depth_now == 0
+            and _lc_relay_es < 0.5
             and nnue_top_vote
             and nnue_top_vote not in ("resign", "win")):
         _lc_nnue1_book_absolute = True
         _dlog(f"[NNUE1-BOOK/LC] nnue_1 定跡手 (absolute) move={nnue_top_vote!r} "
-              f"— light council をバイパスし即採用")
+              f"— light council をバイパスし即採用 (elapsed={_lc_relay_es:.3f}s depth={_lc_nnue_depth_now})")
+    elif (nnue_info.get("book_info_seen")
+            and nnue_top_vote
+            and nnue_top_vote not in ("resign", "win")):
+        _flog(f"[NNUE1-BOOK/LC-REJECT] book_info_seen=True だが scored_info_seen="
+              f"{bool(nnue_info.get('scored_info_seen'))} depth={_lc_nnue_depth_now} "
+              f"elapsed={_lc_relay_es:.3f}s → 本探索と判断し light council 投票を実施 "
+              f"(false-positive gate; move={nnue_top_vote!r} ply={move_count})")
 
     _lc_nnue_vote_weight = None
     if _lc_proxy_gate_core(ctx.cfg.dl3_proxy_enable, nnue_top_vote,
@@ -19055,7 +19649,9 @@ def _run_endgame_search(ctx, line, move_count, is_infinite,
             "council_stale_withdraw": False,
             "council_wr_discount":   None,
             "council_wr_dl":         (_veto_meta.get("win_rate_dl") if _veto_meta else None),
-            "council_wr_nnue":       _cp_to_winrate(nnue_info["score_cp"], _SR_WR_SLOPE),
+            "council_wr_nnue":       (_veto_meta.get("win_rate_nnue")
+                                      if _veto_meta and _veto_meta.get("win_rate_nnue") is not None
+                                      else _cp_to_winrate(nnue_info["score_cp"], _SR_WR_SLOPE)),
             "council_wr_discount_dl2": None,
             "council_wr_dl2":        None,
 
@@ -19199,6 +19795,12 @@ def _shutdown(ctx, reason="unknown"):
             ctx.game_meta["dlp_mode"] = str(_DLPONDER_STATE.get("mode", "unknown"))
             ctx.game_meta["dlp_diff"] = _dlp_game_diff()
             _write_game_stats(ctx.game_log, ctx.game_meta, cfg=ctx.cfg)
+            if not _tuning_mode:
+                _dlponder_save_state()
+            try:
+                _usi_game_sfen_flush(ctx, "shutdown")
+            except Exception as _sk_e:
+                _flog(f"_shutdown: sfen flush failed (non-fatal): {_sk_e!r}")
             _suppressed = (_RUN_MODE is RunMode.DLP_CAL
                            or not ctx.cfg.log_stats)
             _flog(f"_shutdown: flushed {len(ctx.game_log)} pending move(s) "
@@ -19405,6 +20007,16 @@ def _handle_setoption(ctx, line):
             _broadcast_setoption(_ponder_targets, "USI_Ponder", ponder_enabled_str)
             if not ponder_enabled:
                 _broadcast_setoption(_ponder_targets, "Stochastic_Ponder", "false")
+            else:
+                for _pt_eng, _pt_opts in ((ctx.dl_1, _dl_1_opts),
+                                          (ctx.nnue_1, _nnue_1_opts),
+                                          (ctx.dl_2, _dl_2_opts),
+                                          (ctx.dl_3, _dl_3_opts)):
+                    if _pt_eng in _ponder_targets:
+                        _pt_sp = _pt_opts.get("Stochastic_Ponder")
+                        if _pt_sp is not None:
+                            _broadcast_setoption([_pt_eng],
+                                                 "Stochastic_Ponder", _pt_sp)
             _flog(f"USI_Ponder set to {ponder_enabled_str} (forwarded to child engines, dl_ponder_enable={_dl_ponder_enable})")
         elif key in ("MaxMovesToDraw", "Draw_Ply"):
             try:
@@ -19508,7 +20120,8 @@ def _handle_isready(ctx, line):
         f"DL_2={_dl2_mb} MB ({_dl2_model_rel})"
         f"{'  DL_3=' + str(_dl3_mb) + ' MB (' + str(_dl3_model_rel) + ')' if _dl3_mb else ''}"
     )
-    _nnue_1_opts["Stochastic_Ponder"] = str(_cfg["nnue_1_Stochastic_Ponder"])
+    _nnue_1_opts["Stochastic_Ponder"] = (
+        str(_cfg["nnue_1_Stochastic_Ponder"]) if _early_ponder else "false")
     _endgame_opts["Stochastic_Ponder"] = "false"
     if not _nnue_slowmover_user_set:
         _nnue_1_opts["SlowMover"] = str(round(_lerp(*_LERP_SLOWMOVER, _time_aggression_nnue)))
@@ -19534,8 +20147,20 @@ def _handle_isready(ctx, line):
         else:
             _flog("endgame: ctx.nnue_1 と同一設定のため別プロセスを起動しない")
 
-        ctx.dl_1.initialize(_dl_1_opts);   _flog("ctx.dl_1 isready sent")
-        ctx.nnue_1.initialize(_nnue_1_opts); _flog("ctx.nnue_1 isready sent")
+        def _init_usiok_retry(_ir_label, _ir_eng, _ir_opts):
+            try:
+                _ir_eng.initialize(_ir_opts)
+                _flog(f"{_ir_label} isready sent")
+            except Exception as _ir_e:
+                _flog(f"{_ir_label} initialize failed: {_ir_e!r} — "
+                      f"one-shot restart & retry")
+                time.sleep(2.0)
+                _ir_eng.start()
+                _flog(f"{_ir_label} restarted (usiok retry)")
+                _ir_eng.initialize(_ir_opts)
+                _flog(f"{_ir_label} isready sent (retry)")
+        _init_usiok_retry("ctx.dl_1", ctx.dl_1, _dl_1_opts)
+        _init_usiok_retry("ctx.nnue_1", ctx.nnue_1, _nnue_1_opts)
         _dl_2_init_ok = True
         if ctx.cfg.dl_2_enable:
             try:
@@ -19721,6 +20346,13 @@ def _handle_isready(ctx, line):
         tb = _safe_format_exc()
         log(f"Init error: {e}")
         _flog(f"Init error: {e}\n{tb}")
+        if os.environ.get("PYFAMATE_DLP_CAL") == "1":
+            _flog("[dlp-cal-child] init failed — fail-fast exit (readyok 送信せず)")
+            try:
+                _shutdown(ctx, "dlp-cal-init-failfast")
+            except Exception as _ff_e:
+                _flog(f"[ignored] dlp-cal failfast shutdown: {_ff_e}")
+            sys.exit(1)
 
     if not _suppress_info_print:
         print("readyok", flush=True)
@@ -19981,7 +20613,8 @@ def _handle_usinewgame(ctx, line):
     _wsl_restore = []
     for _eng_attr_r in ("nnue_1", "nnue_2"):
         _eng_r = getattr(ctx, _eng_attr_r, None)
-        if _eng_alive(_eng_r):
+        if (_eng_alive(_eng_r)
+                and getattr(_eng_r, "_bat_path", None) is not None):
             _orig_h = getattr(_eng_r, "_dyn_hash_original", None)
             if _orig_h is not None and _orig_h > 1:
                 _wsl_restore.append((_eng_attr_r, _eng_r, _orig_h))
@@ -19993,6 +20626,8 @@ def _handle_usinewgame(ctx, line):
                 _e.send("isready")
                 _e.flush_until_ready(timeout=30.0)
                 _flog(f"[WSL-HASH-RESTORE] {_attr} Hash 1→{_o}MB (game start, isready committed)")
+                _e._dyn_hash_last = _o
+                _e._dyn_hash_avail0 = None
                 _wr_results[_attr] = True
             except (KeyboardInterrupt, SystemExit):
                 raise
@@ -20027,6 +20662,7 @@ def _handle_usinewgame(ctx, line):
                 _hdr_ok = ctx.nnue_1.flush_until_ready(timeout=30.0)
                 if _hdr_ok:
                     ctx.nnue_1._dyn_hash_last = _hdr_orig
+                    ctx.nnue_1._dyn_hash_avail0 = None
                     ctx.nnue_health.hash_degraded = False
                     ctx.nnue_health.hash_original = 0
                     _flog(f"[HASH-DEGRADE-RESTORE] nnue_1 Hash restored to {_hdr_orig}MB")
@@ -20171,6 +20807,9 @@ def _handle_usinewgame(ctx, line):
     ctx.game_meta["dlp_diff"] = _dlp_game_diff()
     if ctx.game_log:
         _write_game_stats(ctx.game_log, ctx.game_meta, cfg=ctx.cfg)
+        _usi_game_sfen_flush(ctx, "usinewgame")
+    if not _tuning_mode:
+        _dlponder_save_state()
     _dlp_snapshot_for_diff()
     ctx.reset_game()
 
@@ -20517,6 +21156,9 @@ _CHILD_ENG_LOCK_MAP = {
 
 
 def _restart_child_async(ctx, slot, caller):
+    if slot == "dl_2" and not ctx.cfg.dl_2_enable:
+        _flog(f"{caller}: ctx.dl_2 revive skip (DL_2_Enable=false — 意図的無効)")
+        return
     eng = getattr(ctx, slot, None)
     if eng is None or _eng_alive(eng):
         return
@@ -20534,6 +21176,9 @@ def _restart_child_async(ctx, slot, caller):
 
 
 def _restart_child(ctx, slot, caller, readyok_timeout=None):
+    if slot == "dl_2" and not ctx.cfg.dl_2_enable:
+        _flog(f"{caller}: ctx.dl_2 restart skip (DL_2_Enable=false — 意図的無効)")
+        return False
     _s = _CHILD_RESTART_SLOTS[slot]
     opts = globals()[_s["opts"]]
     eng = getattr(ctx, slot)
@@ -20876,6 +21521,8 @@ def _apply_time_dynamics(ctx, line, move_count, label="go", clock_base=None):
 
 
 def _handle_go(ctx, line):
+    if "ponder" not in line.split():
+        ctx.ps.last_go_position = ctx.current_position
     _go_tokens = line.split()
     if len(_go_tokens) >= 2 and _go_tokens[1] == "mate":
         if _eng_alive(ctx.mate_solver):
@@ -20931,7 +21578,7 @@ def _handle_go(ctx, line):
     ctx.game_progress.ponder_arb_pred_dl = None
     try:
         _dlponder_bm = _DLPONDER_STATE.get("bm_ts")
-        if _dlponder_bm is not None:
+        if _dlponder_bm is not None and _ACTIVE_BESTMOVE_SINK is None:
             _dlponder_opp = time.monotonic() - _dlponder_bm
             _DLPONDER_STATE["bm_ts"] = None
             if 0.2 <= _dlponder_opp <= 600.0:
@@ -21169,18 +21816,19 @@ def _handle_go(ctx, line):
             and _zmf_gp_ready):
         _activate_endgame(ctx, "zero_main_fischer", eff_s=_eff_s_go)
         _dlog("[MODE][ZMF] endgame_mode=True at ply=%d "
-              "(remaining=0ms inc=%dms — 残時間ゼロ Fischer。配当機構ごと nnue 専任へ)"
-              % (move_count, _go_clock_main.inc_ms))
+              "(remaining=%sms < inc=%dms — 残時間<増分 Fischer。配当機構ごと nnue 専任へ)"
+              % (move_count, _go_clock_main.remaining_ms, _go_clock_main.inc_ms))
     elif (_zmf_decision == "activate" and _book_active_now
           and not ctx.endgame_mode):
-        _dlog("[MODE][ZMF] remaining=0ms inc=%dms だが定跡エンジン稼働中 — "
+        _dlog("[MODE][ZMF] remaining=%sms < inc=%dms だが定跡エンジン稼働中 — "
               "定跡手は増分を蓄積するため endgame 抑止"
-              % _go_clock_main.inc_ms)
+              % (_go_clock_main.remaining_ms, _go_clock_main.inc_ms))
     elif (_zmf_decision == "activate" and not _zmf_gp_ready
           and not ctx.endgame_mode):
-        _dlog("[MODE][ZMF] remaining=0ms inc=%dms だが game_phase=%.3f < handover*0.5=%.3f"
+        _dlog("[MODE][ZMF] remaining=%sms < inc=%dms だが game_phase=%.3f < handover*0.5=%.3f"
               " — 序中盤のため endgame 抑止"
-              % (_go_clock_main.inc_ms, _cur_game_phase, _handover_game_phase * 0.5))
+              % (_go_clock_main.remaining_ms, _go_clock_main.inc_ms,
+                 _cur_game_phase, _handover_game_phase * 0.5))
     if (not is_infinite and not ctx.endgame_mode and ctx.dl_1._alive
             and _endgame_decision in ("activate_game_phase", "activate_eff_s")):
         if _book_active_now:
@@ -21194,7 +21842,10 @@ def _handle_go(ctx, line):
               and _eff_s_go is not None
               and _eff_s_go >= ctx.cfg.light_council_min_eff_s
               and ctx.cfg.light_council_enable
-              and _eng_alive(ctx.dl_3)):
+              and _eng_alive(ctx.dl_3)
+              and ((_go_clock_main.inc_ms or 0) <= 0
+                   or _go_clock_main.remaining_ms is None
+                   or _go_clock_main.remaining_ms >= _go_clock_main.inc_ms * 2)):
             _dlog("[MODE] eff_s=%.2f < min_eff_s=%.2f だが Light Council 動作可能 "
                   "(eff_s >= lc_min=%.2f, DL_3 alive) — endgame 抑止し council 維持"
                   % (_eff_s_go, ctx.cfg.endgame_min_eff_s, ctx.cfg.light_council_min_eff_s))
@@ -21287,8 +21938,8 @@ def _drain_sp_early_bestmove(eng, caller="ponderhit", grace_s=0.30):
                       f"{_bm} (ponder={_pd}) — ponderhit を送らず即採用")
                 return _bm, _pd, nnue_info
             _flog(f"[{caller}/SP-early] {eng.name} bestmove={_bm!r} は早期採用対象外 "
-                  "— 通常 ponderhit 経路へ")
-            return None, None, {}
+                  "— 子は idle (search complete)、ponderhit 抑止シグナル")
+            return None, None, {"__search_complete__": True}
     return None, None, {}
 
 
@@ -22863,6 +23514,7 @@ def _handle_ponderhit(ctx, line):
     ctx.game_progress.ponder_arb_pred_dl = None
     move_count, position_cmd, ponderhit_pv_holder = _ponderhit_preamble(ctx, line)
     _phit_trace("preamble", mc=move_count)
+    ctx.ps.last_go_position = ctx.current_position
     bestmove = ""
     ponder_move = None
     extra_stats = {"score_swing_cp": None}
@@ -23112,6 +23764,91 @@ def _handle_stop(ctx, line):
         ctx.ps.active = False
 
 
+def _usi_game_sfen_flush(ctx, tag: str) -> None:
+    if _RUN_MODE is not RunMode.USI or _SPSA_RUNNER_ACTIVE[0]:
+        return
+    try:
+        pos = (getattr(ctx, "current_position", "") or "").strip()
+        if not pos.startswith("position"):
+            return
+        toks = pos.split()
+        if "moves" in toks:
+            _mi = toks.index("moves")
+            prefix_toks, moves = toks[1:_mi], toks[_mi + 1:]
+        else:
+            prefix_toks, moves = toks[1:], []
+        _conf = getattr(ctx.ps, "last_go_position", None)
+        _spec = getattr(ctx.ps, "position", None)
+        if isinstance(_conf, str) and _conf.startswith("position"):
+            _ct = _conf.split()
+            if "moves" in _ct:
+                _cmi = _ct.index("moves")
+                _cprefix, _cmoves = _ct[1:_cmi], _ct[_cmi + 1:]
+            else:
+                _cprefix, _cmoves = _ct[1:], []
+            if (_cprefix == prefix_toks and len(moves) == len(_cmoves) + 2
+                    and moves[:len(_cmoves)] == _cmoves
+                    and (_spec == pos or _spec is None)):
+                _flog(f"[USI-SFEN-KIFU][{tag}] speculative ponder move "
+                      f"'{moves[-1]}' dropped (go-ponder prediction, "
+                      f"never confirmed by ponderhit/go)")
+                moves = moves[:-1]
+        my_side = None
+        last_move_added = None
+        if ctx.game_log:
+            for _r in ctx.game_log:
+                _p = _r.get("ply")
+                if isinstance(_p, int):
+                    my_side = "sente" if _p % 2 == 0 else "gote"
+                    break
+            _last = ctx.game_log[-1]
+            _lm = _last.get("council_winner") or _last.get("bestmove")
+            _lp = _last.get("ply")
+            if (_lm and isinstance(_lm, str) and len(_lm) >= 4
+                    and _lm not in ("resign", "win", "none", "0000")
+                    and isinstance(_lp, int)
+                    and _lp == _count_moves(pos)):
+                moves = moves + [_lm]
+                last_move_added = _lm
+        if not moves:
+            return
+        pos_full = ("position " + " ".join(prefix_toks)
+                    + " moves " + " ".join(moves))
+        _res = (getattr(ctx, "game_meta", None) or {}).get("result")
+        try:
+            _final_sfen = _sfen_for_position(pos_full)
+        except Exception as _bfe:
+            _final_sfen = f"<build failed: {_bfe!r}>"
+        _flog(f"[USI-SFEN-KIFU][{tag}] {pos_full}")
+        _flog(f"[USI-SFEN-KIFU][{tag}] final_sfen={_final_sfen} "
+              f"result={_res} side={my_side}"
+              + (f" (+last bestmove {last_move_added})"
+                 if last_move_added else ""))
+        _sfen_result = None
+        if _res == "draw":
+            _sfen_result = "draw"
+        elif _res in ("win", "lose") and my_side in ("sente", "gote"):
+            _winner = (my_side if _res == "win"
+                       else ("gote" if my_side == "sente" else "sente"))
+            _sfen_result = _winner + "_win"
+        if _sfen_result and bool(globals().get("SFEN_Kifu_Enable", True)):
+            _path = (globals().get("SFEN_Kifu_Path", "") or "").strip()
+            if not _path:
+                _path = os.path.join(_BASE_DIR, "usi_games.sfen")
+            if prefix_toks and prefix_toks[0] == "startpos":
+                _prefix = "startpos"
+            else:
+                _start = (" ".join(prefix_toks[1:])
+                          if (prefix_toks and prefix_toks[0] == "sfen") else "")
+                _prefix = ("startpos"
+                           if _start.split()[:1] == [_HIRATE_SFEN.split()[0]]
+                           else ("sfen " + _start if _start else "startpos"))
+            _sfen_kifu_append(_path, _prefix, moves, _sfen_result, None)
+            _flog(f"[USI-SFEN-KIFU][{tag}] appended → {_path} ({_sfen_result})")
+    except Exception as _ue:
+        _flog(f"[USI-SFEN-KIFU][{tag}] failed (ignored): {_ue!r}")
+
+
 def _handle_gameover(ctx, line):
     _teardown_game(ctx, "gameover")
     if ctx.prefetch.dl_1_lock.acquire(timeout=5.0):
@@ -23174,7 +23911,10 @@ def _handle_gameover(ctx, line):
     ctx.game_meta["dlp_mode"] = str(_DLPONDER_STATE.get("mode", "unknown"))
     ctx.game_meta["dlp_diff"] = _dlp_game_diff()
     _write_game_stats(ctx.game_log, ctx.game_meta, cfg=ctx.cfg)
+    if not _tuning_mode:
+        _dlponder_save_state()
     _dlp_snapshot_for_diff()
+    _usi_game_sfen_flush(ctx, "gameover")
     ctx.reset_game()
     _assert_sp_consistency(ctx, "gameover")
     ctx.ps.mate_skip_pending = False
@@ -23236,6 +23976,41 @@ def _handle_spsa(ctx, line):
     print("info string [setup] SPSA チューニングを開始しました (内蔵ワーカー)", flush=True)
     _spsa_args = line.split()[1:]
     def _run():
+        for _sh_attr in ("nnue_1", "nnue_2"):
+            _sh_eng = getattr(ctx, _sh_attr, None)
+            if _sh_eng is None or not getattr(_sh_eng, "_alive", False):
+                continue
+            try:
+                _sh_eng.send("stop")
+                _sh_eng.setoption("USI_Hash", "1")
+                _sh_eng.send("isready")
+                _sh_eng.flush_until_ready(timeout=30.0)
+                _flog("[FIX-SPSA-PARENT-HASH] %s Hash→1MB (WSL RAM released)"
+                      % _sh_attr)
+            except Exception as _sh_e:
+                _flog("[FIX-SPSA-PARENT-HASH] %s shrink failed: %s"
+                      % (_sh_attr, _sh_e))
+        for _dq_attr in ("dl_1", "dl_2", "dl_3"):
+            _dq_eng = getattr(ctx, _dq_attr, None)
+            if _dq_eng is None or not getattr(_dq_eng, "_alive", False):
+                continue
+            try:
+                _dq_eng.quit()
+                _flog("[FIX-SPSA-PARENT-DL-QUIESCE] %s quit "
+                      "(DirectML/VRAM+host RAM released; "
+                      "auto-revive at next real go)" % _dq_attr)
+            except Exception as _dq_e:
+                _flog("[FIX-SPSA-PARENT-DL-QUIESCE] %s quit failed: %s"
+                      % (_dq_attr, _dq_e))
+        if not _spsa_wsl_health_reset():
+            _wsl_abort_msg = (
+                "[SPSA] 中止: WSL が利用不能 (wedge) — WSL bridge の nnue が"
+                "起動できず全ワーカー死亡が確定するため。管理者 PowerShell で "
+                "Restart-Service WSLService を実行するか、OS 再起動後に再実行"
+                "してください。")
+            _flog(_wsl_abort_msg)
+            print("info string " + _wsl_abort_msg, flush=True)
+            return
         if not _ensure_prereqs("spsa", _spsa_args):
             _flog("[SPSA] 前提工程 (DLP/Setup) 失敗 — SPSA を開始しない")
             return
@@ -23490,6 +24265,8 @@ def _handle_replay(ctx, line):
             if isinstance(v, (int, float)):
                 wr = _cp_to_winrate(v, _SR_WR_SLOPE) * 100.0
                 break
+        if wr is not None and len(moves) % 2 == 0:
+            wr = 100.0 - wr
         _tstr = (time.strftime("%H:%M:%S", time.localtime(ts))
                  if isinstance(ts, (int, float)) else "")
         hdr = f"── {len(moves)}手目 {mv}" + (f"  [{_tstr}]" if _tstr else "")
@@ -26657,6 +27434,7 @@ TOKEN_DISPATCH = {
     "teacher":    _handle_teacher,
     "setup":      _handle_setup,
     "game":       _handle_game,
+    "match":      _handle_match,
     "spsa":       _handle_spsa,
     "grid":       _handle_grid,
     "learn":      _handle_learn,
@@ -26748,6 +27526,9 @@ def _tuner_load_games(path):
                     continue
                 if not (isinstance(game, dict) and "moves" in game):
                     continue
+                if (game.get("infra_void")
+                        or game.get("reason") in _SPSA_INFRA_VOID_REASONS):
+                    continue
                 games.append(game)
     except FileNotFoundError:
         pass
@@ -26770,6 +27551,9 @@ def _tuner_load_records(path):
                 except json.JSONDecodeError:
                     continue
                 if not (isinstance(game, dict) and "moves" in game):
+                    continue
+                if (game.get("infra_void")
+                        or game.get("reason") in _SPSA_INFRA_VOID_REASONS):
                     continue
                 n_games += 1
                 ver = game.get("formula", {}).get("version", "unknown")
@@ -27759,13 +28543,14 @@ class _SpsaUsiEngine:
             bufsize=1,
             **_spsa_pgrp_kwargs(),
         )
-        self._lock = threading.Lock()
         self._alive = True
         self._go_sent = 0
         self._bm_seen = 0
         self._last_ack_gen = None
         self._bm_gen = None
         self._last_rec = None
+        self._last_drained_bm = None
+        self._dup_drained_bm = False
         self._send_lock = threading.Lock()
         self._q = _queue.Queue()
         _self = self
@@ -27790,15 +28575,20 @@ class _SpsaUsiEngine:
 
     def send(self, cmd: str) -> None:
         if not self._alive or not self.proc or not self.proc.stdin:
+            _flog(f"[{getattr(self, 'name', 'spsa-child')}] send skipped "
+                  f"(not alive): {cmd.split()[0] if cmd else cmd}")
             return
-        with self._lock:
+        with self._send_lock:
             try:
                 self.proc.stdin.write(cmd + "\n")
                 self.proc.stdin.flush()
                 if cmd.startswith("go"):
                     self._go_sent += 1
-            except (BrokenPipeError, OSError):
+            except (BrokenPipeError, OSError) as _sp_se:
                 self._alive = False
+                _flog(f"[{getattr(self, 'name', 'spsa-child')}] send "
+                      f"{type(_sp_se).__name__} (process exited): "
+                      f"{cmd.split()[0] if cmd else cmd}")
 
     def setoption(self, key, val):
         self.send(f"setoption name {key} value {val}")
@@ -27832,10 +28622,11 @@ class _SpsaUsiEngine:
     _note_line    = USIEngine._note_line
     bm_is_current     = USIEngine.bm_is_current
     classify_bestmove = USIEngine.classify_bestmove
+    _force_accept_resync = USIEngine._force_accept_resync
 
     def preserve_wedge_diag(self, tag: str = "WEDGE") -> None:
-        if os.environ.get("SPSA_PRESERVE_CHILD_DIAG", "1").strip().lower() \
-                in ("0", "false", "no", ""):
+        if os.environ.get("SPSA_PRESERVE_CHILD_DIAG", "0").strip().lower() \
+                not in ("1", "true", "yes"):
             return
         _n = getattr(self, "_wedge_snaps", 0)
         if _n >= 5:
@@ -27890,8 +28681,8 @@ class _SpsaUsiEngine:
         return True
 
     def _pre_tmpdir_cleanup(self) -> None:
-        if os.environ.get("SPSA_PRESERVE_CHILD_DIAG", "1").strip().lower() \
-                not in ("0", "false", "no", ""):
+        if os.environ.get("SPSA_PRESERVE_CHILD_DIAG", "0").strip().lower() \
+                in ("1", "true", "yes"):
             try:
                 _src = os.path.join(self._tmpdir, "diagnosis.txt")
                 if os.path.exists(_src):
@@ -28009,7 +28800,10 @@ class _OpponentEngine(_SpsaUsiEngine):
 def _opponent_default_hash_mb() -> int:
     _total, _avail = _sys_ram_info()
     if _avail and _avail > 0:
-        return max(1024, int(_avail) // 2)
+        h = max(1024, int(_avail) // 2)
+        if _DIRECTML_SHARED_RAM:
+            h = h // 2
+        return h
     return 8192
 
 
@@ -28149,6 +28943,16 @@ def _spsa_kifu_path() -> str:
 
 
 _spsa_kifu_lock = threading.Lock()
+
+_SPSA_RUNNER_ACTIVE = [False]
+
+_SPSA_INFRA_VOID_REASONS = frozenset({
+    "worker_died", "bestmove_timeout_within_budget",
+    "engine_restart_failed", "illegal_usi",
+    "opening_resign_void", "restart_storm", "fast_bestmove_void",
+    "time_loss_infra_void", "silence_mute_void"})
+
+_SPSA_VOID_MARKS: list = []
 
 _HIRATE_SFEN = "lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL b - 1"
 
@@ -28333,11 +29137,16 @@ def _selfplay_game(eng_sente: "_SpsaUsiEngine",
     _prefix, _base_moves = _sprt_split_opening_core(opening)
     _board = None
     _check_flags: list = []
+    _sp_last_ja = ""
     if sennichite_check or _base_moves or _prefix != "startpos":
         try:
             _board = ShogiBoard(sfen=_prefix)
             for _bm in _base_moves:
                 _check_flags.append(_board.gives_check(_bm))
+                try:
+                    _sp_last_ja = _sr_usi_to_ja(_board, _bm)
+                except Exception:
+                    _sp_last_ja = _bm
                 _board.push(_bm)
         except Exception as _oe:
             _flog("[SPSA-W] opening rejected %r (%s) → startpos" % (opening, _oe))
@@ -28346,14 +29155,17 @@ def _selfplay_game(eng_sente: "_SpsaUsiEngine",
                   flush=True)
             _prefix, _base_moves, _check_flags = "startpos", [], []
             _board = ShogiBoard() if sennichite_check else None
+            _sp_last_ja = ""
     _start_is_sente = (_board.side == "b") if _board is not None else True
+    _sp_move_base = len(_base_moves)
 
     _LIVE.reset()
     _zenrei_live_reset()
     moves: list = []
     _restart_count = 0
 
-    def _fill_info(reason: str, extra: "dict | None" = None) -> None:
+    def _fill_info(reason: str, extra: "dict | None" = None,
+                    result: str = "") -> None:
         if info is not None:
             info["reason"] = reason
             info["plies"]  = len(moves)
@@ -28362,12 +29174,39 @@ def _selfplay_game(eng_sente: "_SpsaUsiEngine",
             info.setdefault("sennichite", False)
             if extra:
                 info.update(extra)
+        if (result and (_SPSA_MODE or _SPSA_RUNNER_ACTIVE[0])
+                and reason in _SPSA_INFRA_VOID_REASONS):
+            _flog("[STATS-VOID] infra-void game — parent record suppressed "
+                  "(reason=%s, %d moves)" % (reason, len(moves)))
+            _SPSA_VOID_MARKS.append(time.time())
+            return
+        if result and (_SPSA_MODE or _SPSA_RUNNER_ACTIVE[0]):
+            try:
+                _rec = {"ts": time.time(), "source": "spsa_parent",
+                        "result": result, "reason": reason,
+                        "usi_moves": list(_base_moves) + list(moves),
+                        "opening_prefix": _prefix,
+                        "tc": tc.label if tc is not None else "",
+                        "sente": eng_sente.name, "gote": eng_gote.name}
+                if extra:
+                    _rec.update(extra)
+                _atomic_append(
+                    os.path.join(_BASE_DIR, "stats.txt"),
+                    json.dumps(_rec, ensure_ascii=False) + "\n",
+                    lock=_stats_write_lock)
+            except Exception as _e:
+                _flog("[STATS-PARENT] write failed: %s" % _e)
 
     def _kifu(result: str, reason: str = None) -> None:
         if _prefix == "startpos":
             _spsa_append_kifu(_base_moves + moves, result, reason)
         else:
             _flog("[SPSA-W] kifu skipped (non-startpos opening)")
+
+    def _flag_fall_result() -> str:
+        if _last_wr_sente is not None and _last_wr_sente > 0.5:
+            return "sente_win"
+        return "gote_win"
 
     eng_sente.setoption("Book_Turn_Hint", "+")
     eng_gote.setoption("Book_Turn_Hint", "-")
@@ -28409,8 +29248,15 @@ def _selfplay_game(eng_sente: "_SpsaUsiEngine",
 
     _adj_streak_sente = 0
     _adj_streak_gote = 0
+    _adj_last_obs_move = None
     _adj_score_obs = None
     _sp_rec = None
+    _last_wr_sente = None
+    _fast_bm_streak = 0
+    _FAST_BM_THRESHOLD_MS = 100
+    _FAST_BM_STREAK_LIMIT = 3
+    _FAST_BM_MIN_MOVE = 10
+    _infra_intervened = False
     try:
       for move_no in range(512):
         if time.perf_counter() > deadline:
@@ -28418,7 +29264,7 @@ def _selfplay_game(eng_sente: "_SpsaUsiEngine",
             _LIVE.reset()
             print("[!] game timeout — counted as draw", flush=True)
             _kifu("void")
-            _fill_info("game_timeout")
+            _fill_info("game_timeout", result="draw")
             return "draw"
 
         is_sente = (_start_is_sente == (move_no % 2 == 0))
@@ -28432,6 +29278,7 @@ def _selfplay_game(eng_sente: "_SpsaUsiEngine",
         _barrier_ok = True
         _t_hit = None
         _sp_pre_drained = False
+        _ph_skip_send = False
         bestmove = ""
         _ponder_hint = ""
         _was_preempted = thinker in _ponder_preempted
@@ -28449,10 +29296,42 @@ def _selfplay_game(eng_sente: "_SpsaUsiEngine",
                         _flog("[P6-1] SP pre-drain hit: %s — adopting directly" % _sp_pre_bm)
                         bestmove = _sp_pre_bm
                         _ponder_hint = _sp_pre_pd or ""
+                    else:
+                        _flog("[P6-1/FIX-BH] pre-drain bm %r not for board — "
+                              "child idle, suppressing ponderhit" % _sp_pre_bm)
+                        _ph_skip_send = True
+                elif _sp_pre_ni.get("__search_complete__"):
+                    _sp_pre_drained = True
+                    _ph_skip_send = True
+                    _flog("[P6-1/FIX-BH] pre-drain consumed terminal bestmove — "
+                          "child idle, suppressing ponderhit")
                 _t_hit = time.perf_counter()
                 _ponderhit_clock = _extract_clock_tokens(
                     _spsa_build_go_line(tc, btime_ms, wtime_ms))
-                if not bestmove:
+                if not bestmove and not _ph_skip_send:
+                    _sp_race_bm, _sp_race_pd, _sp_race_ni = (
+                        _drain_sp_early_bestmove(
+                            thinker, caller="sp-ponderhit-race", grace_s=0.0))
+                    if _sp_race_bm:
+                        _sp_pre_drained = True
+                        if (_board is not None
+                                and _bestmove_is_for_board(_sp_race_bm, _board)):
+                            _flog("[P6-1-RACE] SP pre-drain race caught at send: "
+                                  "%s (ponder=%s) — ponderhit suppressed"
+                                  % (_sp_race_bm, _sp_race_pd))
+                            bestmove = _sp_race_bm
+                            _ponder_hint = _sp_race_pd or ""
+                        else:
+                            _flog("[P6-1-RACE/FIX-BH] race-caught bm %r not for "
+                                  "board — child idle, suppressing ponderhit"
+                                  % _sp_race_bm)
+                            _ph_skip_send = True
+                    elif _sp_race_ni.get("__search_complete__"):
+                        _sp_pre_drained = True
+                        _ph_skip_send = True
+                        _flog("[P6-1-RACE/FIX-BH] race-caught terminal bestmove — "
+                              "child idle, suppressing ponderhit")
+                if not bestmove and not _ph_skip_send:
                     thinker.send(("ponderhit " + _ponderhit_clock) if _ponderhit_clock else "ponderhit")
                 _ponder_hits += 1
             else:
@@ -28484,7 +29363,7 @@ def _selfplay_game(eng_sente: "_SpsaUsiEngine",
                         print("[!] engine halt failure x%d — game voided (draw)"
                               % _restart_count, flush=True)
                         _kifu("void")
-                        _fill_info("restart_storm")
+                        _fill_info("restart_storm", result="draw")
                         return "draw"
                     _flog("[SPSA-W][PNDR] halt failed — restarting %s (%d/2 this game)"
                           % (getattr(thinker, "name", "?"), _restart_count))
@@ -28498,7 +29377,7 @@ def _selfplay_game(eng_sente: "_SpsaUsiEngine",
                         print("[!] engine restart failed — counted as draw",
                               flush=True)
                         _kifu("void")
-                        _fill_info("engine_restart_failed")
+                        _fill_info("engine_restart_failed", result="draw")
                         return "draw"
         _fast_first = False
         if _t_hit is None:
@@ -28521,7 +29400,13 @@ def _selfplay_game(eng_sente: "_SpsaUsiEngine",
         if _fast_first or bestmove:
             wait_s = 0
         _t_think0 = _t_hit if _t_hit is not None else time.perf_counter()
+        _t_think0_orig = _t_think0
         _is_hit_path = (_t_hit is not None)
+        _stale_miss_reissue_count = 0
+        _intervention_ms = 0.0
+        _hit_wd_base_pre_isready = None
+        _sp_echo_prev_t = None
+        _mute_after_rescue = False
 
         def _consume_bestmove(_line: str) -> bool:
             nonlocal bestmove, _ponder_hint
@@ -28549,7 +29434,6 @@ def _selfplay_game(eng_sente: "_SpsaUsiEngine",
                             "sharpness", "momentum",
                             "council_wr_nnue",
                             "council_wr_dl", "council_wr_dl2",
-                            "dl_2_top_move", "dl_2_invoked",
                             "dl_top_score", "dl_used",
                             "nnue_score_cp", "nnue_depth",
                             "regime_label", "regime_conviction"):
@@ -28558,7 +29442,8 @@ def _selfplay_game(eng_sente: "_SpsaUsiEngine",
             _LIVE.set_think(_sp_live_rec, _sp_live_pos, _sp_carry_policy,
                             live=True)
             _sp_live_last_emit = 0.0
-            _LIVE.show(_board, move_no=move_no,
+            _LIVE.show(_board, move_no=_sp_move_base + move_no,
+                       last_move=_sp_last_ja,
                        sente_time=_sr_fmt_clock(btime_ms),
                        gote_time=_sr_fmt_clock(wtime_ms))
         dl2 = _t_think0 + wait_s
@@ -28570,10 +29455,12 @@ def _selfplay_game(eng_sente: "_SpsaUsiEngine",
 
         if _use_session_fsm:
             _fsm = _EngineSession(
-                probe_s=_clamp(0.25 * _main_budget_ms / 1000.0, 1.0, 10.0),
-                stop_window_s=max(0.4, 2.0 * float(tc.overhead_ms) / 1000.0),
+                probe_s=_clamp(0.25 * _main_budget_ms / 1000.0, 1.0, 20.0),
+                stop_window_s=max(3.0, 2.0 * float(tc.overhead_ms) / 1000.0),
             )
             if _is_hit_path and _sp_pre_drained:
+                _fsm.probe_s = min(_fsm.probe_s, 2.0)
+            elif _is_hit_path and _ph_skip_send:
                 _fsm.probe_s = min(_fsm.probe_s, 2.0)
             _fsm_fresh_pv = False
             _sp_live_fresh = False
@@ -28626,6 +29513,7 @@ def _selfplay_game(eng_sente: "_SpsaUsiEngine",
                             _fsm_fresh_pv = False
                             _fsm.state = "SEARCHING"
                             _t_think0 = _now_f
+                            _infra_intervened = True
                             dl2 = _now_f + min(
                                 budget_ms / 1000.0,
                                 max(0.05, deadline - _now_f))
@@ -28779,8 +29667,26 @@ def _selfplay_game(eng_sente: "_SpsaUsiEngine",
                         and not _bestmove_is_for_board(bestmove, _board)))
                 if _is_stale:
                     _sp_echo_seen = True
-                    _flog("[WO-3][%s] SP-echo drained (class=%s): %r"
-                          % (side, _bm_class, bestmove))
+                    _stale_miss_reissue_count += 1
+                    _flog("[WO-3][%s] SP-echo drained (class=%s, count=%d): %r"
+                          % (side, _bm_class, _stale_miss_reissue_count,
+                             bestmove))
+                    if _stale_miss_reissue_count > 5:
+                        _flog("[WO-3][%s] SP-echo cap reached (%d>5) — "
+                              "stop+flush and abandon"
+                              % (side, _stale_miss_reissue_count))
+                        try:
+                            thinker.send("stop")
+                        except Exception:
+                            pass
+                        try:
+                            thinker.flush_until_ready(timeout=5.0)
+                        except Exception:
+                            pass
+                        _infra_intervened = True
+                        bestmove = ""
+                        _ponder_hint = ""
+                        break
                     bestmove = ""
                     _ponder_hint = ""
                     if _is_hit_path:
@@ -28793,6 +29699,7 @@ def _selfplay_game(eng_sente: "_SpsaUsiEngine",
                     thinker.send(_spsa_build_go_line(
                         tc, btime_ms, wtime_ms))
                     _is_hit_path = False
+                    _infra_intervened = True
                     _nw = time.perf_counter()
                     _rs = max(0.05,
                               _main_budget_ms / 1000.0
@@ -28816,10 +29723,18 @@ def _selfplay_game(eng_sente: "_SpsaUsiEngine",
         _hit_lines_seen = 0
         _wd_fresh_seen = False
         _hit_probe_stage = 0
-        _hit_probe_s = _clamp(0.25 * _main_budget_ms / 1000.0, 1.0, 10.0)
+        _hit_probe1_lines = 0
+        _hit_isready_probed = False
+        _wd_reissue_prev_gen = None
+        _hit_probe_s = _clamp(0.25 * _main_budget_ms / 1000.0, 1.0, 20.0)
+        _hit_probe_s = min(_hit_probe_s,
+                           max(1.0, 0.10 * our_remaining / 1000.0))
         if _is_hit_path and _sp_pre_drained:
             _hit_probe_s = min(_hit_probe_s, 2.0)
+        elif _is_hit_path and _ph_skip_send:
+            _hit_probe_s = min(_hit_probe_s, 2.0)
         _hit_probe2_deadline = 0.0
+        _hit_probe1_ext_total = 0.0
         _hit_wd_base = _t_think0
         try:
             _silence_wd_s = _cfloat(_cfg, "Tuning_Silence_Watchdog_S", 120)
@@ -28828,14 +29743,60 @@ def _selfplay_game(eng_sente: "_SpsaUsiEngine",
         if _silence_wd_s > 0:
             _silence_wd_s = min(_silence_wd_s,
                                 max(10.0, 0.5 * _main_budget_ms / 1000.0))
+            _silence_wd_s = min(_silence_wd_s,
+                                max(2.0, 0.25 * our_remaining / 1000.0))
         _silence_last_t = time.perf_counter()
-        _silence_rescue_used = False
+        _silence_rescue_fired = False
         _heartbeat_interval_s = 15.0
         _heartbeat_next_t = time.perf_counter() + _heartbeat_interval_s
         _heartbeat_fail_count = 0
         _sp_live_fresh = False
+        _time_loss_grant_ms = float(
+            (tc.inc_ms if tc.kind == "fischer" else tc.byoyomi_ms)
+            + _stop_cushion_ms)
         while not bestmove and time.perf_counter() < dl2:
+            _real_wall_ms = (time.perf_counter() - _t_think0_orig) * 1000.0
+            if _real_wall_ms > our_remaining + _time_loss_grant_ms + _intervention_ms:
+                if _infra_intervened:
+                    _flog("[SPSA-W][%s] time_loss after harness rescue: real "
+                          "wall %.0fms > remaining %.0fms + grant %.0fms + "
+                          "intervention %.0fms → infra void (not θ's fault)"
+                          % (side, _real_wall_ms, our_remaining,
+                             _time_loss_grant_ms, _intervention_ms))
+                    _LIVE.reset()
+                    print("[!] %s: time forfeit after rescue — infra void"
+                          % side, flush=True)
+                    try:
+                        thinker.preserve_wedge_diag("TIMELOSS")
+                    except Exception:
+                        pass
+                    _kifu("void")
+                    _fill_info("time_loss_infra_void", {
+                        "real_wall_ms": int(_real_wall_ms),
+                        "remaining_ms": int(our_remaining),
+                        "wr_sente": _last_wr_sente},
+                        result="draw")
+                    return "draw"
+                _flog("[SPSA-W][%s] time_loss: real wall %.0fms > remaining "
+                      "%.0fms + grant %.0fms + intervention %.0fms "
+                      "(orig_t0 not rebased)"
+                      % (side, _real_wall_ms, our_remaining,
+                         _time_loss_grant_ms, _intervention_ms))
+                _LIVE.reset()
+                print("[!] %s: time forfeit (実時計超過)" % side, flush=True)
+                _result = _flag_fall_result()
+                _kifu(_result, "flag_fall")
+                _fill_info("time_loss", {
+                    "real_wall_ms": int(_real_wall_ms),
+                    "remaining_ms": int(our_remaining),
+                    "wr_sente": _last_wr_sente},
+                    result=_result)
+                return _result
             _rl_to = max(0.1, dl2 - time.perf_counter())
+            _tl_rem_s = ((our_remaining + _time_loss_grant_ms + _intervention_ms)
+                         / 1000.0 - (time.perf_counter() - _t_think0_orig))
+            if _tl_rem_s < _rl_to:
+                _rl_to = max(0.25, _tl_rem_s)
             if (_silence_wd_s > 0 and not _is_hit_path
                     and time.perf_counter() >= _heartbeat_next_t):
                 try:
@@ -28856,8 +29817,21 @@ def _selfplay_game(eng_sente: "_SpsaUsiEngine",
                     or (_hit_lines_seen > 0 and _hit_probe_stage == 0)):
                 _sil_s = time.perf_counter() - _silence_last_t
                 if _sil_s >= _silence_wd_s:
-                    if not _silence_rescue_used:
-                        _silence_rescue_used = True
+                    _sil_credit_s = min(
+                        _sil_s,
+                        max(0.0, time.perf_counter() - _t_think0_orig))
+                    _intervention_ms += _sil_credit_s * 1000.0
+                    if not _silence_rescue_fired:
+                        _sw_p = _get_proc(thinker)
+                        if ((_sw_p is not None and _sw_p.poll() is not None)
+                                or not getattr(thinker, "_alive", True)):
+                            _flog("[SPSA-W][%s] silence-watchdog: child dead "
+                                  "(poll/_alive) — skipping rescue, abandoning "
+                                  "main wait" % side)
+                            break
+                        _silence_rescue_fired = True
+                        _infra_intervened = True
+                        _t_intervention_start = time.perf_counter()
                         _flog("[SPSA-W][%s] silence-watchdog: %.1fs mute — "
                               "stop probe + reissuing position+go (one rescue)"
                               % (side, _sil_s))
@@ -28867,14 +29841,31 @@ def _selfplay_game(eng_sente: "_SpsaUsiEngine",
                             _flog("[SPSA-W][%s] silence-rescue stop send failed: %s"
                                   % (side, _sw_se))
                         time.sleep(max(0.4, 2.0 * float(tc.overhead_ms) / 1000.0))
+                        if _wd_reissue_prev_gen is None:
+                            _wd_reissue_prev_gen = thinker._go_sent
+                        _rsq_active_ms = max(
+                            0.0, (time.perf_counter() - _t_think0_orig) * 1000.0
+                            - _intervention_ms)
+                        _rsq_rem = max(0, int(our_remaining - _rsq_active_ms))
+                        _rsq_b = _rsq_rem if is_sente else btime_ms
+                        _rsq_w = wtime_ms if is_sente else _rsq_rem
                         thinker.send(pos)
-                        thinker.send(_spsa_build_go_line(tc, btime_ms, wtime_ms))
+                        thinker.send(_spsa_build_go_line(tc, _rsq_b, _rsq_w))
                         _is_hit_path = False
+                        _intervention_ms += (time.perf_counter()
+                                             - _t_intervention_start) * 1000.0
                         _t_think0 = time.perf_counter()
+                        _tl_bound_s = max(1.0,
+                                          (our_remaining + _time_loss_grant_ms
+                                           + _intervention_ms) / 1000.0
+                                          - (_t_think0 - _t_think0_orig))
                         dl2 = _t_think0 + min(budget_ms / 1000.0,
+                                              _tl_bound_s,
                                               max(0.05, deadline - _t_think0))
                         _silence_last_t = time.perf_counter()
+                        _sp_echo_prev_t = _silence_last_t
                         continue
+                    _mute_after_rescue = True
                     _flog("[SPSA-W][%s] silence-watchdog: no output for %.1fs "
                           "(>= %.0fs) — abandoning main wait (stop window next)"
                           % (side, _sil_s, _silence_wd_s))
@@ -28885,7 +29876,21 @@ def _selfplay_game(eng_sente: "_SpsaUsiEngine",
                 _now_wd = time.perf_counter()
                 if _hit_probe_stage == 0:
                     _wd_next = _hit_wd_base + _hit_probe_s
-                    if _now_wd >= _wd_next:
+                    if _now_wd >= _wd_next and not _hit_isready_probed:
+                        _hit_isready_probed = True
+                        _flog("[SPSA-W][%s] hit-watchdog: no output %.1fs after "
+                              "ponderhit — sending isready probe (non-destructive)"
+                              % (side, _now_wd - _hit_wd_base))
+                        try:
+                            thinker.send("isready")
+                        except Exception as _wd_ie:
+                            _flog("[SPSA-W][%s] hit-watchdog isready send failed: %s"
+                                  % (side, _wd_ie))
+                        if _hit_wd_base_pre_isready is None:
+                            _hit_wd_base_pre_isready = _hit_wd_base
+                        _hit_wd_base = _now_wd + 3.0 - _hit_probe_s
+                        _rl_to = _clamp(3.0, 0.1, _rl_to)
+                    elif _now_wd >= _wd_next:
                         _flog("[SPSA-W][%s] hit-watchdog: no output %.1fs after "
                               "ponderhit — sending stop probe"
                               % (side, _now_wd - _hit_wd_base))
@@ -28895,27 +29900,77 @@ def _selfplay_game(eng_sente: "_SpsaUsiEngine",
                             _flog("[SPSA-W][%s] hit-watchdog stop send failed: %s"
                                   % (side, _wd_se))
                         _hit_probe_stage = 1
+                        _hit_probe1_lines = 0
                         _hit_probe2_deadline = _now_wd + max(
-                            0.4, 2.0 * float(tc.overhead_ms) / 1000.0)
+                            5.0, 2.0 * float(tc.overhead_ms) / 1000.0)
                         _rl_to = _clamp(
                             _hit_probe2_deadline - _now_wd, 0.1, _rl_to)
                     else:
                         _rl_to = _clamp(_wd_next - _now_wd, 0.1, _rl_to)
                 elif _hit_probe_stage == 1:
                     if _now_wd >= _hit_probe2_deadline:
-                        _flog("[SPSA-W][%s] hit-watchdog: still silent after stop "
-                              "probe — child idle, reissuing position+go" % side)
+                        _ext_w = max(5.0, 2.0 * float(tc.overhead_ms) / 1000.0)
+                        _ext_cap = max(5.0, min(30.0,
+                                                0.25 * our_remaining / 1000.0))
+                        if (_hit_probe1_lines > 0
+                                and _hit_probe1_ext_total + _ext_w <= _ext_cap):
+                            _hit_probe1_ext_total += _ext_w
+                            _flog("[SPSA-W][%s] hit-watchdog: child produced "
+                                  "%d lines after stop probe — busy, not idle; "
+                                  "extending deadline (%.0fs/%.0fs used)"
+                                  % (side, _hit_probe1_lines,
+                                     _hit_probe1_ext_total, _ext_cap))
+                            _hit_probe1_lines = 0
+                            _hit_probe2_deadline = _now_wd + _ext_w
+                            _rl_to = _clamp(
+                                _hit_probe2_deadline - _now_wd, 0.1, _rl_to)
+                            continue
+                        if _hit_probe1_lines > 0:
+                            _flog("[SPSA-W][%s] hit-watchdog: busy-extension "
+                                  "cap %.0fs reached (still no bestmove) — "
+                                  "escalating to reissue" % (side, _ext_cap))
+                        else:
+                            _flog("[SPSA-W][%s] hit-watchdog: still silent after "
+                                  "stop probe — child idle, reissuing position+go"
+                                  % side)
+                        _s2_p = _get_proc(thinker)
+                        if ((_s2_p is not None and _s2_p.poll() is not None)
+                                or not getattr(thinker, "_alive", True)):
+                            _flog("[SPSA-W][%s] hit-watchdog: child dead at "
+                                  "stage2 (poll/_alive) — abandoning main wait"
+                                  % side)
+                            break
                         _hit_probe_stage = 2
+                        _infra_intervened = True
+                        _hwb_credit = (_hit_wd_base_pre_isready
+                                       if _hit_wd_base_pre_isready is not None
+                                       else _hit_wd_base)
+                        _intervention_ms += (_now_wd - _hwb_credit) * 1000.0
+                        if _wd_reissue_prev_gen is None:
+                            _wd_reissue_prev_gen = thinker._go_sent
+                        _rs2_active_ms = max(
+                            0.0, (_now_wd - _t_think0_orig) * 1000.0
+                            - _intervention_ms)
+                        _rs2_rem = max(0, int(our_remaining - _rs2_active_ms))
+                        _rs2_b = _rs2_rem if is_sente else btime_ms
+                        _rs2_w = wtime_ms if is_sente else _rs2_rem
                         thinker.send(pos)
-                        thinker.send(_spsa_build_go_line(tc, btime_ms, wtime_ms))
+                        thinker.send(_spsa_build_go_line(tc, _rs2_b, _rs2_w))
                         _is_hit_path = False
                         _flog("[SPSA-W][%s] hit-watchdog: reissue window rebased "
                               "(dead=%.0fms → fresh main=%.0fms)"
                               % (side, (_now_wd - _t_think0) * 1000.0,
                                  _main_budget_ms))
                         _t_think0 = _now_wd
+                        _tl_bound_s = max(1.0,
+                                          (our_remaining + _time_loss_grant_ms
+                                           + _intervention_ms) / 1000.0
+                                          - (_now_wd - _t_think0_orig))
                         dl2 = _now_wd + min(budget_ms / 1000.0,
+                                            _tl_bound_s,
                                             max(0.05, deadline - _now_wd))
+                        _silence_last_t = _now_wd
+                        _heartbeat_next_t = _now_wd + _heartbeat_interval_s
                         continue
                     _rl_to = _clamp(_hit_probe2_deadline - _now_wd, 0.1, _rl_to)
             line = thinker.readline(timeout=_rl_to)
@@ -28933,6 +29988,12 @@ def _selfplay_game(eng_sente: "_SpsaUsiEngine",
                     _flog("[SPSA-W][%s] reader revive limit reached" % side)
                     break
                 import queue as _rq
+                _prev_alive = getattr(thinker, "_alive", "?")
+                _prev_q_size = 0
+                try:
+                    _prev_q_size = thinker._q.qsize()
+                except Exception:
+                    pass
                 _fresh_q = _rq.Queue()
                 thinker._q = _fresh_q
                 thinker._alive = True
@@ -28953,7 +30014,8 @@ def _selfplay_game(eng_sente: "_SpsaUsiEngine",
                         _rqq.put(None)
                 threading.Thread(target=_recovery_reader, daemon=True,
                                  name="spsa_recovery_%s" % side).start()
-                _flog("[SPSA-W][%s] reader revived (%d/3)" % (side, _reader_revive_count))
+                _flog("[SPSA-W][%s] reader revived (%d/3) prev_alive=%s q_size=%d"
+                      % (side, _reader_revive_count, _prev_alive, _prev_q_size))
                 time.sleep(0.1)
                 continue
             if not line:
@@ -28966,12 +30028,36 @@ def _selfplay_game(eng_sente: "_SpsaUsiEngine",
             _silence_last_t = time.perf_counter()
             _heartbeat_next_t = _silence_last_t + _heartbeat_interval_s
             _heartbeat_fail_count = 0
+            if (_is_hit_path and _hit_probe_stage == 0 and _hit_isready_probed
+                    and _hit_lines_seen == 0 and line.strip() == "readyok"):
+                _flog("[SPSA-W][%s] hit-watchdog: bare readyok after isready "
+                      "probe — child dispatch idle (ponderhit black hole); "
+                      "escalating to stop probe now" % side)
+                _ph_bh_race_n = getattr(thinker, "_ph_bh_race_count", 0) + 1
+                thinker._ph_bh_race_count = _ph_bh_race_n
+                _flog("[PH-BH-RACE][%s] bare-readyok idle after ponderhit "
+                      "(#%d elapsed=%.1fs) — residual pipe-arrival race "
+                      "(Patch1 では閉じない window)"
+                      % (side, _ph_bh_race_n,
+                         time.perf_counter() - _t_think0))
+                try:
+                    thinker.send("stop")
+                except Exception as _wd_se2:
+                    _flog("[SPSA-W][%s] hit-watchdog stop send failed: %s"
+                          % (side, _wd_se2))
+                _hit_probe_stage = 1
+                _hit_probe1_lines = 0
+                _hit_probe2_deadline = time.perf_counter() + max(
+                    5.0, 2.0 * float(tc.overhead_ms) / 1000.0)
+                continue
             _wd_line_fresh = True
             if _is_hit_path and _hit_probe_stage == 0 and _board is not None:
                 _wd_line_fresh, _wd_fresh_seen = _line_freshness(
                     line, _board, _wd_fresh_seen)
             if _wd_line_fresh:
                 _hit_lines_seen += 1
+                if _hit_probe_stage == 1:
+                    _hit_probe1_lines += 1
             if not line.startswith("bestmove"):
                 if _is_scored_info(line) and _RE_DEPTH.search(line):
                     _adj_sm = _RE_SCORE_CP.search(line)
@@ -29055,15 +30141,117 @@ def _selfplay_game(eng_sente: "_SpsaUsiEngine",
                 continue
             if not _consume_bestmove(line):
                 continue
+            if (moves and bestmove not in ("resign", "win")
+                    and bestmove == moves[-1]):
+                _flog("[SP-GEN-DESYNC] duplicate-of-last-move echo — discarded"
+                      " (class-independent)")
+                bestmove = ""
+                _ponder_hint = ""
+                continue
             _bm_class = thinker.classify_bestmove()
+            _la_rec = getattr(thinker, "_last_rec", None)
+            _la_veto = (isinstance(_la_rec, dict)
+                        and _la_rec.get("pos_hash")
+                        and (_la_rec.get("council_winner") == bestmove
+                             or _la_rec.get("bestmove") == bestmove)
+                        and _la_rec.get("pos_hash") != _pos_hash8(pos))
+            if (_bm_class == "stale" and _wd_reissue_prev_gen is not None
+                    and thinker._bm_gen is not None
+                    and thinker._bm_gen >= _wd_reissue_prev_gen
+                    and thinker._bm_gen <= thinker._go_sent
+                    and bestmove not in ("resign", "win")
+                    and not (moves and bestmove == moves[-1])
+                    and _bestmove_is_for_board(bestmove, _board)
+                    and not _la_veto):
+                _flog("[SPSA-W][%s] late answer for pre-reissue go adopted "
+                      "(gen=%s go_sent=%s)"
+                      % (side, thinker._bm_gen, thinker._go_sent))
+                _wd_reissue_prev_gen = None
+                _bm_class = "current"
+            elif _la_veto and _bm_class == "stale" and _wd_reissue_prev_gen is not None:
+                _flog("[SPSA-W][%s] late-adopt vetoed: rec pos_hash=%s != want %s "
+                      "for %r — leaving stale (bounded drain/reissue)"
+                      % (side, _la_rec.get("pos_hash"), _pos_hash8(pos), bestmove))
+            _ca_rec = getattr(thinker, "_last_rec", None)
+            _ca_pos_mismatch = (isinstance(_ca_rec, dict)
+                                and _ca_rec.get("pos_hash")
+                                and (_ca_rec.get("council_winner") == bestmove
+                                     or _ca_rec.get("bestmove") == bestmove)
+                                and _ca_rec.get("pos_hash") != _pos_hash8(pos))
+            if (_bm_class == "current"
+                    and bestmove not in ("resign", "win")
+                    and (not _bestmove_is_for_board(bestmove, _board)
+                         or _ca_pos_mismatch)):
+                _flog("[SPSA-W][%s] current-class bestmove %r drained "
+                      "(gen-resync residue; board_illegal=%s pos_hash_mismatch=%s)"
+                      % (side, bestmove,
+                         not _bestmove_is_for_board(bestmove, _board),
+                         bool(_ca_pos_mismatch)))
+                bestmove = ""
+                _ponder_hint = ""
+                continue
             _is_stale = (_bm_class == "stale" or
                          (_bm_class == "unknown"
                           and not _bestmove_is_for_board(bestmove, _board)))
             if _is_stale:
+                _stale_miss_reissue_count += 1
+                if (not _is_hit_path
+                        and _stale_miss_reissue_count > 2
+                        and thinker._bm_gen is not None
+                        and thinker._bm_gen < thinker._go_sent
+                        and move_no >= 2
+                        and _bestmove_is_for_board(bestmove, _board)):
+                    _sa_rec = getattr(thinker, "_last_rec", None)
+                    _sa_veto = (isinstance(_sa_rec, dict)
+                                and _sa_rec.get("pos_hash")
+                                and (_sa_rec.get("council_winner") == bestmove
+                                     or _sa_rec.get("bestmove") == bestmove)
+                                and _sa_rec.get("pos_hash") != _pos_hash8(pos))
+                    if _sa_veto:
+                        _flog("[SP-GEN-DESYNC] stale acceptance vetoed: rec "
+                              "pos_hash=%s != want %s for %r — drained instead"
+                              % (_sa_rec.get("pos_hash"), _pos_hash8(pos),
+                                 bestmove))
+                    else:
+                        _flog("[SP-GEN-DESYNC] move %d: accepting stale bestmove "
+                              "%r after %d stale misses (bm_gen=%s go_sent=%s "
+                              "bm_seen=%s) — resyncing gen counters"
+                              % (move_no, bestmove, _stale_miss_reissue_count,
+                                 thinker._bm_gen, thinker._go_sent,
+                                 thinker._bm_seen))
+                        with thinker._send_lock:
+                            if thinker._bm_gen is not None:
+                                thinker._go_sent = thinker._bm_gen
+                            else:
+                                thinker._go_sent = thinker._bm_seen
+                            thinker._bm_seen = thinker._go_sent
+                        break
+                if _stale_miss_reissue_count > 5:
+                    _flog("[SPSA-W][%s] SP-echo miss cap reached (%d>5) — "
+                          "stop+flush child residue and abandon main wait "
+                          "(class=%s bm=%r)"
+                          % (side, _stale_miss_reissue_count, _bm_class,
+                             bestmove))
+                    if _sp_echo_prev_t is not None:
+                        _intervention_ms += (
+                            (time.perf_counter() - _sp_echo_prev_t) * 1000.0)
+                    try:
+                        thinker.send("stop")
+                    except Exception:
+                        pass
+                    try:
+                        thinker.flush_until_ready(timeout=5.0)
+                    except Exception as _capfe:
+                        _flog("[SPSA-W][%s] SP-echo cap flush failed: %s"
+                              % (side, _capfe))
+                    _infra_intervened = True
+                    bestmove = ""
+                    _ponder_hint = ""
+                    break
                 _sp_echo_seen = True
-                _flog("[SPSA-W][%s] SP-echo drained%s (class=%s): %r"
+                _flog("[SPSA-W][%s] SP-echo drained%s (class=%s, miss_count=%d): %r"
                       % (side, " on ponderhit" if _is_hit_path else "",
-                         _bm_class, bestmove))
+                         _bm_class, _stale_miss_reissue_count, bestmove))
                 bestmove = ""
                 _ponder_hint = ""
                 if _is_hit_path:
@@ -29072,15 +30260,29 @@ def _selfplay_game(eng_sente: "_SpsaUsiEngine",
                           "reissue)" % side)
                     _hit_lines_seen = 0
                     _wd_fresh_seen = False
+                    _hit_isready_probed = False
                     _hit_wd_base = time.perf_counter()
+                    _hit_wd_base_pre_isready = None
+                    continue
+                if thinker._go_sent > thinker._bm_seen:
+                    _flog("[SPSA-W][%s] SP-echo on miss: outstanding go exists "
+                          "(go_sent=%d bm_seen=%d miss_count=%d) — waiting "
+                          "for child response instead of reissuing"
+                          % (side, thinker._go_sent, thinker._bm_seen,
+                             _stale_miss_reissue_count))
                     continue
                 _flog("[SPSA-W][%s] SP-echo on miss: child consumed "
-                      "go with stale result — reissuing go" % side)
+                      "go with stale result — reissuing go (miss_count=%d)"
+                      % (side, _stale_miss_reissue_count))
+                _now = time.perf_counter()
+                if _sp_echo_prev_t is not None:
+                    _intervention_ms += (_now - _sp_echo_prev_t) * 1000.0
+                _sp_echo_prev_t = _now
+                _infra_intervened = True
                 thinker.send(pos)
                 thinker.send(
                     _spsa_build_go_line(tc, btime_ms, wtime_ms))
                 _is_hit_path = False
-                _now = time.perf_counter()
                 _rem_s = max(0.05,
                             _main_budget_ms / 1000.0
                             - (_now - _t_think0))
@@ -29113,6 +30315,12 @@ def _selfplay_game(eng_sente: "_SpsaUsiEngine",
                          - _elapsed_main_s - 0.05)
                 _stop_window = min(_stop_cushion_ms / 1000.0 + 2.0 * _ov_s,
                                    _rem_to_limit_s)
+                try:
+                    if thinker._go_sent > thinker._bm_seen:
+                        _stop_window = max(_stop_window,
+                                           min(5.0, _rem_to_limit_s))
+                except Exception:
+                    pass
                 if _stop_window < _ov_s:
                     _stop_window = _ov_s
                 _stop_window = min(_stop_window,
@@ -29143,6 +30351,7 @@ def _selfplay_game(eng_sente: "_SpsaUsiEngine",
                                   and not _bestmove_is_for_board(bestmove, _board)))
                     if _sw_stale:
                         _sp_echo_seen = True
+                        _infra_intervened = True
                         _flog("[SPSA-W][%s] SP-echo drained in stop window "
                               "(class=%s): %r" % (side, _sw_class, bestmove))
                         bestmove = ""
@@ -29161,7 +30370,8 @@ def _selfplay_game(eng_sente: "_SpsaUsiEngine",
                     break
         if _use_session_fsm:
             _hit_probe_stage = _fsm.probe_stage
-            _silence_rescue_used = (_fsm.probe_stage >= 1)
+            _silence_rescue_fired = (_fsm.probe_stage >= 1)
+            _infra_intervened = _infra_intervened or _silence_rescue_fired
         elapsed_ms = int((time.perf_counter() - _t_think0) * 1000)
 
         if not bestmove:
@@ -29183,9 +30393,24 @@ def _selfplay_game(eng_sente: "_SpsaUsiEngine",
                 _LIVE.reset()
                 print("[!] %s: engine process died — counted as draw" % side, flush=True)
                 _kifu("void")
-                _fill_info("worker_died")
+                _fill_info("worker_died", result="draw")
                 return "draw"
-            if elapsed_ms >= _flag_limit and _hit_probe_stage != 2:
+            if _mute_after_rescue:
+                _flog("[SPSA-W][%s] no bestmove and mute after silence-rescue "
+                      "(elapsed=%dms) → infra void (silence_mute_void)"
+                      % (side, elapsed_ms))
+                _LIVE.reset()
+                print("[!] %s: mute after rescue — infra void" % side,
+                      flush=True)
+                try:
+                    thinker.preserve_wedge_diag("MUTE")
+                except Exception:
+                    pass
+                _kifu("void")
+                _fill_info("silence_mute_void", result="draw")
+                return "draw"
+            if (elapsed_ms >= _flag_limit and _hit_probe_stage != 2
+                    and not _infra_intervened):
                 _flog("[SPSA-W][%s] flag fall (no bestmove, elapsed=%dms >= limit=%dms, tc=%s)"
                       % (side, elapsed_ms, _flag_limit, tc.kind))
                 _flog("[SPSA-W][%s] flagfall diag: remaining=%dms "
@@ -29200,9 +30425,9 @@ def _selfplay_game(eng_sente: "_SpsaUsiEngine",
                          pos))
                 _LIVE.reset()
                 print("[!] %s: time forfeit (持ち時間超過)" % side, flush=True)
-                _result = "gote_win" if is_sente else "sente_win"
+                _result = _flag_fall_result()
                 _kifu(_result, "flag_fall")
-                _fill_info("flag_fall")
+                _fill_info("flag_fall", result=_result)
                 return _result
             _flog("[SPSA-W][%s] no bestmove but within budget+cushion "
                   "(alive, elapsed=%dms / limit=%dms) → draw (case ③)"
@@ -29224,7 +30449,7 @@ def _selfplay_game(eng_sente: "_SpsaUsiEngine",
             except Exception:
                 pass
             _kifu("void")
-            _fill_info("bestmove_timeout_within_budget")
+            _fill_info("bestmove_timeout_within_budget", result="draw")
             return "draw"
 
         if tc.kind == "fischer":
@@ -29234,9 +30459,9 @@ def _selfplay_game(eng_sente: "_SpsaUsiEngine",
                       % (side, elapsed_ms, our_remaining, tc.inc_ms, tc.overhead_ms, _stop_cushion_ms))
                 _LIVE.reset()
                 print("[!] %s: time forfeit (持ち時間切れ)" % side, flush=True)
-                _result = "gote_win" if is_sente else "sente_win"
+                _result = _flag_fall_result()
                 _kifu(_result, "flag_fall")
-                _fill_info("flag_fall")
+                _fill_info("flag_fall", result=_result)
                 return _result
             new_remaining = max(0, our_remaining + tc.inc_ms - elapsed_ms)
         else:
@@ -29246,9 +30471,9 @@ def _selfplay_game(eng_sente: "_SpsaUsiEngine",
                       % (side, elapsed_ms, our_remaining, tc.byoyomi_ms, _stop_cushion_ms))
                 _LIVE.reset()
                 print("[!] %s: time forfeit (秒読み切れ)" % side, flush=True)
-                _result = "gote_win" if is_sente else "sente_win"
+                _result = _flag_fall_result()
                 _kifu(_result, "flag_fall")
-                _fill_info("flag_fall")
+                _fill_info("flag_fall", result=_result)
                 return _result
             new_remaining = our_remaining - elapsed_ms
             if new_remaining < 0:
@@ -29263,8 +30488,30 @@ def _selfplay_game(eng_sente: "_SpsaUsiEngine",
             _LIVE.reset()
             print("[!] %s: illegal move %r — counted as draw (反則負け無効)" % (side, bestmove), flush=True)
             _kifu("void")
-            _fill_info("illegal_usi", {"move": bestmove})
+            _fill_info("illegal_usi", {"move": bestmove}, result="draw")
             return "draw"
+        if (not _fast_first and move_no >= _FAST_BM_MIN_MOVE
+                and elapsed_ms < _FAST_BM_THRESHOLD_MS):
+            _fast_bm_streak += 1
+            if _fast_bm_streak >= _FAST_BM_STREAK_LIMIT:
+                _flog("[SPSA-W][%s][FAST-BM] %d consecutive moves in <%dms "
+                      "(move %d, elapsed=%dms) — sub-engine likely dead, "
+                      "voiding game"
+                      % (side, _fast_bm_streak, _FAST_BM_THRESHOLD_MS,
+                         move_no + 1, elapsed_ms))
+                _LIVE.reset()
+                print("[!] %s: abnormal fast response (%d moves in <%dms) "
+                      "— sub-engine dead?" % (side, _fast_bm_streak,
+                      _FAST_BM_THRESHOLD_MS), flush=True)
+                _kifu("void")
+                _fill_info("fast_bestmove_void", {
+                    "streak": _fast_bm_streak,
+                    "threshold_ms": _FAST_BM_THRESHOLD_MS,
+                    "move_no": move_no + 1,
+                    "elapsed_ms": elapsed_ms}, result="draw")
+                return "draw"
+        elif elapsed_ms >= _FAST_BM_THRESHOLD_MS:
+            _fast_bm_streak = 0
         if bestmove == "resign":
             if (move_no + 1) <= (12 if (_prefix == "startpos" and not _base_moves)
                                  else 6):
@@ -29274,12 +30521,13 @@ def _selfplay_game(eng_sente: "_SpsaUsiEngine",
                 print("[!] %s: 序盤投了 (move %d) を異常検出 — draw 化 "
                       "(谜投了の疑い・要 WSL reap 確認)" % (side, move_no + 1), flush=True)
                 _kifu("void")
-                _fill_info("opening_resign_void", {"move_no": move_no + 1})
+                _fill_info("opening_resign_void", {"move_no": move_no + 1},
+                           result="draw")
                 return "draw"
             _flog("[SPSA-W][%s] resign (move %d)" % (side, move_no + 1))
             _result = "gote_win" if is_sente else "sente_win"
             _kifu(_result, "resign")
-            _fill_info("resign")
+            _fill_info("resign", result=_result)
             return _result
         if bestmove == "win":
             _flog("[SPSA-W][%s] win declaration (move %d)" % (side, move_no + 1))
@@ -29287,7 +30535,7 @@ def _selfplay_game(eng_sente: "_SpsaUsiEngine",
             moves.append(bestmove)
             _kifu(_result, "win_declare")
             moves.pop()
-            _fill_info("win_declare")
+            _fill_info("win_declare", result=_result)
             return _result
 
         if _board is not None:
@@ -29308,6 +30556,7 @@ def _selfplay_game(eng_sente: "_SpsaUsiEngine",
                     _board_pre = _board.clone()
                 except Exception:
                     pass
+            _sp_last_ja = _ja_sp
             _board.push(bestmove)
             try:
                 _sp_rec = {"source": "selfplay", "council_winner": bestmove,
@@ -29349,7 +30598,11 @@ def _selfplay_game(eng_sente: "_SpsaUsiEngine",
                         _sp_rec.setdefault("council_winner", bestmove)
                         if "nnue_bestmove" not in _sp_rec:
                             _flog("[SETTLE-CARRY] nnue_bestmove not in pyfa_rec — "
-                                  "falling back to bestmove (emit gap?)")
+                                  "falling back to bestmove (emit gap?) "
+                                  "source=%s handler=%s ply=%s"
+                                  % (_sp_rec.get("_orig_source", "?"),
+                                     _sp_rec.get("handler", "?"),
+                                     move_no))
                             _sp_rec["nnue_bestmove"] = bestmove
                         _wo2_used = True
                         _flog("[LIVE-BOARD][SELFPLAY] stats loaded via pyfa_rec: "
@@ -29468,20 +30721,33 @@ def _selfplay_game(eng_sente: "_SpsaUsiEngine",
                     _sp_cp = _sp_rec["nnue_score_cp"]
                     _sp_wr_f = _cp_to_winrate(_sp_cp, _SR_WR_SLOPE)
                     _sp_wr = (_sp_wr_f if is_sente else (1.0 - _sp_wr_f)) * 100.0
-                _LIVE.show(_board, move_no=move_no + 1, last_move=_ja_sp,
+                if _sp_wr is None and isinstance(_last_wr_sente, (int, float)):
+                    _sp_wr = float(_last_wr_sente) * 100.0
+                _LIVE.show(_board, move_no=_sp_move_base + move_no + 1,
+                           last_move=_ja_sp,
                            winrate=_sp_wr,
                            sente_time=_sr_fmt_clock(btime_ms),
                            gote_time=_sr_fmt_clock(wtime_ms))
                 _zenrei_live_push(_board)
                 _LIVE.start_clock(_board, btime_ms, wtime_ms,
                                   active_sente=(not is_sente),
-                                  move_no=move_no + 1, last_move=_ja_sp,
+                                  move_no=_sp_move_base + move_no + 1,
+                                  last_move=_ja_sp,
                                   winrate=_sp_wr)
             except (KeyboardInterrupt, SystemExit, MemoryError):
                 raise
             except Exception:
                 _flog("[LIVE-BOARD][SELFPLAY] render error:\n"
                       + _safe_format_exc().strip())
+            _w = None
+            if isinstance(_sp_rec, dict):
+                _w = _sp_rec.get("council_wr_nnue")
+                if not isinstance(_w, (int, float)) and _sp_rec.get("nnue_score_cp") is not None:
+                    _w = _cp_to_winrate(_sp_rec["nnue_score_cp"], _SR_WR_SLOPE)
+            if _w is None and _adj_score_obs is not None and _adj_score_obs[0] == move_no:
+                _w = _cp_to_winrate(_adj_score_obs[1], _SR_WR_SLOPE)
+            if isinstance(_w, (int, float)):
+                _last_wr_sente = float(_w) if is_sente else 1.0 - float(_w)
             if sennichite_check and _board.is_sennichite():
                 moves.append(bestmove)
                 _verdict, _parity = _sprt_sennichite_verdict_core(
@@ -29499,18 +30765,20 @@ def _selfplay_game(eng_sente: "_SpsaUsiEngine",
                         print(_msg, flush=True)
                     _LIVE.reset()
                     _kifu(_result, "perpetual_check")
-                    _fill_info("perpetual_check", {"sennichite": True})
+                    _fill_info("perpetual_check", {"sennichite": True},
+                               result=_result)
                     return _result
-                _flog("[SPSA-W] sennichite (4-fold) → draw (move %d)" % (move_no + 1))
-                _msg4 = "[!] 千日手 (同一局面4回) — 引き分け"
+                _flog("[SPSA-W] sennichite (4-fold) → gote win (move %d)" % (move_no + 1))
+                _msg4 = "[!] 千日手 (同一局面4回) — 後手の勝ち"
                 if _sp_live_active and hasattr(_LIVE, "safe_print"):
                     _LIVE.safe_print(_msg4)
                 else:
                     print(_msg4, flush=True)
                 _LIVE.reset()
                 _kifu("draw", "sennichite")
-                _fill_info("sennichite", {"sennichite": True})
-                return "draw"
+                _fill_info("sennichite", {"sennichite": True},
+                           result="gote_win")
+                return "gote_win"
 
         moves.append(bestmove)
 
@@ -29539,37 +30807,55 @@ def _selfplay_game(eng_sente: "_SpsaUsiEngine",
                     _adj_wr_nnue = None
             _adj_dir = None
             if _adj_wr_nnue is not None and _adj_wr_dl is not None:
-                if _adj_wr_nnue >= 0.60 and _adj_wr_dl >= 0.60:
+                if _adj_wr_nnue >= _ADJ_WR_TH and _adj_wr_dl >= _ADJ_WR_TH:
                     _adj_dir = "sente"
-                elif _adj_wr_nnue <= 0.40 and _adj_wr_dl <= 0.40:
+                elif (_adj_wr_nnue <= (1.0 - _ADJ_WR_TH)
+                      and _adj_wr_dl <= (1.0 - _ADJ_WR_TH)):
                     _adj_dir = "gote"
                 else:
                     _adj_dir = "none"
             elif _adj_wr_nnue is not None:
-                if _adj_wr_nnue >= 0.70:
+                if _adj_wr_nnue >= _ADJ_WR_TH:
                     _adj_dir = "sente"
-                elif _adj_wr_nnue <= 0.30:
+                elif _adj_wr_nnue <= (1.0 - _ADJ_WR_TH):
                     _adj_dir = "gote"
                 else:
                     _adj_dir = "none"
-            if _adj_dir == "sente":
-                _adj_streak_sente += 1
-                _adj_streak_gote = 0
-            elif _adj_dir == "gote":
-                _adj_streak_gote += 1
+            if _adj_dir is None:
                 _adj_streak_sente = 0
+                _adj_streak_gote = 0
+            elif _adj_dir in ("sente", "gote"):
+                _adj_is_consecutive = (
+                    _adj_last_obs_move is not None
+                    and _adj_last_obs_move == move_no - 2)
+                if _adj_dir == "sente":
+                    if _adj_is_consecutive and _adj_streak_gote == 0:
+                        _adj_streak_sente += 1
+                    else:
+                        _adj_streak_sente = 1
+                    _adj_streak_gote = 0
+                else:
+                    if _adj_is_consecutive and _adj_streak_sente == 0:
+                        _adj_streak_gote += 1
+                    else:
+                        _adj_streak_gote = 1
+                    _adj_streak_sente = 0
+                _adj_last_obs_move = move_no
             elif _adj_dir == "none":
                 _adj_streak_sente = 0
                 _adj_streak_gote = 0
+                _adj_last_obs_move = move_no
             if _adj_streak_sente >= 2 or _adj_streak_gote >= 2:
                 _result = ("sente_win" if _adj_streak_sente >= 2
                            else "gote_win")
                 _flog("[SPSA-W][ADJUDICATE] move %d: wr_nnue=%s wr_dl=%s "
-                      "(streak s=%d g=%d) → %s"
+                      "(streak s=%d g=%d prev_obs=%s th=%.0f%%) → %s"
                       % (move_no + 1,
                          ("%.3f" % _adj_wr_nnue) if _adj_wr_nnue is not None else "—",
                          ("%.3f" % _adj_wr_dl) if _adj_wr_dl is not None else "—",
-                         _adj_streak_sente, _adj_streak_gote, _result))
+                         _adj_streak_sente, _adj_streak_gote,
+                         (_adj_last_obs_move + 1) if _adj_last_obs_move is not None else "—",
+                         _ADJ_WR_TH * 100, _result))
                 print("[!] 形勢判定終局 (move %d): %s"
                       % (move_no + 1,
                          "先手勝ち" if _result == "sente_win" else "後手勝ち"),
@@ -29578,10 +30864,10 @@ def _selfplay_game(eng_sente: "_SpsaUsiEngine",
                 _kifu(_result, "adjudication")
                 _fill_info("adjudication", {
                     "wr_nnue": _adj_wr_nnue, "wr_dl": _adj_wr_dl,
-                    "move_no": move_no + 1})
+                    "move_no": move_no + 1}, result=_result)
                 return _result
 
-        if _hit_probe_stage == 2 or _silence_rescue_used:
+        if _hit_probe_stage == 2 or _silence_rescue_fired:
             if not thinker.flush_with_stop(timeout=5.0):
                 _flog("[SPSA-W][%s] hit-watchdog: post-move barrier incomplete "
                       "(%s) — 残骸は次の flush/watchdog に委ねる"
@@ -29599,7 +30885,7 @@ def _selfplay_game(eng_sente: "_SpsaUsiEngine",
 
       _flog("[SPSA-W] draw by move limit")
       _kifu("draw", "move_limit")
-      _fill_info("move_limit")
+      _fill_info("move_limit", result="draw")
       return "draw"
     finally:
         for _eng in (eng_sente, eng_gote):
@@ -29634,6 +30920,54 @@ def _spsa_game_plan_core(global_game_idx: int, n_tc: int,
     return swap, tc_idx
 
 
+_SPSA_WSL_SUSPECT = {"flag": False}
+
+
+def _spsa_wsl_bridge_in_use() -> bool:
+    for _wb_p in {nnue_1_PATH, nnue_2_PATH}:
+        try:
+            if (_wb_p and os.path.splitext(_wb_p)[1].lower()
+                    in (".bat", ".cmd") and os.path.isfile(_wb_p)
+                    and "wsl" in open(_wb_p, "r", encoding="utf-8",
+                                      errors="replace").read().lower()):
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _spsa_wsl_health_reset(caller: str = "[FIX-WSL-CLEAN]") -> bool:
+    if not _spsa_wsl_bridge_in_use():
+        _flog("%s nnue に WSL bridge なし — shutdown/probe スキップ" % caller)
+        return True
+    _wsl_ok = (_hp_run(["wsl", "-e", "true"], 10)[0] == 0)
+    if _wsl_ok:
+        _sd_rc, _ = _hp_run(["wsl", "--shutdown"], 30)
+        _flog("%s wsl --shutdown rc=%s (clean slate)" % (caller, _sd_rc))
+        _wsl_ok = False
+        _rdy_end = time.monotonic() + 60.0
+        _rdy_n = 0
+        while time.monotonic() < _rdy_end:
+            _rdy_n += 1
+            if _hp_run(["wsl", "-e", "true"], 20)[0] == 0:
+                _wsl_ok = True
+                break
+            time.sleep(2.0)
+        _flog("[FIX-WSL-READY] shutdown 後の VM 復帰 %s (probe=%d)"
+              % ("OK" if _wsl_ok else "未確認", _rdy_n))
+    else:
+        _flog("%s wsl 無応答 — wslservice wedge 疑い。"
+              "shutdown はスキップし自己修復を試行" % caller)
+        _hp_run(["taskkill", "/F", "/IM", "wsl.exe"], 15)
+        _rs_rc, _ = _hp_run(
+            ["powershell", "-NoProfile", "-Command",
+             "Restart-Service -Name WSLService -Force"], 45)
+        _flog("[FIX-WSL-HEAL] WSLService restart rc=%s" % (_rs_rc,))
+        _wsl_ok = (_hp_run(["wsl", "-e", "true"], 30)[0] == 0)
+        _flog("[FIX-WSL-HEAL] 修復後 probe: %s" % ("OK" if _wsl_ok else "NG"))
+    return _wsl_ok
+
+
 def _spsa_builtin_worker(
     config_plus:  str,
     config_minus: str,
@@ -29658,6 +30992,15 @@ def _spsa_builtin_worker(
 
     _sente_losses = {"plus": 0, "minus": 0}
     _total_losses = {"plus": 0, "minus": 0}
+
+    if _SPSA_WSL_SUSPECT["flag"]:
+        _SPSA_WSL_SUSPECT["flag"] = False
+        _flog("[SPSA-W][FIX-WSL-ITER-RESET] 前 iteration がエンジン死で終了 — "
+              "worker 起動前に WSL 健全化を実行")
+        if not _spsa_wsl_health_reset(caller="[SPSA-W]"):
+            _flog("[SPSA-W] WSL 復旧不能 — init を試みず iteration を中止")
+            _SPSA_WSL_SUSPECT["flag"] = True
+            return None
 
     eng_plus = _SpsaUsiEngine(config_plus, stats_plus, "plus")
     eng_minus = _SpsaUsiEngine(config_minus, stats_minus, "minus")
@@ -29689,9 +31032,12 @@ def _spsa_builtin_worker(
                 _eng._wsl_reap()
             except Exception:
                 pass
+        _SPSA_WSL_SUSPECT["flag"] = True
         return None
 
     _engine_dead = False
+    _consecutive_void = 0
+    _VOID_CIRCUIT_LIMIT = 4
     for game_idx in range(games_per_iter):
         _g_global = game_offset + game_idx
         swap, _tc_idx = _spsa_game_plan_core(
@@ -29708,6 +31054,14 @@ def _spsa_builtin_worker(
                 break
             eng_plus.send("usinewgame")
             eng_minus.send("usinewgame")
+            for _sge in (eng_plus, eng_minus):
+                _sge._go_sent = 0
+                _sge._bm_seen = 0
+                _sge._last_ack_gen = None
+                _sge._bm_gen = None
+                _sge._last_rec = None
+                _sge._last_drained_bm = None
+                _sge._dup_drained_bm = False
             _ig_ok = [False, False]
             def _ig_flush(_idx, _eng):
                 if _eng.flush_until_ready(timeout=30.0):
@@ -29733,9 +31087,7 @@ def _spsa_builtin_worker(
             if _engine_dead:
                 break
 
-        _INFRA_REASONS = {"worker_died", "bestmove_timeout_within_budget",
-                          "engine_restart_failed", "illegal_usi",
-                          "opening_resign_void", "restart_storm"}
+        _INFRA_REASONS = _SPSA_INFRA_VOID_REASONS
         for _attempt in range(2):
             _ginfo: dict = {}
             result = _selfplay_game(eng_s, eng_g,
@@ -29751,11 +31103,30 @@ def _spsa_builtin_worker(
             if _attempt == 0:
                 _flog("[SPSA-W] infra-void game (reason=%s) — recover engines "
                       "and replay once" % _ginfo.get("reason"))
+                _force_restart = _ginfo.get("reason") in (
+                    "fast_bestmove_void", "silence_mute_void",
+                    "time_loss_infra_void")
                 _re_ok = [False, False]
                 def _re_flush(_idx, _eng):
-                    if not _eng.flush_until_ready(timeout=30.0):
-                        if not _eng.restart():
-                            return
+                    _need_restart = _force_restart
+                    if not _need_restart:
+                        if not _eng.flush_until_ready(timeout=30.0):
+                            _need_restart = True
+                        elif getattr(_eng, "_dup_drained_bm", False):
+                            _flog("[SPSA-W][%s] same bestmove re-drained across "
+                                  "consecutive flushes — wedged child suspected, "
+                                  "forcing restart"
+                                  % getattr(_eng, "name", "?"))
+                            _need_restart = True
+                    if _need_restart and not _eng.restart():
+                        return
+                    _eng._go_sent = 0
+                    _eng._bm_seen = 0
+                    _eng._last_ack_gen = None
+                    _eng._bm_gen = None
+                    _eng._last_rec = None
+                    _eng._last_drained_bm = None
+                    _eng._dup_drained_bm = False
                     _eng.send("usinewgame")
                     _re_ok[_idx] = True
                 _re_tp = threading.Thread(target=_re_flush, args=(0, eng_plus),
@@ -29768,6 +31139,18 @@ def _spsa_builtin_worker(
                     _engine_dead = True
                 if _engine_dead:
                     break
+
+        if (result == "draw"
+                and _ginfo.get("reason") in _INFRA_REASONS):
+            _consecutive_void += 1
+            if _consecutive_void >= _VOID_CIRCUIT_LIMIT:
+                _flog("[SPSA-W][CIRCUIT-BREAKER] %d consecutive infra-void "
+                      "draws — engine unrecoverable, aborting iteration"
+                      % _consecutive_void)
+                _engine_dead = True
+                break
+        else:
+            _consecutive_void = 0
 
         if result == "sente_win":
             if s_lbl == "plus": plus_wins  += 1
@@ -29809,6 +31192,9 @@ def _spsa_builtin_worker(
            (_pm is not None and _pm.poll() is not None):
             _engine_dead = True
 
+    if _engine_dead:
+        _SPSA_WSL_SUSPECT["flag"] = True
+
     _t_quit = time.perf_counter()
     _quit_engines(eng_plus, eng_minus, label="SPSA-W")
     _dur_update_quit("spsa-worker", (time.perf_counter() - _t_quit) / 2.0)
@@ -29836,6 +31222,17 @@ def _spsa_salvage_stats(src_path: str, side: str, game_idx: int = -1,
                 if not (isinstance(_rec, dict) and "moves" in _rec):
                     continue
                 _rec["spsa_side"] = side
+                _rts = _rec.get("ts")
+                try:
+                    if isinstance(_rts, str):
+                        _rts = time.mktime(
+                            time.strptime(_rts, "%Y-%m-%dT%H:%M:%S"))
+                except Exception:
+                    _rts = None
+                if (isinstance(_rts, (int, float)) and _SPSA_VOID_MARKS
+                        and any(abs(_rts - _vm) <= 10.0
+                                for _vm in _SPSA_VOID_MARKS)):
+                    _rec["infra_void"] = True
                 if game_idx >= 0:
                     _rec["spsa_game_idx"] = game_idx + len(_kept)
                 _kept.append(json.dumps(_rec, ensure_ascii=False))
@@ -29859,6 +31256,8 @@ def _spsa_run_match(cfg_plus: dict, cfg_minus: dict, match_cmd: str | None = Non
     import tempfile as _tmpmod2
     _match_tmpdir = _tmpmod2.mkdtemp(prefix="spsa_match_")
     stats_plus = stats_minus = ""
+    _g_salvage: list = []
+    _SPSA_RUNNER_ACTIVE[0] = True
     try:
         plus_path  = os.path.join(_match_tmpdir, "cfg_plus.json")
         minus_path = os.path.join(_match_tmpdir, "cfg_minus.json")
@@ -29893,13 +31292,14 @@ def _spsa_run_match(cfg_plus: dict, cfg_minus: dict, match_cmd: str | None = Non
                 _spsa_groups = 1
             if _spsa_groups == 1:
                 _flog("[SPSA-MATCH] no match_cmd → using built-in worker")
-                _pw, _mw = _spsa_builtin_worker(
+                _bw_ret = _spsa_builtin_worker(
                     plus_path, minus_path, stats_plus, stats_minus,
                     games_per_iter=games_per_iter,
                     timeout_s=timeout_s,
                     game_offset=game_idx,
                     _caller_manages_loop=True,
                 )
+                _pw, _mw = _bw_ret if _bw_ret is not None else (0, 0)
             else:
                 _flog("[SPSA-MATCH] parallel groups=%d games=%d"
                       % (_spsa_groups, games_per_iter))
@@ -29912,13 +31312,16 @@ def _spsa_run_match(cfg_plus: dict, cfg_minus: dict, match_cmd: str | None = Non
                     _g_sp = os.path.join(_match_tmpdir, "stats_plus_g%d.jsonl" % _gi)
                     _g_sm = os.path.join(_match_tmpdir, "stats_minus_g%d.jsonl" % _gi)
                     _g_off = game_idx + _gi * _g_size
-                    _g_results[_gi] = _spsa_builtin_worker(
+                    _g_salvage.append((_g_sp, "plus", _g_off))
+                    _g_salvage.append((_g_sm, "minus", _g_off))
+                    _g_ret = _spsa_builtin_worker(
                         plus_path, minus_path, _g_sp, _g_sm,
                         games_per_iter=_g_games,
                         timeout_s=timeout_s,
                         game_offset=_g_off,
                         _caller_manages_loop=True,
                     )
+                    _g_results[_gi] = _g_ret if _g_ret is not None else (0, 0)
                 _g_threads = []
                 for _gi in range(_spsa_groups):
                     _gt = threading.Thread(target=_run_spsa_group, args=(_gi,),
@@ -29998,8 +31401,11 @@ def _spsa_run_match(cfg_plus: dict, cfg_minus: dict, match_cmd: str | None = Non
         _flog("[SPSA-MATCH] no clear result parsed — returning 0.0")
         return 0.0
     finally:
+        _SPSA_RUNNER_ACTIVE[0] = False
         _spsa_salvage_stats(stats_plus,  "plus",  game_idx)
         _spsa_salvage_stats(stats_minus, "minus", game_idx)
+        for _gs_p, _gs_side, _gs_off in _g_salvage:
+            _spsa_salvage_stats(_gs_p, _gs_side, _gs_off)
         try:
             import shutil as _sh2
             _sh2.rmtree(_match_tmpdir, ignore_errors=True)
@@ -30493,6 +31899,8 @@ def _spsa_cli(setup_mode: bool = False):
     wins_plus = 0
     wins_minus = 0
     draws = 0
+    _consecutive_zero_iters = 0
+    _ZERO_ITER_CIRCUIT_LIMIT = 3
     _g_global_idx = state.k * games_per_iter
 
     _t_spsa_start = time.monotonic()
@@ -30527,6 +31935,9 @@ def _spsa_cli(setup_mode: bool = False):
         )
         _g_global_idx += games_per_iter
 
+        if result is None:
+            result = 0.0
+
         if result > 0:
             wins_plus += 1
             print("  → θ+ score=%.3f  (total: +%d -%d =%d)" % (result, wins_plus, wins_minus, draws), flush=True)
@@ -30536,6 +31947,18 @@ def _spsa_cli(setup_mode: bool = False):
         else:
             draws += 1
             print("  → draw/error  (total: +%d -%d =%d)" % (wins_plus, wins_minus, draws), flush=True)
+
+        if result == 0.0:
+            _consecutive_zero_iters += 1
+            if _consecutive_zero_iters >= _ZERO_ITER_CIRCUIT_LIMIT:
+                _flog("[SPSA][CIRCUIT-BREAKER] %d consecutive zero-score "
+                      "iterations — engines likely unrecoverable, aborting"
+                      % _consecutive_zero_iters)
+                print("[SPSA] %d consecutive zero-score iterations — aborting "
+                      "(state saved)" % _consecutive_zero_iters, flush=True)
+                break
+        else:
+            _consecutive_zero_iters = 0
 
         if result != 0.0:
             spsa_step(state, score=result)
@@ -30560,6 +31983,8 @@ def _spsa_cli(setup_mode: bool = False):
                     games_per_iter=_anchor_games,
                 )
                 _g_global_idx += _anchor_games
+                if _anc_result is None:
+                    _anc_result = 0.0
                 _anc_w = 1 if _anc_result > 0 else 0
                 _anc_l = 1 if _anc_result < 0 else 0
                 _anc_d = 1 if _anc_result == 0 else 0
@@ -32491,12 +33916,17 @@ def _parse_game_summary(lines: list[str]) -> dict:
     if _saw_position_block and _p_rows:
         _stm = _pos_stm or result["turn"]
         _sfen = _csa_position_block_to_sfen(_p_rows, _hand_lines, _stm)
-        if _sfen != "startpos":
-            result["sfen"] = _sfen
-            _flog(f"[CSA] 指定局面戦: Position ブロックを SFEN へ変換 → {_sfen}")
-        else:
+        _sfen_body = _sfen[5:] if _sfen.startswith("sfen ") else _sfen
+        if _sfen == "startpos":
             _flog("[CSA] Position ブロックの SFEN 変換に失敗 — startpos で続行 "
                   "(指定局面戦なら手が反則になる恐れ; 要確認)")
+        elif _sfen_body == _HIRATE_SFEN:
+            _flog("[CSA] Position ブロック = 通常初期局面 (SFEN 一致) — "
+                  "指定局面戦扱いにしない (startpos として続行)")
+        else:
+            result["sfen"] = _sfen
+            _flog(f"[CSA] 指定局面戦: Position ブロックを SFEN へ変換 → {_sfen}")
+            result["_shitei_active"] = True
     elif _saw_position_block:
         _flog("[CSA] Position ブロックを検出したが盤面段が空 — startpos で続行")
 
@@ -32738,6 +34168,8 @@ class _CsaGame:
         self.gameover   = False
         self.result      = "draw"
         self._end_reason = None
+        self._kachi_sent = False
+        self._opp_kachi_seen = False
 
         self.kifu_moves: list = []
         self._kifu_pending_comment = None
@@ -32755,10 +34187,13 @@ class _CsaGame:
             _flog(f"[CSA] kifu open failed (ignored): {_ke!r}")
         self._bm_event    = threading.Event()
         self._bm_result   = None
+        self._go_seq      = 0
+        self._go_await    = None
         self._bm_depth    = 0
         self._bm_score_cp = 0
         self._bm_pv       = ""
         self._bm_instant  = False
+        self._bm_relay_eff_s = None
 
         self._zenrei = None
         if globals().get('CSA_Zenrei_Enable', False) and _LIVE._ready():
@@ -32783,21 +34218,34 @@ class _CsaGame:
             f"[CSA-TRACE] ply={self.move_count} route={self._t_route or 'normal'} "
             f"usi={final_move} csa={csa_sent or '-'} "
             f"my_rem={self.my_remaining_ms}ms opponent_rem={self.opponent_remaining_ms}ms "
-            f"relay_cap={relay_s:.2f}s ponder={'on' if self.ponder_active else 'off'} "
+            f"relay_cap={relay_s:.2f}s "
+            f"inner_cap={('%.2fs' % self._bm_relay_eff_s) if self._bm_relay_eff_s is not None else '-'} "
+            f"ponder={'on' if self._t_route in ('ponderhit', 'pondermiss') else 'off'} "
             f"research={self._t_research}{why}"
         )
         self._t_route = ""
         self._t_research = 0
         self._t_research_why = []
 
-    def _on_bestmove(self, final_move, ponder_move, depth=0, score_cp=0, pv=""):
+    def _on_bestmove(self, final_move, ponder_move, depth=0, score_cp=0, pv="", relay_eff_s=None,
+                     adopted_wr_sente=None):
+        if self._go_await is None:
+            _flog(f"[CSA-BM-GUARD] unexpected bestmove dropped (not awaiting): "
+                  f"move={final_move!r} route={self._t_route} ply={self.move_count}")
+            return
         self._bm_result   = (final_move, ponder_move)
         self._bm_depth    = depth
         self._bm_score_cp = score_cp
         self._bm_pv       = pv or ""
         self._bm_instant  = _BESTMOVE_IS_INSTANT
-        if score_cp is not None:
-            _win_rate = _cp_to_winrate(score_cp, self.ctx.cfg.council_wr_scale_nnue)
+        self._bm_relay_eff_s = relay_eff_s
+        if isinstance(adopted_wr_sente, (int, float)):
+            with self._wr_lock:
+                self._last_sente_wr = float(adopted_wr_sente) * 100.0
+        elif score_cp is not None:
+            _gp_disp = getattr(self.ctx.game_progress, "last_game_phase", None)
+            _sl_disp, _a_disp = _win_rate_params_for_phase(_gp_disp, 'nnue', self.ctx.cfg)
+            _win_rate = _cp_to_winrate(score_cp, _sl_disp, game_phase=_gp_disp, a=_a_disp)
             with self._wr_lock:
                 self._last_sente_wr = (
                     (_win_rate if getattr(self.csa_board, "side", "b") == "b"
@@ -32814,7 +34262,9 @@ class _CsaGame:
                      getattr(self.ctx, "endgame_mode", "?"),
                      getattr(self.ctx.nnue_1, "_alive", "?") if self.ctx.nnue_1 else "None",
                      getattr(self.ctx.dl_1, "_alive", "?") if self.ctx.dl_1 else "None"))
+            self._go_await = None
             return (None, None)
+        self._go_await = None
         return self._bm_result or (None, None)
 
     def _move_relay_timeout(self) -> float:
@@ -32830,7 +34280,7 @@ class _CsaGame:
         is_byoyomi_only = (self.increment_ms == 0 and self.byoyomi_ms > 0)
         if is_byoyomi_only:
             _base = _clamp(cap_s, 2.0, timeout_s)
-            if self.my_remaining_ms <= 0 and self._turn_start_perf is not None:
+            if self._turn_start_perf is not None:
                 _byo_left_s = (self.byoyomi_ms - _move_overhead_ms
                                - self._turn_spent_ms()) / 1000.0
                 _base = _clamp(_byo_left_s, 1.0, _base)
@@ -32921,11 +34371,19 @@ class _CsaGame:
             if self._zenrei is not None:
                 _sf = self.csa_board.sfen()
                 _pl = self.csa_board.ply
-                def _zenrei_cb(sf, cnt, _game=self):
-                    _zt = _game._zenrei_panel_text()
-                    if _zt is not None and _LIVE._ready():
-                        _LIVE.set_zenrei(_zt)
-                        _LIVE._redraw()
+                def _zenrei_cb(sf, cnt, _sf_expected=_sf, _pl_expected=_pl):
+                    if not _LIVE._ready():
+                        return
+                    if _pl_expected is None or _pl_expected < _ZENREI_MIN_PLY:
+                        return
+                    if isinstance(cnt, int) and cnt > 0:
+                        _zt = "前例多数" if cnt >= 20 else ("前例約%d局" % cnt)
+                    elif isinstance(cnt, int) and cnt == 0:
+                        _zt = ""
+                    else:
+                        return
+                    _LIVE.set_zenrei(_zt)
+                    _LIVE._redraw()
                 self._zenrei.prefetch(_sf, _pl, on_complete=_zenrei_cb)
 
     def _kifu_bind_time(self, sign: str, consumed_units: int) -> None:
@@ -32968,6 +34426,11 @@ class _CsaGame:
         self._bm_event.clear()
         self._bm_result = None
         self._bm_instant = False
+        if ponder:
+            self._go_await = None
+        else:
+            self._go_seq += 1
+            self._go_await = self._go_seq
         _set_current_position(self.ctx, position_cmd)
         if ponder:
             _flog("[CSA] _dispatch_go(ponder): position dispatched, issuing go ponder")
@@ -33078,6 +34541,7 @@ class _CsaGame:
             return self._send_move_to_server(fm_r, pm_r)
         if final_move == "win":
             if self._verify_declaration_win():
+                self._kachi_sent = True
                 self._safe_send("%KACHI")
                 return False
             _flog("[CSA] engine claimed win but 27-point check FAILED — "
@@ -33288,7 +34752,25 @@ class _CsaGame:
                         try:
                             _rb = self.csa_board.clone(); _rb.apply_usi(_u)
                             _rsfen, _rply = _rb.sfen(), _rb.ply
-                            self._zenrei.prefetch(_rsfen, _rply)
+                            def _spec_zenrei_cb(sf, cnt, _expected=_rsfen, _pl_expected=_rply):
+                                if not _LIVE._ready():
+                                    return
+                                if _pl_expected is None or _pl_expected < _ZENREI_MIN_PLY:
+                                    return
+                                try:
+                                    if _zenrei_position_key(self.csa_board.sfen()) != _zenrei_position_key(_expected):
+                                        return
+                                except Exception:
+                                    return
+                                if isinstance(cnt, int) and cnt > 0:
+                                    _zt = "前例多数" if cnt >= 20 else ("前例約%d局" % cnt)
+                                elif isinstance(cnt, int) and cnt == 0:
+                                    _zt = ""
+                                else:
+                                    return
+                                _LIVE.set_zenrei(_zt)
+                                _LIVE._redraw()
+                            self._zenrei.prefetch(_rsfen, _rply, on_complete=_spec_zenrei_cb)
                         except Exception:
                             pass
                 _mine = getattr(self, "my_remaining_ms", None)
@@ -33346,6 +34828,8 @@ class _CsaGame:
                 self._bm_event.clear()
                 self._bm_result = None
                 self._bm_instant = False
+                self._go_seq += 1
+                self._go_await = self._go_seq
                 _set_current_position(self.ctx, pos_cmd)
                 self.ctx.ps.position      = pos_cmd
                 _pconf_elapsed = (
@@ -33459,11 +34943,14 @@ class _CsaGame:
     def _cleanup_search(self):
         if self.ponder_active:
             _was_set_before = self._bm_event.is_set()
+            self._go_seq += 1
+            self._go_await = self._go_seq
             _dispatch(self.ctx, "stop")
             if _was_set_before or self._bm_event.is_set():
                 self._wait_bestmove(timeout=5.0)
             else:
                 _flog("[CSA] _cleanup_search: stop drained by _handle_stop — skipping _wait_bestmove")
+                self._go_await = None
             self.ponder_active = False
             self.ponder_usi_move = None
 
@@ -33634,7 +35121,12 @@ class _CsaGame:
             "#TIME_UP": "%TIME_UP",
             "#JISHOGI": "%JISHOGI", "#MAX_MOVES": "%JISHOGI",
         }
-        _sym = _END_SYM.get(_end)
+        _kachi_involved = (getattr(self, "_kachi_sent", False)
+                           or getattr(self, "_opp_kachi_seen", False))
+        if _end == "#JISHOGI" and _kachi_involved and self.result != "draw":
+            _sym = "%KACHI"
+        else:
+            _sym = _END_SYM.get(_end)
         if _sym:
             end_lines.append(_sym)
         end_lines.append("$END_TIME:" + time.strftime("%Y/%m/%d %H:%M:%S"))
@@ -33755,6 +35247,13 @@ class _CsaGame:
                 self.gameover = True
                 break
 
+            if ls == "%KACHI":
+                if not self._kachi_sent:
+                    self._opp_kachi_seen = True
+                    _flog("[CSA] opponent declared %KACHI "
+                          "(kifu will record %KACHI on #JISHOGI)")
+                continue
+
             csa_move, consumed_s, sign = _parse_csa_move_line(ls)
             if csa_move is None:
                 continue
@@ -33772,6 +35271,16 @@ class _CsaGame:
                     self.gameover = True
                     break
                 self._update_clock("opponent", consumed_s)
+                try:
+                    _opp_s = float(int(consumed_s) * self.time_unit_ms) / 1000.0
+                    if 0.2 <= _opp_s <= 600.0:
+                        _prev_ema = _DLPONDER_STATE.get("opponent_s_ema")
+                        _DLPONDER_STATE["opponent_s_ema"] = _dlponder_ema(_prev_ema, _opp_s)
+                        _flog(f"[DLP-EMA CSA] T={consumed_s} opp_s={_opp_s:.2f}s "
+                              f"ema {_prev_ema if _prev_ema is None else f'{_prev_ema:.2f}'}→"
+                              f"{_DLPONDER_STATE['opponent_s_ema']:.2f}s")
+                except Exception as _ie:
+                    _flog(f"[ignored] DLP-EMA CSA update: {_ie!r}")
                 cont = self._on_opponent_move(usi_opp)
                 self._kifu_bind_time(self.opponent_turn, consumed_s)
                 if not cont:
@@ -33802,6 +35311,12 @@ class _CsaGame:
                         "#JISHOGI": "jishogi", "#MAX_MOVES": "move_limit",
                     }
                     _sfen_reason = _CSA_REASON_MAP.get(self._end_reason, "resign")
+                    _kachi_involved = (getattr(self, "_kachi_sent", False)
+                                       or getattr(self, "_opp_kachi_seen", False))
+                    if (self._end_reason == "#JISHOGI"
+                            and _kachi_involved
+                            and self.result != "draw"):
+                        _sfen_reason = "win_declare"
                     if self.result == "win":
                         _sfen_result = "sente_win" if self.turn == "+" else "gote_win"
                     elif self.result == "lose":
@@ -33944,6 +35459,16 @@ def _csa_main(args: list, existing_ctx=None) -> None:
     port     = _ns.port     or _p_port
     login_id = _ns.id       or _p_id
     password = _ns.password or _p_pw
+    if _ns.id:
+        _flog(f"[LOGIN-ID-SETUP] login_id={login_id!r} source=argv(--id)")
+    elif login_id == _CONFIG_DEFAULTS.get("Floodgate_ID"):
+        _flog(f"[LOGIN-ID-SETUP] login_id={login_id!r} source=_CONFIG_DEFAULTS "
+              f"(line 4703) — setup_config.txt / config.txt / --id いずれも "
+              f"Floodgate_ID を供給していない。恒久変更したい場合は setup_config.txt "
+              f"に \"Floodgate_ID\": \"<name>\" を追記。")
+    else:
+        _flog(f"[LOGIN-ID-SETUP] login_id={login_id!r} source=merged _cfg "
+              f"(setup_config.txt or spsa_config.txt or config.txt)")
     _game_name = str(_cfg.get("Floodgate_Game_Name", _CONFIG_DEFAULTS["Floodgate_Game_Name"]))
     password = _csa_build_login_password_core(password, _game_name, _is_floodgate)
     if _is_floodgate:
@@ -34061,6 +35586,7 @@ def _csa_main(args: list, existing_ctx=None) -> None:
                         continue
 
                     ctx.book_state.turn_hint = game_info.get("turn", "")
+                    ctx.shitei_active = bool(game_info.get("_shitei_active"))
 
                     _dispatch(ctx, "usinewgame")
                     global _draw_ply
@@ -38842,12 +40368,12 @@ def _excepthook_to_diagnosis(exc_type, exc_value, exc_tb):
 
 def _cli_game(rest):
     if _ensure_prereqs("game", rest):
-        _csa_main(_strip_skip(rest))
+        _csa_main(_strip_prereq_tokens(rest))
 
 def _cli_spsa(rest):
     if not _ensure_prereqs("spsa", rest):
         return
-    _spsa_extra = _strip_skip(rest)
+    _spsa_extra = _strip_prereq_tokens(rest)
     _state_path = os.path.join(_BASE_DIR, "spsa_state.txt")
     _spsa_argv = [sys.argv[0], "--spsa", "--run"] + _spsa_extra
     if os.path.exists(_state_path) and "--resume" not in _spsa_extra:
