@@ -3317,9 +3317,24 @@ if _IS_FROZEN:
     _ENGINES_DIR = os.path.dirname(os.path.dirname(sys.executable))
 else:
     _ENGINES_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-_DEFAULT_DL_1_PATH   = os.path.join(_ENGINES_DIR, "DL 1", "engine")
+_DL_ENGINE_BASENAME  = "engine.bat" if sys.platform == "win32" else "engine"
+
+
+def _dl_engine_file(_dir):
+    if sys.platform == "win32":
+        _bat = os.path.join(_dir, "engine.bat")
+        if os.path.isfile(_bat):
+            return _bat
+        _exe = os.path.join(_dir, "engine.exe")
+        if os.path.isfile(_exe):
+            return _exe
+        return _bat
+    return os.path.join(_dir, "engine")
+
+
+_DEFAULT_DL_1_PATH   = _dl_engine_file(os.path.join(_ENGINES_DIR, "DL 1"))
 _DEFAULT_nnue_1_PATH = os.path.join(_ENGINES_DIR, "nnue 1", "engine")
-_DEFAULT_DL_2_PATH       = os.path.join(_ENGINES_DIR, "DL 2", "engine")
+_DEFAULT_DL_2_PATH       = _dl_engine_file(os.path.join(_ENGINES_DIR, "DL 2"))
 _DEFAULT_nnue_2_PATH = os.path.join(_ENGINES_DIR, "nnue 2", "engine")
 _POOL_LETTERS = "abcdefghijklmnopqrstuvwxyz"
 
@@ -3330,7 +3345,7 @@ def _pool_letter_index(ch: str) -> int:
     ch = _norm_str(ch)
     return _POOL_LETTERS.index(ch) if len(ch) == 1 and ch in _POOL_LETTERS else -1
 
-_DEFAULT_DL_POOL = {k: os.path.join(_ENGINES_DIR, f"DL {i}", "engine")
+_DEFAULT_DL_POOL = {k: _dl_engine_file(os.path.join(_ENGINES_DIR, f"DL {i}"))
                     for i, k in enumerate("abcdef", 1)}
 _DEFAULT_NNUE_POOL = {
     "a": os.path.join(_ENGINES_DIR, "nnue 1", "engine"),
@@ -3819,7 +3834,7 @@ _CONFIG_DEFAULTS = {
     "ARB1_Prestart_Timeout_S":         6.0,
     "ARB1_NNUE1_Burst_Threads":        1,
     "Resource_RAM_Use_Available":      True,
-    "Resource_RAM_Safety_Margin_MB":   4096,
+    "Resource_RAM_Safety_Margin_MB":   6144,
     "Resource_RAM_Budget_Pct":         1.0,
     "Resource_Threads_Budget_Pct":     1.0,
     "Resource_Reserved_MB":            1536,
@@ -3834,7 +3849,7 @@ _CONFIG_DEFAULTS = {
     "Tuning_Silence_Watchdog_S":       120,
     "Threads_Physical_Cap":            False,
     "Monitor_Interval_S":              60,
-    "Monitor_Low_Ram_Warn_MB":         4096,
+    "Monitor_Low_Ram_Warn_MB":         6144,
     "Revive_Max_Attempts":             2,
     "Revive_Cooldown_S":               45.0,
     "ARB1_NNUE2_Hash":                 1024,
@@ -4451,7 +4466,7 @@ _params = {
     "POLICY_NODES": _cint(_cfg, "POLICY_NODES", 2043),
 }
 
-_RESOURCE_THREADS_SPARE_MIN = _cint(_cfg, "Resource_Threads_Spare_Min", 2)
+_RESOURCE_THREADS_SPARE_MIN = _cint(_cfg, "Resource_Threads_Spare_Min", 4)
 _RESOURCE_RAM_SAFETY_MARGIN_MB = _cint(_cfg, "Resource_RAM_Safety_Margin_MB", 4096)
 
 _PONDER_NEVER = {
@@ -4840,6 +4855,56 @@ _VRAM_PROBE_OK_ONCE = [False]
 
 _DIRECTML_SHARED_RAM = False
 
+_NVSMI_PATH = [None]
+
+
+def _env_int(name):
+    try:
+        _v = os.environ.get(name)
+        return int(_v) if _v not in (None, "") else None
+    except Exception:
+        return None
+
+
+def _env_flag(name):
+    _v = os.environ.get(name)
+    if _v in (None, ""):
+        return None
+    return _v.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _resolve_nvidia_smi():
+    if _NVSMI_PATH[0] is not None:
+        return _NVSMI_PATH[0]
+    import shutil
+    _forced = os.environ.get("PYFAMATE_NVIDIA_SMI")
+    _cands = [_forced] if _forced else []
+    _hit = shutil.which("nvidia-smi")
+    if _hit:
+        _cands.append(_hit)
+    if os.name == "nt":
+        _sysroot = os.environ.get("SystemRoot", r"C:\Windows")
+        _cands.append(os.path.join(_sysroot, "System32", "nvidia-smi.exe"))
+        for _pf in (os.environ.get("ProgramFiles", r"C:\Program Files"),
+                    os.environ.get("ProgramW6432", r"C:\Program Files")):
+            _cands.append(os.path.join(_pf, "NVIDIA Corporation",
+                                       "NVSMI", "nvidia-smi.exe"))
+        _cuda = os.environ.get("CUDA_PATH")
+        if _cuda:
+            _cands.append(os.path.join(_cuda, "bin", "nvidia-smi.exe"))
+    else:
+        _cands += ["/usr/bin/nvidia-smi", "/usr/local/nvidia/bin/nvidia-smi",
+                   "/usr/local/bin/nvidia-smi", "/opt/conda/bin/nvidia-smi"]
+    for _c in _cands:
+        try:
+            if _c and os.path.isfile(_c):
+                _NVSMI_PATH[0] = _c
+                return _c
+        except Exception:
+            continue
+    _NVSMI_PATH[0] = "nvidia-smi"
+    return "nvidia-smi"
+
 
 def _sys_vram_info(timeout_s=2.0):
     if _VRAM_PROBE_DISABLED[0]:
@@ -4848,7 +4913,7 @@ def _sys_vram_info(timeout_s=2.0):
         return None, None
     try:
         out = subprocess.run(
-            ["nvidia-smi", "--query-gpu=memory.total,memory.used",
+            [_resolve_nvidia_smi(), "--query-gpu=memory.total,memory.used",
              "--format=csv,noheader,nounits"],
             capture_output=True, text=True, timeout=timeout_s)
         if out.returncode != 0 or not out.stdout.strip():
@@ -4871,7 +4936,7 @@ def _sys_gpu_util(timeout_s=2.0):
         return None
     try:
         out = subprocess.run(
-            ["nvidia-smi", "--query-gpu=utilization.gpu",
+            [_resolve_nvidia_smi(), "--query-gpu=utilization.gpu",
              "--format=csv,noheader,nounits"],
             capture_output=True, text=True, timeout=timeout_s)
         if out.returncode != 0 or not out.stdout.strip():
@@ -4889,12 +4954,19 @@ def _sys_gpu_count(timeout_s=2.0):
         return 1
     if _GPU_COUNT[0] is not None:
         return _GPU_COUNT[0]
+    _forced_n = _env_int("PYFAMATE_GPU_COUNT")
+    if _forced_n and _forced_n > 0:
+        _GPU_COUNT[0] = _clamp(_forced_n, 1, 16)
+        _flog(f"[GPU-DETECT] GPU 数を環境変数で強制: {_GPU_COUNT[0]} "
+              "(PYFAMATE_GPU_COUNT)")
+        return _GPU_COUNT[0]
     n = 1
     if not _VRAM_PROBE_DISABLED[0]:
         for _gp_try in range(2):
             try:
                 out = subprocess.run(
-                    ["nvidia-smi", "--query-gpu=index", "--format=csv,noheader"],
+                    [_resolve_nvidia_smi(), "--query-gpu=index",
+                     "--format=csv,noheader"],
                     capture_output=True, text=True, timeout=max(timeout_s, 10.0))
                 if out.returncode == 0:
                     _lines = [ln for ln in out.stdout.splitlines() if ln.strip()]
@@ -5174,7 +5246,12 @@ if not _MP_LIGHT_IMPORT:
                   f"{_rb_dl_cpu_reserve}MB を予約に上乗せ "
                   f"(models={_rb_dl_model_mbs or 'n/a→fallback'} "
                   f"factor={_cfg.get('Resource_DL_CPU_Reserve_Factor', 2.5)})")
-    if _VRAM_PROBE_DISABLED[0] and os.name == "nt" and _rb_basis_mb is not None:
+    _dml_override = _env_flag("PYFAMATE_FORCE_CUDA")
+    if _dml_override is None:
+        _dml_override = _env_flag("PYFAMATE_NO_DIRECTML")
+    _gpu_asserted = bool(_env_int("PYFAMATE_GPU_COUNT")) or _sys_gpu_count() > 1
+    if (_VRAM_PROBE_DISABLED[0] and os.name == "nt" and _rb_basis_mb is not None
+            and not _dml_override and not _gpu_asserted):
         _DIRECTML_SHARED_RAM = True
         _rb_basis_old = _rb_basis_mb
         _rb_basis_mb = _rb_basis_mb // 2
@@ -5279,7 +5356,7 @@ if not _MP_LIGHT_IMPORT:
             try:
                 _vt_check, _vu_check = _sys_vram_info()
                 if _vt_check is not None and _vu_check is not None:
-                    _vram_tight = (_vu_check / _vt_check) < 0.15
+                    _vram_tight = ((_vt_check - _vu_check) / _vt_check) < 0.15
             except Exception:
                 pass
         for _ds_slot, (_ds_thr, _ds_bat) in _dl_scale.items():
@@ -5359,7 +5436,7 @@ if not _MP_LIGHT_IMPORT:
 
 def _build_dl_opts(slot_prefix, ponder_opts, mcts_opts=None, *,
                    model_override=None, multipv=None,
-                   pv_mate_threads=None):
+                   pv_mate_threads=None, replicate=True):
     opts = {
         "DNN_Model1":             model_override or str(_cfg[f"{slot_prefix}_DNN_Model1"]),
         "DNN_Batch_Size1":        str(_cfg[f"{slot_prefix}_DNN_Batch_Size1"]),
@@ -5369,7 +5446,7 @@ def _build_dl_opts(slot_prefix, ponder_opts, mcts_opts=None, *,
         "MultiPV":                multipv if multipv is not None else "1",
     }
     _ngpu = _sys_gpu_count()
-    if _ngpu and _ngpu > 1:
+    if replicate and _ngpu and _ngpu > 1:
         _per = (("DNN_Model", opts["DNN_Model1"]),
                 ("DNN_Batch_Size", opts["DNN_Batch_Size1"]),
                 ("UCT_Threads", opts["UCT_Threads1"]))
@@ -5862,6 +5939,7 @@ _dl_2_opts = _build_dl_opts(
 
 _dl_3_opts = _build_dl_opts(
     "DL_3", _DL3_PONDER_OPTS, _dl_3_mcts_opts,
+    replicate=False,
 )
 
 
@@ -6695,8 +6773,11 @@ class USIEngine:
             with self._send_lock:
                 if self.proc.stdin and not self.proc.stdin.closed:
                     self.proc.stdin.close()
+        except OSError as _fe:
+            if self.proc.poll() is None:
+                _flog(f"[{self.name}] quit: stdin.close() failed on live child: {_fe!r}")
         except Exception as _fe:
-            _flog(f"[ignored] {__file__}:1781: {_fe}")
+            _flog(f"[{self.name}] quit: stdin.close() unexpected: {_fe!r}")
         try:
             self.proc.wait(timeout=15)
             _flog(f"[{self.name}] quit: graceful exit (rc={self.proc.returncode})")
@@ -9131,7 +9212,8 @@ def _parse_go_clock_base(go_line, our_side_ply=None, cfg=None):
             and remaining_ms > 0 and inc_ms > 0:
         cap_s = (remaining_ms * _eff_s_fischer_cap_ratio) / 1000.0
         if inc_ms > 0:
-            _fischer_cap_floor_s = (inc_ms / 1000.0) * 0.8
+            _fischer_cap_floor_s = min((inc_ms / 1000.0) * 0.8,
+                                       remaining_ms / 1000.0)
             cap_s = max(cap_s, _fischer_cap_floor_s)
         if eff_s > cap_s:
             _dlog(f"_parse_go_clock: eff_s {eff_s:.2f}s -> {cap_s:.2f}s "
@@ -10913,7 +10995,7 @@ def _override_ponder_core(final_move, pv_lines):
     return cand
 
 
-_SFEN_HEADER_RE = re.compile(r"\bsfen\s+\S+\s+([bw])\s+\S+\s+(\d+)")
+_SFEN_HEADER_RE = re.compile(r"\bsfen\s+\S+\s+([bw])\s+\S+(?:\s+(\d+))?")
 
 def _count_moves(position_cmd):
     head, sep, tail = position_cmd.partition(" moves ")
@@ -10922,7 +11004,8 @@ def _count_moves(position_cmd):
     m = _SFEN_HEADER_RE.search(head)
     if not m:
         return n_moves
-    stm, move_n = m.group(1), int(m.group(2))
+    stm = m.group(1)
+    move_n = int(m.group(2)) if m.group(2) else 1
     plies_anchor = (move_n - 1) + ((stm == "b") != ((move_n - 1) % 2 == 0))
     return plies_anchor + n_moves
 
@@ -11595,6 +11678,7 @@ def relay_until_bestmove(eng, timeout=120, intercept_bestmove=False,
                     _flog(f"relay_until_bestmove: no bestmove after stop — "
                           f"{eng.name} は生存。kill せず空で返す "
                           f"(SP ponderhit idle とみなし呼び出し側で再探索)")
+                    nnue_info["score_stale"] = True
                     break
                 _probe_to = _clamp(_stop_window, _move_overhead_s, 2.0 * _move_overhead_s)
                 if eng._alive and eng.flush_until_ready(timeout=_probe_to, max_stale_lines=200):
@@ -11626,6 +11710,7 @@ def relay_until_bestmove(eng, timeout=120, intercept_bestmove=False,
                           f"{eng.name} is responsive (isready→readyok, probe={_probe_to:.2f}s) — "
                           f"idle とみなし kill せず温存 (呼び出し側で再探索, "
                           f"empty_streak={eng._empty_relay_streak})")
+                    nnue_info["score_stale"] = True
                     break
                 _flog(f"relay_until_bestmove: no bestmove AND unresponsive "
                       f"(isready→readyok 失敗) — killing {eng.name}")
@@ -11668,6 +11753,7 @@ def relay_until_bestmove(eng, timeout=120, intercept_bestmove=False,
             if _relay_idle_now():
                 if _idle_suspect:
                     nnue_info["relay_idle_exit"] = True
+                    nnue_info["score_stale"] = True
                     nnue_info["relay_elapsed_s"] = (
                         time.perf_counter() - _t_start)
                     _flog(f"relay_until_bestmove: {eng.name} structurally idle "
@@ -13435,7 +13521,21 @@ def _restart_nnue_impl(ctx, caller, *, slot, readyok_timeout=None, async_launch=
             _flog(f"[ignored] _restart_nnue_impl: {_ie!r}")
         _t_cold_start = time.perf_counter()
         eng.start()
-        eng.initialize(opts)
+        _restart_opts = opts
+        try:
+            _h_orig = int(opts.get(opts_key, "0"))
+            _HASH_CLEAR_MB_PER_S = 3000
+            _h_safe = int(readyok_timeout * 0.6 * _HASH_CLEAR_MB_PER_S)
+            if _h_orig > 0 and _h_safe > 0 and _h_orig > _h_safe:
+                _h_clamped = max(64, _h_safe)
+                _flog(f"{caller}: [RESTART-HASH-CLAMP] Hash {_h_orig} -> {_h_clamped}MB "
+                      f"(readyok_timeout={readyok_timeout:.1f}s clear_budget="
+                      f"{readyok_timeout*0.6:.1f}s throughput={_HASH_CLEAR_MB_PER_S}MB/s)")
+                _restart_opts = dict(opts)
+                _restart_opts[opts_key] = str(_h_clamped)
+        except Exception:
+            pass
+        eng.initialize(_restart_opts)
         result = eng.wait_for("readyok", timeout=readyok_timeout)
         if result is not None:
             _dur_update_cold_start(slot, time.perf_counter() - _t_cold_start)
@@ -13450,7 +13550,7 @@ def _restart_nnue_impl(ctx, caller, *, slot, readyok_timeout=None, async_launch=
         eng.send("usinewgame")
         _flog(f"{caller}: {label} restarted OK")
         try:
-            _h_boot = int(opts.get(opts_key, "0"))
+            _h_boot = int(_restart_opts.get(opts_key, "0"))
             if _h_boot > 0:
                 eng._dyn_hash_last = _h_boot
                 eng._dyn_hash_avail0 = None
@@ -18787,6 +18887,7 @@ def _wait_revive_nnue_and_move(ctx, caller="emergency", deadline_s=None):
             _pm, _ni = relay_until_bestmove(
                 _eng, timeout=_move_ms / 1000.0 + min(1.0, _budget * 0.1),
                 intercept_bestmove=True,
+                kill_on_empty=False,
                 slow_mover_opts=_opts)
         except Exception as _se:
             _flog(f"[WAIT-REVIVE] {_slot} search raised: {_se}")
@@ -21199,6 +21300,16 @@ _CHILD_ENG_LOCK_MAP = {
     "mate_solver": (None, "mate_solver_lock"),
 }
 
+_DL_RESTART_RAM_FLOOR_MB = 2048
+
+
+def _dl_restart_ram_critical():
+    try:
+        _av = _mon_avail_mb
+        return _av is not None and _av < _DL_RESTART_RAM_FLOOR_MB
+    except Exception:
+        return False
+
 
 def _restart_child_async(ctx, slot, caller):
     if slot == "dl_2" and not ctx.cfg.dl_2_enable:
@@ -21640,8 +21751,19 @@ def _handle_go(ctx, line):
         _clock_base, _fischer_cap, _dl_skip = _parse_go_clock_base(line, move_count, cfg=ctx.cfg)
     _eff_s_go = _clock_base.eff_s if (_clock_base is not None and _clock_base.eff_s > 0) else 0.0
     if _dl_ponder_enable:
+        _t_drain_start = time.perf_counter()
         _harvest_mp_alt_on_go(ctx, eff_s=_eff_s_go)
         _stop_dl_ponders(ctx, "go ponder-miss/fresh-go", eff_s=_eff_s_go)
+        _drain_elapsed_s = max(0.0, time.perf_counter() - _t_drain_start)
+        if (_drain_elapsed_s > 0.05 and _clock_base is not None
+                and _clock_base.eff_s > 0):
+            _drain_floor_s = max(_clock_base.floor_ms / 1000.0, 0.05)
+            _new_eff_s = max(_drain_floor_s, _clock_base.eff_s - _drain_elapsed_s)
+            if _new_eff_s < _clock_base.eff_s:
+                _flog("[FIX-DRAIN-BUDGET] eff_s %.2f→%.2fs (DL drain %.2fs 控除)"
+                      % (_clock_base.eff_s, _new_eff_s, _drain_elapsed_s))
+                _clock_base = _clock_base._replace(eff_s=_new_eff_s)
+                _eff_s_go = _new_eff_s
     _mate_ponder_cancel(ctx, "go")
     if getattr(ctx.ps, "nnue1_ponder_sent", False):
         _stop_nnue_ponders(ctx, "go fresh-go nnue-drain")
@@ -21736,12 +21858,13 @@ def _handle_go(ctx, line):
         _clock_base, _fischer_cap, _dl_skip = _parse_go_clock_base(line, move_count, cfg=ctx.cfg)
 
     _restart_timeout = None if is_infinite else _restart_child_budget_s(_clock_base)
-    if not ctx.dl_1._alive:
-        _restart_child(ctx, "dl_1", "go", readyok_timeout=_restart_timeout)
-    if ctx.cfg.dl_2_enable and ctx.dl_2 is not None and not ctx.dl_2._alive:
-        _restart_child(ctx, "dl_2", "go", readyok_timeout=_restart_timeout)
-    if ctx.dl_3 is not None and not ctx.dl_3._alive:
-        _restart_child(ctx, "dl_3", "go", readyok_timeout=_restart_timeout)
+    if not _dl_skip and not _dl_restart_ram_critical():
+        if not ctx.dl_1._alive:
+            _restart_child_async(ctx, "dl_1", "go")
+        if ctx.cfg.dl_2_enable and ctx.dl_2 is not None and not ctx.dl_2._alive:
+            _restart_child_async(ctx, "dl_2", "go")
+        if ctx.dl_3 is not None and not ctx.dl_3._alive:
+            _restart_child_async(ctx, "dl_3", "go")
 
     ctx.game_progress.book_seed_move   = None
     ctx.game_progress.book_seed_weight = 0.0
@@ -21996,10 +22119,17 @@ def _ponderhit_restart_nnue1_and_movetime(ctx, position_cmd, move_count, eff_s,
                                     apply_slowmover=True, relay_kwargs=None,
                                     go_clock=None):
     _phit_trace("restart", who=restart_caller)
-    _restart_nnue_1(ctx, restart_caller)
+    _rec_rem_ms = _ph_recovery_rem_ms(clock_rem_ms)
+    _rec_readyok_to = (_clamp(_rec_rem_ms / 1000.0 * 0.5, 0.5, 30.0)
+                       if _rec_rem_ms is not None else None)
+    _restart_nnue_1(ctx, restart_caller, readyok_timeout=_rec_readyok_to)
     if not ctx.nnue_1._alive:
         return None
+    _rec_rem_ms = _ph_recovery_rem_ms(clock_rem_ms)
     _movetime_ms = max(500, int(eff_s * 200))
+    if _rec_rem_ms is not None:
+        _movetime_ms = int(_clamp(_rec_rem_ms - _move_overhead_ms - 300,
+                                  300, _movetime_ms))
     if apply_slowmover and ponder_line is not None:
         _apply_slow_mover(ctx.nnue_1, _nnue_1_opts,
                           ctx.cfg.nnue_slowmover_user_set,
@@ -22007,9 +22137,14 @@ def _ponderhit_restart_nnue1_and_movetime(ctx, position_cmd, move_count, eff_s,
                           eff_s=eff_s, cfg=ctx.cfg)
     ctx.nnue_1.send(position_cmd)
     ctx.nnue_1.send("go movetime %d" % _movetime_ms)
-    _kwargs = dict(timeout=_movetime_ms / 1000.0 + 3.0,
+    _relay_to = _movetime_ms / 1000.0 + 3.0
+    if _rec_rem_ms is not None:
+        _relay_to = min(_relay_to, max(0.3, _rec_rem_ms / 1000.0 - _move_overhead_s))
+    _kwargs = dict(timeout=_relay_to,
                    intercept_bestmove=True,
-                   eff_s=eff_s, go_clock=go_clock)
+                   eff_s=eff_s, go_clock=go_clock,
+                   remaining_ms=(max(1, int(_rec_rem_ms))
+                                 if _rec_rem_ms is not None else None))
     if relay_kwargs:
         _kwargs.update(relay_kwargs)
     return relay_until_bestmove(ctx.nnue_1, **_kwargs)
@@ -22546,9 +22681,16 @@ def _ponderhit_handle_cache_hit(ctx, position_cmd, move_count, ponderhit_pv_hold
                 go_clock=go_clock,
                 kill_on_empty=False)
         else:
-            _ponderhit_ponder_line = ctx.ps.ponder_line or ctx.ps.go_line or "go movetime 1000"
-            if _ponderhit_ponder_line.startswith("go ponder "):
-                _ponderhit_ponder_line = "go " + _ponderhit_ponder_line[10:]
+            _eg_pc = getattr(ctx.ps, "ponder_clock", None)
+            _eg_clock_src = (_eg_pc.patched_line if (_eg_pc is not None
+                             and getattr(_eg_pc, "patched_line", None)) else None)
+            _eg_clock_tok = _extract_clock_tokens(_eg_clock_src) if _eg_clock_src else ""
+            if _eg_clock_tok:
+                _ponderhit_ponder_line = "go " + _eg_clock_tok
+            else:
+                _ponderhit_ponder_line = ctx.ps.ponder_line or ctx.ps.go_line or "go movetime 1000"
+                if _ponderhit_ponder_line.startswith("go ponder "):
+                    _ponderhit_ponder_line = "go " + _ponderhit_ponder_line[10:]
             _apply_slow_mover(_eng, _nnue_1_opts,
                               ctx.cfg.nnue_slowmover_user_set, "nnue_1-ph-cache", eff_s=eff_s, cfg=ctx.cfg)
             _eng.send(position_cmd)
@@ -22572,11 +22714,24 @@ def _ponderhit_handle_cache_hit(ctx, position_cmd, move_count, ponderhit_pv_hold
             _flog("[PH-CACHE-HIT] endgame relay returned empty bestmove "
                   "(eng=%s alive=%s) — restart + re-search" % (_eng.name, _eng._alive))
             if not _eng._alive:
-                _restart_nnue_1(ctx, "ponderhit-cache-hit-nnue-only-recovery")
+                _eg_ro_rem_ms = _ph_recovery_rem_ms(_clock_rem_ms)
+                _eg_readyok_to = (_clamp(_eg_ro_rem_ms / 1000.0 * 0.5, 0.5, 30.0)
+                                  if _eg_ro_rem_ms is not None else None)
+                _restart_nnue_1(ctx, "ponderhit-cache-hit-nnue-only-recovery",
+                                readyok_timeout=_eg_readyok_to)
             if _eng._alive:
+                _eg_rec_rem_ms = _ph_recovery_rem_ms(_clock_rem_ms)
                 _eng.send("stop")
+                _eg_drain_to = _stop_drain_timeout_safe(ctx, eff_s)
+                if _eg_rec_rem_ms is not None:
+                    _eg_drain_to = min(
+                        _eg_drain_to,
+                        max(0.3, _eg_rec_rem_ms / 1000.0 - _move_overhead_s))
                 relay_until_bestmove(_eng,
-                                     timeout=_stop_drain_timeout_safe(ctx, eff_s),
+                                     timeout=_eg_drain_to,
+                                     remaining_ms=(max(1, int(_eg_rec_rem_ms))
+                                                   if _eg_rec_rem_ms is not None
+                                                   else None),
                                      intercept_bestmove=True,
                                      kill_on_empty=False)
                 if not _eng.flush_until_ready(
@@ -22593,7 +22748,12 @@ def _ponderhit_handle_cache_hit(ctx, position_cmd, move_count, ponderhit_pv_hold
                         "nnue_bestmove": "",
                         "nnue_score_cp": None,
                     }
+                _eg_rec_rem_ms = _ph_recovery_rem_ms(_clock_rem_ms)
                 _rec_movetime_ms = max(500, int(eff_s * 200))
+                if _eg_rec_rem_ms is not None:
+                    _rec_movetime_ms = int(_clamp(
+                        _eg_rec_rem_ms - _move_overhead_ms - 300,
+                        300, _rec_movetime_ms))
                 _rec_opts = _nnue_1_opts
                 _rec_userset = ctx.cfg.nnue_slowmover_user_set
                 _apply_slow_mover(_eng, _rec_opts,
@@ -22602,11 +22762,18 @@ def _ponderhit_handle_cache_hit(ctx, position_cmd, move_count, ponderhit_pv_hold
                 _eng.send(position_cmd)
                 _eng.send("go movetime %d" % _rec_movetime_ms)
                 _ponderhit_pv = [None]
+                _eg_rs_timeout = _rec_movetime_ms / 1000.0 + _clamp(eff_s * 0.5, 0.5, 3.0)
+                if _eg_rec_rem_ms is not None:
+                    _eg_rs_timeout = min(
+                        _eg_rs_timeout,
+                        max(0.3, _eg_rec_rem_ms / 1000.0 - _move_overhead_s))
                 _pm, _ni = relay_until_bestmove(
-                    _eng, timeout=_rec_movetime_ms / 1000.0 + _clamp(eff_s * 0.5, 0.5, 3.0),
+                    _eng, timeout=_eg_rs_timeout,
                     intercept_bestmove=True,
                     partial_pv_holder=_ponderhit_pv,
-                    go_clock=go_clock)
+                    go_clock=go_clock,
+                    remaining_ms=(max(1, int(_eg_rec_rem_ms))
+                                  if _eg_rec_rem_ms is not None else None))
                 _bm = _ni.get("bestmove", "") if _ni else ""
                 _pd = _ni.get("ponder") if _ni else None
                 _phit_trace("eg_research", bm=_bm or "-")
@@ -23349,6 +23516,37 @@ def _ponderhit_capture_emit_ni(ctx, ni, bestmove):
         _flog(f"[PH-EMIT] capture failed (ignored): {_e!r}")
 
 
+def _ponderhit_cached_fallback_move(ctx, extra_stats):
+    try:
+        _board = _get_tracking_board(ctx)
+    except Exception:
+        _board = None
+    if _board is None:
+        return None
+    _cands = []
+    try:
+        _pol = (extra_stats or {}).get("_live_dl1_policy")
+        if _pol and _pol[0]:
+            _cands.append(_pol[0][0])
+    except Exception:
+        pass
+    try:
+        _rp = getattr(ctx.game_progress, "dl_3_rescue_policy", None)
+        if _rp and _rp[0]:
+            _cands.append(_rp[0][0])
+    except Exception:
+        pass
+    for _mv in _cands:
+        if not _mv or _mv in ("resign", "win"):
+            continue
+        try:
+            if _bestmove_is_for_board(_mv, _board):
+                return _mv
+        except Exception:
+            continue
+    return None
+
+
 def _ponderhit_finalize(ctx, bestmove, ponder_move, position_cmd, move_count,
                  ponderhit_pv_val=None, extra_stats=None):
     if ctx.ps.dl1_ponder_sent or ctx.ps.dl2_ponder_sent or ctx.ps.dl3_ponder_sent:
@@ -23375,17 +23573,24 @@ def _ponderhit_finalize(ctx, bestmove, ponder_move, position_cmd, move_count,
                 _emerg_eff_s = _clamp(max(_ef * 3.0, 15.0), _ef, _rem_s)
             if position_cmd:
                 _set_current_position(ctx, position_cmd)
+            _cached_mv = _ponderhit_cached_fallback_move(ctx, extra_stats)
+            if _cached_mv:
+                bestmove = _cached_mv
+                ponder_move = None
+                _flog(f"[PH-FINAL] empty bestmove — cached DL policy top {_cached_mv!r} "
+                      "(resign avoided, zero engine cost)")
             _emerg = None
-            try:
-                _emerg = _emergency_move_from_any_engine(ctx, _emerg_eff_s)
-            except Exception as _ee:
-                _flog(f"[PH-FINAL] emergency move raised (ignored): {_ee}")
+            if not bestmove:
+                try:
+                    _emerg = _emergency_move_from_any_engine(ctx, _emerg_eff_s)
+                except Exception as _ee:
+                    _flog(f"[PH-FINAL] emergency move raised (ignored): {_ee}")
             if _emerg:
                 bestmove = _emerg
                 ponder_move = None
                 _flog(f"[PH-FINAL] empty bestmove — EMERGENCY move {_emerg!r} from "
                       "surviving engine (resign avoided)")
-            else:
+            elif not bestmove:
                 _waited = None
                 try:
                     _waited = _wait_revive_nnue_and_move(
@@ -34069,6 +34274,7 @@ def _parse_game_summary(lines: list[str]) -> dict:
                 _scratch.apply_usi(_usi_move)
             if _usi_inits:
                 result["init_moves"] = _usi_inits
+                result["_shitei_active"] = True
                 _flog(f"[CSA] 指定局面戦: 開始局面までの指し手 {len(_usi_inits)} 手を取り込み")
                 if result["sfen"] == "startpos":
                     _flog("[CSA] 盤面段なし — startpos + init_moves で指定局面を再生する")
@@ -34252,7 +34458,7 @@ class _CsaGame:
             _expected_stm = "+" if (self.move_count % 2 == 0) else "-"
             _flog(f"[CSA] 指定局面再生: {self.move_count} 手適用後 手番={_expected_stm} "
                   f"(Your_Turn={self.turn})")
-            self._start_is_sente = True
+            self._start_is_sente = (self.move_count % 2 == 0)
 
         self.ctx.csa_board = self.csa_board
         self.csa_board._position_cmd = self._build_position()
