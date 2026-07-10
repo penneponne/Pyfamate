@@ -205,8 +205,8 @@ CSA_Force_Comment: str = "never"
 CSA_Encoding: str = "cp932"
 
 _CSA_COMMENT_CANDIDATES: list = [
-    ("び○湖○ん○ん王国",   1),
-    ("ホテルニューア○ジ",  2),
+    ("",   1),
+    ("",  2),
 ]
 
 def _console(token: str, *, newline: bool = True, cr: bool = False) -> None:
@@ -3525,6 +3525,12 @@ _CONFIG_DEFAULTS = {
     "DL_3_PV_Mate_Search_Threads":    "0",
     "DL_UCT_Threads_Auto_Scale":      True,
     "DL_Batch_Auto_Scale":            True,
+    "DL_1_Max_GPU":                   "4",
+    "DL_2_Max_GPU":                   "3",
+    "DL_3_Max_GPU":                   "1",
+    "DL_1_Disabled_GPU":              "",
+    "DL_2_Disabled_GPU":              "0,1,2,3",
+    "DL_3_Disabled_GPU":              "0,1,2,3,4,5,6",
     "ZF_Serve_Pool_Max":              "",
     "DL_PVMate_Dynamic":              False,
     "DL_PVMate_Main_Threads":         "",
@@ -5287,6 +5293,17 @@ if not _MP_LIGHT_IMPORT:
                           f"({_pool_label}={_pool_mem}MB "
                           f"workers={_cap_workers})")
                     _rb_hash["nnue_1_Hash"] = _pool_per
+            if _pool_mem is None and _rb_total_mb is not None:
+                _phys_per = max(64,
+                                (_rb_total_mb - _RESOURCE_RAM_SAFETY_MARGIN_MB
+                                 - _rb_reserved) // max(1, _cap_workers))
+                if _rb_hash["nnue_1_Hash"] > _phys_per:
+                    _flog(f"[BUDGET-PHYS] nnue_1_Hash "
+                          f"{_rb_hash['nnue_1_Hash']}→{_phys_per}MB "
+                          f"(total={_rb_total_mb}MB margin="
+                          f"{_RESOURCE_RAM_SAFETY_MARGIN_MB}MB "
+                          f"reserved={_rb_reserved}MB)")
+                    _rb_hash["nnue_1_Hash"] = _phys_per
         except Exception as _e:
             _flog(f"[BUDGET-MEM] check failed (ignored): {_e}")
     _rb_thr = _budget_alloc_core(
@@ -5436,7 +5453,7 @@ if not _MP_LIGHT_IMPORT:
 
 def _build_dl_opts(slot_prefix, ponder_opts, mcts_opts=None, *,
                    model_override=None, multipv=None,
-                   pv_mate_threads=None, replicate=True):
+                   pv_mate_threads=None, replicate=True, engine_path=""):
     opts = {
         "DNN_Model1":             model_override or str(_cfg[f"{slot_prefix}_DNN_Model1"]),
         "DNN_Batch_Size1":        str(_cfg[f"{slot_prefix}_DNN_Batch_Size1"]),
@@ -5445,7 +5462,17 @@ def _build_dl_opts(slot_prefix, ponder_opts, mcts_opts=None, *,
         "PV_Mate_Search_Threads": pv_mate_threads if pv_mate_threads is not None else str(_cfg.get(f"{slot_prefix}_PV_Mate_Search_Threads", "0")),
         "MultiPV":                multipv if multipv is not None else "1",
     }
-    _ngpu = _sys_gpu_count()
+    _is_bat = engine_path.lower().endswith(".bat")
+    _cfg_max_gpu = str(_cfg.get(f"{slot_prefix}_Max_GPU", "")).strip()
+    _cfg_disabled_gpu = str(_cfg.get(f"{slot_prefix}_Disabled_GPU", "")).strip()
+    if _is_bat and _cfg_max_gpu:
+        opts["Max_GPU"] = _cfg_max_gpu
+    if _is_bat and _cfg_disabled_gpu:
+        opts["Disabled_GPU"] = _cfg_disabled_gpu
+    if _is_bat and _cfg_max_gpu:
+        _ngpu = _clamp(int(_cfg_max_gpu), 1, 16)
+    else:
+        _ngpu = _sys_gpu_count()
     if replicate and _ngpu and _ngpu > 1:
         _per = (("DNN_Model", opts["DNN_Model1"]),
                 ("DNN_Batch_Size", opts["DNN_Batch_Size1"]),
@@ -5464,6 +5491,7 @@ _dl_1_opts = _build_dl_opts(
     "DL_1", _DL1_PONDER_OPTS,
     pv_mate_threads=str(_cfg["DL_1_PV_Mate_Search_Threads"]),
     multipv=str(_params["POLICY_MOVES"]),
+    engine_path=DL_1_PATH,
 )
 _dl_1_model_default = str(_cfg["DL_1_DNN_Model1"])
 _dl_1_model_fast    = str(_cfg["DL_1_DNN_Model1_Fast"]).strip()
@@ -5935,11 +5963,12 @@ _mate_solver_opts = {
 _dl_2_opts = _build_dl_opts(
     "DL_2", _DL2_PONDER_OPTS, _dl_2_mcts_opts,
     model_override="eval/model.onnx",
+    engine_path=DL_2_PATH,
 )
 
 _dl_3_opts = _build_dl_opts(
     "DL_3", _DL3_PONDER_OPTS, _dl_3_mcts_opts,
-    replicate=False,
+    replicate=False, engine_path=_dl_3_path or "",
 )
 
 
@@ -6275,6 +6304,28 @@ class USIEngine:
         self._last_drained_bm: str | None = None
         self._dup_drained_bm: bool = False
         self._start_gen: int = 0
+        self._ssh_hb_stop: threading.Event = threading.Event()
+
+    def _ssh_stdin_heartbeat(self, proc):
+        _n = 0
+        _flog(f"[{self.name}] SSH-HB thread started (pid={proc.pid})")
+        while not self._ssh_hb_stop.wait(3.0):
+            if proc is not self.proc:
+                _flog(f"[{self.name}] SSH-HB stopped: proc replaced")
+                break
+            if not self._alive:
+                _flog(f"[{self.name}] SSH-HB stopped: not alive")
+                break
+            try:
+                with self._send_lock:
+                    if proc.stdin and not proc.stdin.closed:
+                        proc.stdin.write("\n")
+                        proc.stdin.flush()
+                        _n += 1
+            except Exception as _e:
+                _flog(f"[{self.name}] SSH-HB stopped: write error {_e!r}")
+                break
+        _flog(f"[{self.name}] SSH-HB thread exited (sent={_n})")
 
     def start(self):
         if self.proc is not None:
@@ -6416,6 +6467,9 @@ class USIEngine:
         threading.Thread(target=self._reader, args=(_proc, self._q), daemon=True).start()
         if (_log_engine_stderr or self._force_stderr) and _proc.stderr:
             threading.Thread(target=self._stderr_reader, args=(_proc,), daemon=True).start()
+        if self._via_shell:
+            self._ssh_hb_stop = threading.Event()
+            threading.Thread(target=self._ssh_stdin_heartbeat, args=(_proc,), daemon=True).start()
 
     def _stderr_reader(self, proc):
         try:
@@ -6503,7 +6557,7 @@ class USIEngine:
     def search_outstanding(self):
         if self._go_sent <= 0:
             return True
-        return self._go_sent > getattr(self, "_bm_arrived", 0)
+        return self._go_sent > self._bm_arrived
 
     def classify_bestmove(self):
         if self._bm_gen is None:
@@ -6577,6 +6631,7 @@ class USIEngine:
     def _force_accept_resync(self):
         with self._send_lock:
             self._bm_seen = self._go_sent
+            self._bm_arrived = self._go_sent
             self._last_ack_gen = None
             self._bm_gen = None
 
@@ -6760,6 +6815,7 @@ class USIEngine:
 
     def quit(self):
         self._alive = False
+        self._ssh_hb_stop.set()
         if not self.proc:
             return
         try:
@@ -11424,7 +11480,7 @@ def _ph_recovery_rem_ms(clock_rem_ms):
         _t0 = _PHIT_TRACE["t0"]
         _el_ms = (time.perf_counter() - _t0) * 1000.0 if _t0 else 0.0
     except Exception:
-        _el_ms = 0.0
+        _el_ms = float(clock_rem_ms) * 0.5
     return max(0.0, float(clock_rem_ms) - _el_ms)
 
 
@@ -15694,6 +15750,18 @@ def _dyn_apply_nnue_hash(eng, eng_name, readyok_budget_s=None):
             _avail0 = _my_avail
         _resident = min(_current, max(0, _avail0 - _my_avail))
         _target = max(64, min(_orig, _resident + _my_avail - _margin))
+        if (_target > _current and readyok_budget_s is not None
+                and readyok_budget_s < 55.0):
+            _HASH_CLEAR_MB_PER_S = 3000
+            _clear_budget_s = float(readyok_budget_s) * 0.6
+            _max_increase = int(_clear_budget_s * _HASH_CLEAR_MB_PER_S)
+            _ceiling = _current + _max_increase
+            if _target > _ceiling:
+                _flog(f"[BUDGET-DYN] {eng_name} Hash 拡大制限: "
+                      f"{_current}→{_target}MB を {_ceiling}MB に抑制 "
+                      f"(budget={readyok_budget_s:.1f}s "
+                      f"clear_cap={_max_increase}MB)")
+                _target = max(_current, _ceiling)
         if _target == _current:
             return
         _crisis_mb = 2048
@@ -17504,6 +17572,7 @@ def _run_council_search(ctx, line, move_count, dl_timeout,
 
 def _run_light_council_search(ctx, line, move_count, go_clock, dl_timeout_s=0.0):
     eff_s = go_clock.eff_s
+    _lc_pre_rem_ms = go_clock.remaining_ms if go_clock else None
 
     (_game_phase_WHAND, _game_phase_P, _game_phase_INV, _game_phase_KING,
      _game_phase_EXPOSURE, _game_phase_PLY) = _calc_game_phase_features(ctx.current_position)
@@ -17513,20 +17582,37 @@ def _run_light_council_search(ctx, line, move_count, go_clock, dl_timeout_s=0.0)
     _dlog(lambda: f"[GP/LightCouncil] game_phase={_game_phase_value:.3f}")
 
     if not ctx.nnue_1._alive:
-        _flog("[LightCouncil] nnue_1 not alive — attempting restart")
-        _ok_restart = _restart_nnue_1(ctx, "light_council")
+        _lc_pre_rem_ms = go_clock.remaining_ms if go_clock else None
+        _lc_pre_floor_ms = go_clock.floor_ms if go_clock else None
+        _lc_restart_budget = _restart_readyok_budget_s(ctx, default_s=8.0)
+        _lc_pre_time_critical = (
+            (_lc_pre_rem_ms is not None and _lc_pre_rem_ms <= 5000
+             and (_lc_pre_floor_ms or 0) <= 3000)
+            or (eff_s > 0 and _lc_restart_budget > eff_s * 0.5)
+        )
+        if _lc_pre_time_critical:
+            _flog(f"[LightCouncil] nnue_1 not alive — time-critical "
+                  f"(remaining={_lc_pre_rem_ms}ms floor={_lc_pre_floor_ms}ms "
+                  f"eff_s={eff_s:.2f} restart_budget={_lc_restart_budget:.1f}s) "
+                  f"— async restart + immediate emergency delegation")
+            _restart_nnue_1(ctx, "light_council-timecrit", async_launch=True)
+            _ok_restart = False
+        else:
+            _flog("[LightCouncil] nnue_1 not alive — attempting restart")
+            _ok_restart = _restart_nnue_1(ctx, "light_council")
         if not _ok_restart or not ctx.nnue_1._alive:
             _flog("[LightCouncil] nnue_1 restart failed — delegating to surviving "
                   "engine (resign avoided)")
             _lc_emerg = None
+            _lc_emerg_deadline = _clamp(eff_s * 0.5, 0.5, 5.0)
             try:
-                _lc_emerg = _emergency_move_from_any_engine(ctx, 3.0)
+                _lc_emerg = _emergency_move_from_any_engine(ctx, _lc_emerg_deadline)
             except Exception as _lce:
                 _flog(f"[LightCouncil] emergency move raised (ignored): {_lce}")
             if not _lc_emerg:
                 try:
                     _lc_emerg = _wait_revive_nnue_and_move(
-                        ctx, caller="light_council", deadline_s=3.0)
+                        ctx, caller="light_council", deadline_s=_lc_emerg_deadline)
                 except Exception as _lcw:
                     _flog(f"[LightCouncil] wait-revive raised (ignored): {_lcw}")
             if _lc_emerg:
@@ -17651,14 +17737,20 @@ def _run_light_council_search(ctx, line, move_count, go_clock, dl_timeout_s=0.0)
     nnue_top_vote = nnue_info.get("bestmove") or None
 
     if nnue_top_vote is None and not ctx.nnue_1._alive:
-        _flog("[LightCouncil] nnue_1 not alive after relay — attempting restart")
-        _restart_nnue_1(ctx, "light_council-relay-dead")
+        _flog("[LightCouncil] nnue_1 not alive after relay — async restart + emergency delegation")
+        _restart_nnue_1(ctx, "light_council-relay-dead", async_launch=True)
         _flog("[LightCouncil] relay bestmove lost — delegating to surviving "
               "engine (resign avoided)")
+        if _lc_pre_rem_ms is not None and _lc_pre_rem_ms > 0:
+            _lc_post_rem_s = max(0.0, _lc_pre_rem_ms / 1000.0
+                                 - _relay_timeout - _move_overhead_s)
+            _lc_post_deadline = _clamp(_lc_post_rem_s * 0.5, 0.3, 5.0)
+        else:
+            _lc_post_deadline = _clamp(eff_s * 0.5, 0.3, 3.0)
         _lc_relay_emerg = None
         try:
             _lc_relay_emerg = _emergency_move_from_any_engine(
-                ctx, min(eff_s, 3.0))
+                ctx, _lc_post_deadline)
         except Exception as _lce:
             _flog(f"[LightCouncil] relay emergency move raised (ignored): "
                   f"{_lce}")
@@ -17666,7 +17758,7 @@ def _run_light_council_search(ctx, line, move_count, go_clock, dl_timeout_s=0.0)
             try:
                 _lc_relay_emerg = _wait_revive_nnue_and_move(
                     ctx, caller="light_council-relay",
-                    deadline_s=min(eff_s, 3.0))
+                    deadline_s=_lc_post_deadline)
             except Exception as _lcw:
                 _flog(f"[LightCouncil] relay wait-revive raised (ignored): "
                       f"{_lcw}")
@@ -20339,10 +20431,20 @@ def _handle_isready(ctx, line):
         for t in threads: t.start()
         _join_t0 = time.perf_counter()
         _hb_n = 0
+        _bat_engs = []
+        for _eng_candidate in [ctx.dl_1, ctx.dl_2 if (ctx.cfg.dl_2_enable and _dl_2_init_ok) else None]:
+            if _eng_candidate is not None and _eng_candidate._alive and getattr(_eng_candidate, "_via_shell", False):
+                _bat_engs.append(_eng_candidate)
         while any(t.is_alive() for t in threads):
             for t in threads:
-                t.join(timeout=5.0)
+                t.join(timeout=3.0)
             if any(t.is_alive() for t in threads):
+                for _be in _bat_engs:
+                    if _be._alive:
+                        try:
+                            _be.send("")
+                        except Exception:
+                            pass
                 _hb_n += 1
                 _got = sorted(k for k, v in results.items() if v is not None)
                 _flog(f"[INIT] readyok wait heartbeat #{_hb_n} "
@@ -22137,7 +22239,7 @@ def _ponderhit_restart_nnue1_and_movetime(ctx, position_cmd, move_count, eff_s,
                           eff_s=eff_s, cfg=ctx.cfg)
     ctx.nnue_1.send(position_cmd)
     ctx.nnue_1.send("go movetime %d" % _movetime_ms)
-    _relay_to = _movetime_ms / 1000.0 + 3.0
+    _relay_to = _movetime_ms / 1000.0 + _clamp(eff_s * 0.5, 0.5, 3.0)
     if _rec_rem_ms is not None:
         _relay_to = min(_relay_to, max(0.3, _rec_rem_ms / 1000.0 - _move_overhead_s))
     _kwargs = dict(timeout=_relay_to,
@@ -30499,6 +30601,7 @@ def _selfplay_game(eng_sente: "_SpsaUsiEngine",
                         else:
                             thinker._go_sent = thinker._bm_seen
                         thinker._bm_seen = thinker._go_sent
+                        thinker._bm_arrived = thinker._go_sent
                     _wd_reissue_prev_gen = None
                     _bm_class = "current"
             _ca_rec = getattr(thinker, "_last_rec", None)
@@ -30554,6 +30657,7 @@ def _selfplay_game(eng_sente: "_SpsaUsiEngine",
                             else:
                                 thinker._go_sent = thinker._bm_seen
                             thinker._bm_seen = thinker._go_sent
+                            thinker._bm_arrived = thinker._go_sent
                         break
                 if _stale_miss_reissue_count > 5:
                     _flog("[SPSA-W][%s] SP-echo miss cap reached (%d>5) — "
@@ -33602,6 +33706,9 @@ class ShogiBoard:
             h ^= _ZB_SIDE_W
         return h
 
+    def sfen_key(self) -> int:
+        return self._zhash
+
     def is_sennichite(self) -> bool:
         if len(self._history) < 8:
             return False
@@ -35834,6 +35941,25 @@ def _csa_main(args: list, existing_ctx=None) -> None:
         _dispatch(ctx, "usi")
         _dispatch(ctx, "isready")
 
+    for _rv_name, _rv_eng, _rv_opts in (
+        ("dl_1", getattr(ctx, "dl_1", None), _dl_1_opts),
+        ("nnue_1", getattr(ctx, "nnue_1", None), _nnue_1_opts),
+    ):
+        if (_rv_eng is not None
+                and not _rv_eng._alive
+                and getattr(_rv_eng, "_via_shell", False)):
+            _flog(f"[CSA-FF-REVIVE] {_rv_name}: SSH dead — attempting reconnect")
+            try:
+                _rv_eng.start()
+                _rv_eng.initialize(_rv_opts)
+                _rv_ok = _rv_eng.wait_for("readyok", timeout=60)
+                if _rv_ok is not None:
+                    _rv_eng.send("usinewgame")
+                    _flog(f"[CSA-FF-REVIVE] {_rv_name}: reconnect OK")
+                else:
+                    _flog(f"[CSA-FF-REVIVE] {_rv_name}: reconnect readyok timeout")
+            except Exception as _rv_e:
+                _flog(f"[CSA-FF-REVIVE] {_rv_name}: reconnect failed: {_rv_e!r}")
     _ff_dead = [_n for _n, _e in (("nnue_1", getattr(ctx, "nnue_1", None)),
                                   ("dl_1", getattr(ctx, "dl_1", None)))
                 if _e is None or not _eng_alive(_e)]
