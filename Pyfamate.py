@@ -1656,10 +1656,6 @@ def _flip_ensure_installed() -> None:
 
     def _note(msg):
         _flog("[flip-auto] " + msg)
-        try:
-            print("[INFO] " + msg, file=sys.stderr, flush=True)
-        except Exception:
-            pass
 
     def _activate_user_machine_native():
         if os.name != "nt":
@@ -3332,10 +3328,20 @@ def _dl_engine_file(_dir):
     return os.path.join(_dir, "engine")
 
 
+def _nnue_engine_file(_dir):
+    if sys.platform == "win32":
+        for _name in ("engine.bat", "engine.exe", "engine"):
+            _p = os.path.join(_dir, _name)
+            if os.path.isfile(_p):
+                return _p
+        return os.path.join(_dir, "engine.bat")
+    return os.path.join(_dir, "engine")
+
+
 _DEFAULT_DL_1_PATH   = _dl_engine_file(os.path.join(_ENGINES_DIR, "DL 1"))
-_DEFAULT_nnue_1_PATH = os.path.join(_ENGINES_DIR, "nnue 1", "engine")
+_DEFAULT_nnue_1_PATH = _nnue_engine_file(os.path.join(_ENGINES_DIR, "nnue 1"))
 _DEFAULT_DL_2_PATH       = _dl_engine_file(os.path.join(_ENGINES_DIR, "DL 2"))
-_DEFAULT_nnue_2_PATH = os.path.join(_ENGINES_DIR, "nnue 2", "engine")
+_DEFAULT_nnue_2_PATH = _nnue_engine_file(os.path.join(_ENGINES_DIR, "nnue 2"))
 _POOL_LETTERS = "abcdefghijklmnopqrstuvwxyz"
 
 def _pool_letter(i: int) -> str:
@@ -3348,8 +3354,8 @@ def _pool_letter_index(ch: str) -> int:
 _DEFAULT_DL_POOL = {k: _dl_engine_file(os.path.join(_ENGINES_DIR, f"DL {i}"))
                     for i, k in enumerate("abcdef", 1)}
 _DEFAULT_NNUE_POOL = {
-    "a": os.path.join(_ENGINES_DIR, "nnue 1", "engine"),
-    "b": os.path.join(_ENGINES_DIR, "nnue 2", "engine"),
+    "a": _nnue_engine_file(os.path.join(_ENGINES_DIR, "nnue 1")),
+    "b": _nnue_engine_file(os.path.join(_ENGINES_DIR, "nnue 2")),
 }
 
 _DL_SLOT_EXCLUDED_INDICES = {
@@ -3429,8 +3435,8 @@ _CONFIG_DEFAULTS = {
     "DL_1_Engine_Index":              0,
     "DL_2_Engine_Index":              1,
     "DL_3_Engine_Index":              0,
-    "nnue_1_Engine_Index":            1,
-    "nnue_2_Engine_Index":            0,
+    "nnue_1_Engine_Index":            0,
+    "nnue_2_Engine_Index":            1,
     "SPSA_Tune_Pool_Params":          False,
     "IO_Rate_Limit_KBps":             "256",
     "mate_solver_Path":               "Zyfamate",
@@ -4231,18 +4237,22 @@ for _bk, _bv in (list(_cfg.items()) if not _MP_LIGHT_IMPORT else []):
     if _bv_ext in (".bat", ".cmd"):
         if os.path.exists(_bv_s):
             continue
-        _bv_alts = [os.path.splitext(_bv_s)[0] + ".exe"]
+        _bv_alts = [os.path.splitext(_bv_s)[0] + ".exe",
+                    os.path.splitext(_bv_s)[0],
+                    os.path.splitext(_bv_s)[0] + ".sh"]
     elif _bv_ext == ".exe":
         if os.path.exists(_bv_s):
             continue
-        _bv_alts = [os.path.splitext(_bv_s)[0] + ".bat"]
+        _bv_alts = [os.path.splitext(_bv_s)[0] + ".bat",
+                    os.path.splitext(_bv_s)[0],
+                    os.path.splitext(_bv_s)[0] + ".sh"]
     elif _bv_ext == "":
         if os.name == "nt":
             _bv_alts = [_bv_s + ".exe", _bv_s + ".bat"]
         elif os.path.exists(_bv_s):
             continue
         else:
-            _bv_alts = [_bv_s + ".exe", _bv_s + ".bat"]
+            _bv_alts = [_bv_s + ".exe", _bv_s + ".bat", _bv_s + ".sh"]
     else:
         continue
     for _bv_alt in _bv_alts:
@@ -4422,25 +4432,25 @@ if not _MP_LIGHT_IMPORT:
 else:
     DL_1_PATH = nnue_1_PATH = DL_2_PATH = ""
 if not _MP_LIGHT_IMPORT:
-    _nnue_2_idx_raw = _cfg.get("nnue_2_Engine_Index", 0)
+    _nnue_2_idx_raw = _cfg.get("nnue_2_Engine_Index", 1)
     try:
         _nnue_2_idx = int(_nnue_2_idx_raw)
     except (TypeError, ValueError):
         _nnue_2_idx = None
-    _nnue_1_idx_raw = _cfg.get("nnue_1_Engine_Index", 1)
+    _nnue_1_idx_raw = _cfg.get("nnue_1_Engine_Index", 0)
     try:
         _nnue_1_idx = int(_nnue_1_idx_raw)
     except (TypeError, ValueError) as _e:
-        print("[WARN] nnue_1_Engine_Index parse fail (%r): fallback to 1"
+        print("[WARN] nnue_1_Engine_Index parse fail (%r): fallback to 0"
               % (_nnue_1_idx_raw,), file=sys.stderr, flush=True)
-        _flog("[NNUE-SEP] nnue_1_Engine_Index parse fail: %r — fallback to 1" % _e)
-        _nnue_1_idx = 1
+        _flog("[NNUE-SEP] nnue_1_Engine_Index parse fail: %r — fallback to 0" % _e)
+        _nnue_1_idx = 0
     if _nnue_2_idx is None:
-        print("[WARN] nnue_2_Engine_Index parse fail (%r): fallback to 0"
+        print("[WARN] nnue_2_Engine_Index parse fail (%r): fallback to 1"
               % (_nnue_2_idx_raw,), file=sys.stderr, flush=True)
-        _flog("[NNUE-SEP] nnue_2_Engine_Index parse fail: %r — fallback to 0"
+        _flog("[NNUE-SEP] nnue_2_Engine_Index parse fail: %r — fallback to 1"
               % (_nnue_2_idx_raw,))
-        _nnue_2_idx = 0
+        _nnue_2_idx = 1
     if _nnue_2_idx == _nnue_1_idx:
         _np_alts = [i for i in sorted(_detect_pool_indices("nnue_Pool_"))
                     if i != _nnue_1_idx]
@@ -4464,15 +4474,21 @@ if not _MP_LIGHT_IMPORT:
         nnue_2_PATH = str(_cfg["nnue_2_Path"])
 else:
     nnue_2_PATH = ""
-    _nnue_1_idx = 1
-    _nnue_2_idx = 0
+    _nnue_1_idx = 0
+    _nnue_2_idx = 1
 
 _params = {
     "POLICY_MOVES": _cint(_cfg, "POLICY_MOVES", 9),
     "POLICY_NODES": _cint(_cfg, "POLICY_NODES", 2043),
 }
 
-_RESOURCE_THREADS_SPARE_MIN = _cint(_cfg, "Resource_Threads_Spare_Min", 4)
+def _spare_cores_plan_core(cores):
+    return min(8, max(2, cores // 16 + 1))
+
+
+_RESOURCE_THREADS_SPARE_MIN = _cint(
+    _cfg, "Resource_Threads_Spare_Min",
+    _spare_cores_plan_core(os.cpu_count() or 4))
 _RESOURCE_RAM_SAFETY_MARGIN_MB = _cint(_cfg, "Resource_RAM_Safety_Margin_MB", 4096)
 
 _PONDER_NEVER = {
@@ -5405,23 +5421,17 @@ if not _MP_LIGHT_IMPORT:
         _flog(f"[DL-SCALE] 適用失敗 ({type(_dse).__name__}: {_dse}) — 据え置き")
     try:
         _spare_min = _RESOURCE_THREADS_SPARE_MIN
-        _ng_dl = max(1, _sys_gpu_count())
-        _dl_total = _cint(_cfg, "DL_1_UCT_Threads1", 1) * _ng_dl
-        if _cfg_bool("DL_2_Enable", True):
-            _dl_total += _cint(_cfg, "DL_2_UCT_Threads1", 1) * _ng_dl
-        if _cfg_bool("DL_3_Enable", True):
-            _dl_total += _cint(_cfg, "DL_3_UCT_Threads1", 1) * _ng_dl
-        _nnue_cap = max(1, _rb_cores - _dl_total - _spare_min)
+        _nnue_cap = max(1, _rb_cores - _spare_min)
         _nnue_cur = _cint(_cfg, "nnue_1_Threads", 4)
         if _nnue_thr_managed and _nnue_cur != _nnue_cap:
             _cfg["nnue_1_Threads"] = str(_nnue_cap)
             _flog(f"[BUDGET-SPARE] nnue_1_Threads {_nnue_cur}→{_nnue_cap} "
-                  f"初期値: cores={_rb_cores} DL={_dl_total} spare={_spare_min}")
+                  f"初期値: cores={_rb_cores} spare={_spare_min} (UCT 控除なし)")
             _rb_applied.append(f"nnue_1_Threads={_nnue_cap}(spare-fill)")
         elif not _nnue_thr_managed and _nnue_cur > _nnue_cap:
             _cfg["nnue_1_Threads"] = str(_nnue_cap)
             _flog(f"[BUDGET-SPARE] nnue_1_Threads {_nnue_cur}→{_nnue_cap} "
-                  f"クランプ: cores={_rb_cores} DL={_dl_total} spare={_spare_min}")
+                  f"クランプ: cores={_rb_cores} spare={_spare_min} (UCT 控除なし)")
             _rb_applied.append(f"nnue_1_Threads={_nnue_cap}(spare-clamp)")
     except Exception as _se:
         _flog(f"[BUDGET-SPARE] 初期値計算失敗 ({type(_se).__name__}: {_se}) — 据え置き")
@@ -6408,6 +6418,11 @@ class USIEngine:
             self._wsl_tag = None
             _popen_kwargs["start_new_session"] = True
         else:
+            if sys.platform != "win32" and not os.access(self.path, os.X_OK):
+                try:
+                    os.chmod(self.path, 0o755)
+                except OSError:
+                    pass
             _argv = [os.path.abspath(self.path)]
             self._via_shell = False
             self._bat_path = None
@@ -15637,6 +15652,8 @@ def _dyn_apply_nnue_threads(ctx, eng, path):
         if _nnue_now is None:
             _nnue_now = _cint(_cfg, "nnue_1_Threads", 4)
         _target = max(1, int(_nnue_now + _my_idle - _spare))
+        _floor = max(1, _effective_cores() - _spare)
+        _target = max(_target, _floor)
         _target = min(_target, _effective_cores())
         if _target == getattr(eng, "_dyn_threads_last", None):
             return
@@ -25522,6 +25539,11 @@ def _learn_shutdown():
                     timeout=10)
             except Exception:
                 pass
+        else:
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except (OSError, ProcessLookupError):
+                pass
         try:
             proc.terminate()
             proc.wait(timeout=5)
@@ -27729,7 +27751,8 @@ def _handle_learn(ctx, line):
                     cwd=engine_dir,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
-                    text=True, encoding="utf-8", errors="replace")
+                    text=True, encoding="utf-8", errors="replace",
+                    **_spsa_pgrp_kwargs())
                 _learn_proc_ref[0] = proc
                 _ljob = _job_create()
                 if _ljob is not None:
@@ -28878,10 +28901,7 @@ class _SpsaUsiEngine:
                          ).strip().lower() in ("true", "1")
         _total_cores = _safe_cpu_count()
         _wc = _cint(cfg, "Tuning_Worker_Count", 2, lo=1)
-        _fixed_per_child = sum(int(v) for v in
-                               _SpsaUsiEngine._SELFPLAY_DL.values()) + 1
-        _remaining = _total_cores - _wc * _fixed_per_child
-        _nnue_per = max(1, (_remaining - 1) // _wc)
+        _nnue_per = max(1, (_total_cores - 1) // _wc)
         out = {}
         for key, val in cfg.items():
             if not halve:
@@ -29305,6 +29325,8 @@ def _line_freshness(line: str, board, pv_seen: bool) -> tuple:
     if "dl_live_policy" in line:
         return False, pv_seen
     if not line.startswith("info") or board is None:
+        return True, pv_seen
+    if "pyfa_rec" in line or "pyfa_ack" in line:
         return True, pv_seen
     if " pv " in line:
         m = _RE_PV_FULL.search(line)
