@@ -14577,15 +14577,24 @@ def _u_ph_relay(st):
                 return
             _pm, _ni = r
         else:
-            ctx.nnue_1.send("stop")
-            _rc_rem = _ph_recovery_rem_ms(_crm)
-            _drain_to = _stop_drain_timeout_safe(ctx, eff_s)
-            if _rc_rem is not None:
-                _drain_to = min(_drain_to, max(0.3, _rc_rem / 1000.0 - _move_overhead_s))
-            relay_drain(ctx.nnue_1, timeout=_drain_to,
-                        remaining_ms=(max(1, int(_rc_rem)) if _rc_rem is not None else None),
-                        intercept_bestmove=True, kill_on_empty=False)
-            _phit_trace("ph_drain")
+            _already_idle_preserved = bool(
+                _ni and _ni.get("score_stale") and ctx.nnue_1._alive)
+            if _already_idle_preserved:
+                _flog(f"[{_tag}] nnue_1 already confirmed idle by relay's own "
+                      "stop window (score_stale) — skipping redundant "
+                      "stop+drain to avoid pushing idle_preserve_streak "
+                      "toward forced kill")
+                _phit_trace("ph_drain_skip")
+            else:
+                ctx.nnue_1.send("stop")
+                _rc_rem = _ph_recovery_rem_ms(_crm)
+                _drain_to = _stop_drain_timeout_safe(ctx, eff_s)
+                if _rc_rem is not None:
+                    _drain_to = min(_drain_to, max(0.3, _rc_rem / 1000.0 - _move_overhead_s))
+                relay_drain(ctx.nnue_1, timeout=_drain_to,
+                            remaining_ms=(max(1, int(_rc_rem)) if _rc_rem is not None else None),
+                            intercept_bestmove=True, kill_on_empty=False)
+                _phit_trace("ph_drain")
             if not ctx.nnue_1._alive:
                 _flog(f"[{_tag}] nnue_1 died during stop+drain — restarting before re-search")
                 r, _pv = _u_ph_restart(st, "ponderhit-recovery-drain",
