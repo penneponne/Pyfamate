@@ -48824,7 +48824,9 @@ def _book_score_from_info_line(line, best_value, best_depth):
     共通正本。score/mate にマッチしたときだけ上書きするので、呼出側の best_value 初期値
     (None or 0) はそのまま保存される。depth-only 行 (score 無) は depth も更新しない
     (原実装どおり: best_depth は score/mate 採用時のみ前進)。score は手番側 cp。"""
-    if line.depth is None:
+    if line.depth is None or (line.multipv is not None and line.multipv != 1):
+        return best_value, best_depth
+    if "lowerbound" in line.split() or "upperbound" in line.split():
         return best_value, best_depth
     _d = line.depth
     if _d < best_depth:
@@ -49196,12 +49198,14 @@ def _book_position_best(bucket):
     best_v = None
     best_d = 0
     for e in bucket.values():
+        if isinstance(e, dict) and e.get("unscored"):
+            continue   # [10-15] 評価未知の手は局面の代表値に使わない
         v = _book_entry_value(e)
         d = _book_entry_depth(e)
         if best_v is None or v > best_v or (v == best_v and d > best_d):
             best_v = v
             best_d = d
-    return (best_v, best_d)
+    return (best_v, best_d) if best_v is not None else None   # 全手が unscored なら局面値なし
 
 
 @functools.lru_cache(maxsize=131072)
@@ -49251,22 +49255,36 @@ class _MbEvalCache:
     def __init__(self, maxsize):
         self._cache = collections.OrderedDict()
         self._max = max(0, int(maxsize))
-    def get(self, sfen_key, min_depth=0):
+        self._generation = {}
+    @staticmethod
+    def _position(key):
+        return key[0] if isinstance(key, tuple) else key
+    def invalidate(self, sfen_key):
+        # 同局面の全履歴cacheをO(1)で失効。削除した負け筋をcacheから復活させない。
+        self._generation[sfen_key] = self._generation.get(sfen_key, 0) + 1
+    def generation(self, sfen_key):
+        return self._generation.get(self._position(sfen_key), 0)
+    def get(self, sfen_key, min_depth=0, min_time_ms=0):
         e = self._cache.get(sfen_key)
-        if e is not None and e[2] >= min_depth:
+        generation = self._generation.get(self._position(sfen_key), 0)
+        if e is not None and e[2] >= min_depth and e[3] >= min_time_ms and e[4] == generation:
             self._cache.move_to_end(sfen_key)
-            return e
+            return e[:3]
         return None
-    def put(self, sfen_key, bestmove, value_cp, depth):
-        if self._max <= 0:
+    def put(self, sfen_key, bestmove, value_cp, depth, time_ms=0,
+            expected_generation=None):
+        if expected_generation is not None and self.generation(sfen_key) != expected_generation:
+            return  # 削除前に始まったgoの遅延結果を、削除後のcacheへ戻さない。
+        if self._max <= 0 or bestmove in ("resign", "win", "") or depth <= 0:
             return
-        self._cache[sfen_key] = (bestmove, value_cp, depth)
+        self._cache[sfen_key] = (bestmove, value_cp, depth, max(0, int(time_ms)),
+                                self._generation.get(self._position(sfen_key), 0))
         self._cache.move_to_end(sfen_key)
         while len(self._cache) > self._max:
             self._cache.popitem(last=False)
 
 
-def _bestmove_by_search(eng, byoyomi_ms, sfen, byoyomi_override=None,
+def _bestmove_by_search_legacy(eng, byoyomi_ms, sfen, byoyomi_override=None,
                          cache=None, prev_sfen=None, prev_move=None):
     """子エンジンに position + go byoyomi を送り bestmove を取得。
 
@@ -49311,13 +49329,13 @@ def _makebook_save_book(path, book, transitions, full_backup_max_pos,
                         skip_keys=None, only_keys=None, skip_backup=False):
     """やねうら王 db 形式で book を原子的に書き出す。
 
-    書き出し前に peta-shock min-max バックアップを走らせる (常時 ON)。
-    skip_backup=True のときはこの backup を省く。直前の save で同一 in-memory
-    book を既に backup 済みで、その後 book の value/depth を変えていない場合
-    (例: bookfile 保存 → 末端二重検証は meta キーのみ付与で value 不変 →
-    bookfile2/bookfile3 を同一 book から書き出す) に、O(局面数×手数×パス数) の
-    冗長な全 DAG 再走査を 1 回へ集約する。backup は冪等なので結果は不変。
+    書き出し用のコピーで従来のmin-max処理を行う。
+    保存による伝播値・depthを、稼働中の実探索記録へ書き戻さない。
+    skip_backup=True は伝播不要の生データ書き出し用。
     """
+    book = {key: {move: dict(entry) if isinstance(entry, dict) else entry
+                  for move, entry in bucket.items()}
+            for key, bucket in book.items()}
     if not skip_backup:
         try:
             _book_minmax_backup(
@@ -49364,7 +49382,8 @@ def _makebook_save_book(path, book, transitions, full_backup_max_pos,
             os.makedirs(_bk_dir, exist_ok=True)
             _bk_ts = time.strftime("%Y%m%d%H%M%S")
             _bk_npos = len(book)
-            _bk_name = "pyfamate_book-%s_%d.db" % (_bk_ts, _bk_npos)
+            _bk_name = "pyfamate_book-%s_%d_%s_%d.db" % (
+                _bk_ts, time.time_ns(), os.path.splitext(os.path.basename(path))[0], _bk_npos)
             _bk_path = os.path.join(_bk_dir, _bk_name)
             import shutil
             shutil.copy2(path, _bk_path)
@@ -49393,6 +49412,8 @@ def _makebook_save_book(path, book, transitions, full_backup_max_pos,
                     os.remove(_rm_path)
     except Exception as _bke:
         _flog("[M-5] backup error (non-fatal): %s" % _bke)
+    return book  # 同じ書出値を、後続の絞り込み保存にも使う。
+
 
 
 def _makebook_external_peta_shock(book_path, engine_path, threads=1):
@@ -49484,68 +49505,99 @@ def _book_minmax_backup(book: dict, transitions: dict,
                         max_passes: int = 8, full_scan: bool = True,
                         max_full_scan_positions: int = 100000,
                         propagate_depth: bool = True) -> int:
-    """葉評価値を根方向へ min-max (negamax) バックアップする。
+    """子から親へ一度だけnegamaxを伝播する (反復順序に依存しない)。
 
-    min-max 評価値伝播 (peta-shock 方式):
-        親手 m の value = - (子局面の最善応手の value)
-        親手 m の depth = min(子局面の最善応手の depth + 1, 9999)   (propagate_depth)
-    詰み (±_BOOK_MATE_CP) は符号反転だけで自然に最優先される。
-
-    book        : {sfen_key: {move: entry}} (in-place 更新)
-    transitions : {(sfen_key, move): child_sfen_key} 対局ループが手を適用する
-                  たびに board.push 由来で記録した確実な辺。
-    full_scan   : True なら book 全体を走査して transitions 外の辺も補完する
-                  (_book_backup_edges)。これにより readbook でロードした既存
-                  定跡や合流局面など「自己対局で踏まなかった枝」へも伝播する
-                  (旧実装は transitions の辺だけが対象で、ロードした定跡の
-                  内部ノードへ新規末端の評価が一切伝播しない取りこぼしがあった)。
-    max_full_scan_positions : book がこの局面数を超えたら全走査を抑止し
-                  transitions 限定へフォールバック (巨大 db の走査コスト回避)。
-    propagate_depth : True なら depth も min(child_depth+1,9999) で後退させる。
-    max_passes  : 反復回数の上限。1 パスで 1 手分だけ後退するため、N 手前まで
-                  伝えるには N パス要る。収束 (更新ゼロ) で早期終了する。
-
-    戻り値: 実際に行ったパス数。
-
-    各 (親, 手) について、その手で到達する子局面の手番側最善 (value, depth) を
-    取り、親手番から見た価値 -value / depth+1 で親エントリを上書きする。
-    子局面が book に無い (未展開の葉) 場合はその手の現 value/depth を温存する。
-
-    冪等性: child 側が変化しなくなれば親も変化しないため収束したパスで停止。
-    旧挙動 (transitions 辺のみ・value だけ伝播) は full_scan=False かつ
-    propagate_depth=False で再現できる。
+    強連結成分を縮約し、子成分から順に処理する。循環成分の内部辺は
+    履歴なしの局面DBだけでは千日手/連続王手を裁定できないため更新せず、
+    実探索由来の既存値を残す。循環を引き分けと断定したりdepthを増やさない。
+    非循環辺は手順長によらず末端から根まで伝わる。
+    max_passesは呼出互換用。戻り値は処理パス数(辺あり=1、なし=0)。
     """
     edges = _book_backup_edges(book, transitions, full_scan,
                                max_full_scan_positions)
-    passes = 0
-    for _ in range(max(1, max_passes)):
-        changed = False
-        passes += 1
-        for (parent_sfen, move), child_sfen in edges.items():
-            child_best = _book_position_best(book.get(child_sfen))
-            if child_best is None:
-                continue  # 未展開の葉 — 既存 value/depth を温存
-            backed_value = -int(child_best[0])
-            backed_depth = min(int(child_best[1]) + 1, 9999)
-            parent_bucket = book.get(parent_sfen)
-            if parent_bucket is None:
-                continue
-            entry = parent_bucket.get(move)
-            if entry is None:
-                continue
-            if not isinstance(entry, dict):
-                # 旧 int エントリ (value 不明) は count を引き継いで dict 化。
-                entry = _book_make_entry(0, 0, _book_entry_count(entry))
-                parent_bucket[move] = entry
-            if _book_entry_value(entry) != backed_value:
-                entry["value"] = backed_value
-                changed = True
-            if propagate_depth and _book_entry_depth(entry) != backed_depth:
-                entry["depth"] = backed_depth
-                changed = True
-        if not changed:
-            break
-    return passes
+    outgoing = {}
+    reverse = {}
+    for (parent, move), child in edges.items():
+        if move not in book.get(parent, {}) or not book.get(child):
+            continue
+        outgoing.setdefault(parent, []).append((move, child))
+        outgoing.setdefault(child, [])
+        reverse.setdefault(child, []).append(parent)
+        reverse.setdefault(parent, [])
+    if not outgoing:
+        return 0
+
+    # Iterative Kosaraju: long opening lines must not hit Python's recursion limit.
+    visited = set()
+    finish = []
+    for root in outgoing:
+        if root in visited:
+            continue
+        visited.add(root)
+        stack = [(root, iter(outgoing[root]))]
+        while stack:
+            node, children = stack[-1]
+            edge = next(children, None)
+            if edge is None:
+                finish.append(node)
+                stack.pop()
+            elif edge[1] not in visited:
+                visited.add(edge[1])
+                stack.append((edge[1], iter(outgoing[edge[1]])))
+
+    component = {}
+    members = []
+    for root in reversed(finish):
+        if root in component:
+            continue
+        cid = len(members)
+        group = []
+        todo = [root]
+        component[root] = cid
+        while todo:
+            node = todo.pop()
+            group.append(node)
+            for parent in reverse[node]:
+                if parent not in component:
+                    component[parent] = cid
+                    todo.append(parent)
+        members.append(group)
+
+    dependencies = [set() for _ in members]
+    parents = [set() for _ in members]
+    for parent, links in outgoing.items():
+        for _, child in links:
+            src, dst = component[parent], component[child]
+            if src != dst:
+                dependencies[src].add(dst)
+                parents[dst].add(src)
+    remaining = [len(d) for d in dependencies]
+    ready = collections.deque(i for i, n in enumerate(remaining) if not n)
+    cycle_edges = 0
+    while ready:
+        cid = ready.popleft()
+        for parent in members[cid]:
+            for move, child in outgoing[parent]:
+                if component[child] == cid:
+                    cycle_edges += 1
+                    continue
+                child_best = _book_position_best(book.get(child))
+                if child_best is None:
+                    continue
+                entry = book[parent][move]
+                if not isinstance(entry, dict):
+                    entry = _book_make_entry(0, 0, _book_entry_count(entry))
+                    book[parent][move] = entry
+                entry["value"] = -int(child_best[0])
+                if propagate_depth:
+                    entry["depth"] = min(int(child_best[1]) + 1, 9999)
+        for parent_cid in parents[cid]:
+            remaining[parent_cid] -= 1
+            if not remaining[parent_cid]:
+                ready.append(parent_cid)
+    if cycle_edges:
+        _flog("[makebook] cyclic backup edges retained: %d" % cycle_edges)
+    return 1
 
 
 class _BookPriorityQueue:
@@ -49644,6 +49696,8 @@ def _book_position_priority(bucket, close_margin_cp: int = 80,
             _top1 = v
         elif _top2 is None or v > _top2:
             _top2 = v
+    if not n_good:
+        return 0.0
     score = 0.0
     if n_good >= 2:
         diff = _top1 - _top2
@@ -49695,13 +49749,17 @@ def _book_seed_pq_petanext(book, pq, root_key, eval_diff_cp, max_step,
     if _s_anchor and _s_root is None:
         _s_anchor = False
     seeded = 0
-    visited = {root_key}
+    labels = {root_key: [(0.0, 0)]}
     # [MB-BESTFIRST] FIFO → best-first heap: 主要変化の末端を先に掘る
     # priority = cum_dev (root からの best-v 累積偏差; 低いほど主要変化に近い)
     import heapq as _hq
     frontier = [(0.0, 0, root_key)]   # (cum_dev, step, key)
     while frontier:
         cum_dev, step, key = _hq.heappop(frontier)
+        if (cum_dev, step) not in labels.get(key, []):
+            continue
+        if step >= max_step:
+            continue
         bucket = book.get(key)
         if not bucket:
             continue
@@ -49733,41 +49791,56 @@ def _book_seed_pq_petanext(book, pq, root_key, eval_diff_cp, max_step,
             if child not in book:
                 pq.push(child, base_priority + 1.0 / (1.0 + _child_dev))
                 seeded += 1
-            elif child not in visited and step + 1 <= max_step:
-                visited.add(child)
-                _hq.heappush(frontier, (_child_dev, step + 1, child))
+            elif step + 1 <= max_step:
+                # 合流先を発見時にvisitedへ固定すると、後から来た低偏差経路や
+                # 少手数の経路を捨ててしまう。偏差/手数の両方で劣るものだけ除く。
+                next_step = step + 1
+                old = labels.get(child, [])
+                if any(dev <= _child_dev and depth <= next_step for dev, depth in old):
+                    continue
+                labels[child] = [(dev, depth) for dev, depth in old
+                                 if not (_child_dev <= dev and next_step <= depth)]
+                labels[child].append((_child_dev, next_step))
+                _hq.heappush(frontier, (_child_dev, next_step, child))
     return seeded
 
 
-def _apply_book_result(book: dict, tempbook: list, loseturn: str) -> dict:
-    """対局結果を定跡辞書へ反映する（投了・千日手の両経路で共用）。
+def _apply_book_result(book: dict, tempbook: list, loseturn: str, cache=None,
+                       confirmed_loss=None) -> dict:
+    """勝敗を記録し、再探索で確認できた一手だけ削除する。
 
-    book      : 定跡辞書 {sfen_key: {move: visit_count}}  (in-place 更新)
-    tempbook  : [(sfen_key, move), ...]  (今局の全手順)
-    loseturn  : 負けた側の手番 \"b\" または \"w\"
-
-    負けた側の最終手を定跡から削除し、勝った側の各手の訪問数を加算する。
-    投了・千日手の両経路で共用する単一実装。
-
-    [B3] 訪問数の加減算をスキーマ非依存ヘルパ経由にし、新スキーマ
-    (entry=dict の {value,depth,count}) でも壊れないようにした。負けた側の
-    最終手の削除 (pop) は move キー単位なので int/dict いずれでも不変。
-
-    Returns:
-        dict: {"killed": bool, "evaporated": bool}
+    一局の敗北で祖先の候補を連鎖削除しない。未確認の手は訪問数と評価を
+    保持し、loss_count/loss_pendingへ記録する。confirmed_loss=(sfen,move)。
     """
     bookpass = {"killed": False, "evaporated": False}
+    seen_losses = set()
     for i in reversed(tempbook):
-        if i[1] in ("resign", "win", ""):
+        if i[1] in ("resign", "win", "", "rep_draw"):
             continue
-        if _book_turn_of_key(i[0]) == loseturn and not bookpass["killed"]:
-            if i[0] in book and i[1] in book[i[0]]:
+        if _book_turn_of_key(i[0]) == loseturn:
+            if i in seen_losses:
+                continue
+            seen_losses.add(i)
+            if cache is not None:
+                cache.invalidate(i[0])
+            bucket = book.get(i[0], {})
+            if i[1] not in bucket:
+                continue
+            if i == confirmed_loss:
                 book[i[0]].pop(i[1], None)
                 bookpass["killed"] = True
                 if not book[i[0]]:
                     book.pop(i[0])
                     bookpass["evaporated"] = True
+            else:
+                entry = bucket[i[1]]
+                if not isinstance(entry, dict):
+                    entry = _book_make_entry(0, 0, _book_entry_count(entry))
+                    bucket[i[1]] = entry
+                entry["loss_count"] = int(entry.get("loss_count", 0)) + 1
+                entry["loss_pending"] = True
         else:
+            # 勝ち側: カウント加算
             _book_bump_count(book, i[0], i[1], 1)
     return bookpass
 
@@ -49801,6 +49874,9 @@ def _makebook_collect_leaves(book: dict) -> list:
             leaves.append((key, best_move, child_key,
                            _book_entry_count(best_entry)))
     return leaves
+
+
+
 
 
 def _makebook_fetch_kif(fetch_spec, out_dir=None):
@@ -50606,7 +50682,1794 @@ def _zf_digger_verify(usi_moves, movecount_at_mate, all_moves, live_board):
     return remaining
 
 
+
+# ============================================================
+# [2026-10-15] Pymakebook（単独版で直した makebook）を統合。既定の makebook はこの並列・修正版。
+# オーバーレイ（B10 verify・B12 widen・M-4 target・K-1 fetch_kif・M-6 peta_shock_engine）指定時だけ
+# 従来の _makebook_cli_overlay（単一スレッド、book 論理は修正版を共有）へ回す。
+# ============================================================
+
+_MB_ENGINE_LOG_LOCK = threading.Lock()   # makebook の子エンジンログ（Pymakebook 由来）
+
+_MB_REJECTED_KNOBS = {
+    "verify_s":          "B10 末端 DL/NNUE 二重検証",
+    "verify_margin_cp":  "B10 末端 DL/NNUE 二重検証",
+    "verify_max_leaves": "B10 末端 DL/NNUE 二重検証",
+    "widen_nodes":        "B12 適応的 MultiPV 候補拡張",
+    "widen_delta_cp":     "B12 適応的 MultiPV 候補拡張",
+    "widen_step":         "B12 適応的 MultiPV 候補拡張",
+    "widen_max":          "B12 適応的 MultiPV 候補拡張",
+    "widen_min_priority": "B12 適応的 MultiPV 候補拡張",
+    # zf_digger / zf_digger_hash_mb: standalone 版でも対応済み (B13 移植)
+    "target":       "M-4 ターゲットセレクタ",
+    "target_param": "M-4 ターゲットセレクタ",
+    "fetch_kif":    "K-1 KifManager 棋譜取得",
+    "peta_shock_engine":  "M-6 外部 peta_shock 委譲",
+    "peta_shock_threads": "M-6 外部 peta_shock 委譲",
+    "halve":        "_SpsaUsiEngine (SPSA 半減 config) 専用",
+    "book_fix_dummy": "",   # placeholder (未使用)
+}
+
+
+class _MbUsiEngine:
+    def __init__(self, path, options=None, name="mb", *, log_path=None,
+                 stop_event=None, usi_timeout=60, ready_timeout=600):
+        self.path = os.path.abspath(os.path.expandvars(os.path.expanduser(path)))
+        self.options = dict(options or {})
+        self.name = name
+        self.proc = None
+        self._q = queue.Queue()
+        self._alive = False
+        self._wlock = threading.Lock()
+        self._reader_th = None
+        self._stderr_th = None
+        self._recent = collections.deque(maxlen=80)
+        self._recent_lock = threading.Lock()
+        self.log_path = log_path
+        self.stop_event = stop_event
+        self.usi_timeout = usi_timeout
+        self.ready_timeout = ready_timeout
+        self.advertised_options = {}
+        self.last_error = ""
+        self.last_search_from_cache = False
+
+    def _record(self, stream, line):
+        line = str(line)[:4096]
+        with self._recent_lock:
+            self._recent.append("%s: %s" % (stream, line))
+        # 高頻度の探索infoはメモリ内の末尾だけ保持する。
+        if self.log_path and (stream != "stdout" or not line.startswith("info ")
+                              or line.startswith("info string ")):
+            try:
+                with _MB_ENGINE_LOG_LOCK:
+                    with open(self.log_path, "a", encoding="utf-8") as f:
+                        f.write("%s [%s] %s: %s\n" %
+                                (time.strftime("%Y-%m-%d %H:%M:%S"), self.name, stream, line))
+            except OSError as exc:
+                _flog("engine log: %r" % exc)
+
+    def failure(self, reason):
+        if self.proc is not None:
+            try:
+                rc = self.proc.wait(timeout=0.1) if not self._alive else self.proc.poll()
+            except subprocess.TimeoutExpired:
+                rc = self.proc.poll()
+        else:
+            rc = None
+        status = "running" if rc is None else "%s (0x%08X)" % (rc, rc & 0xffffffff)
+        self.last_error = "%s; exit=%s; engine=%s" % (reason, status, self.path)
+        print("[makebook][%s] %s" % (self.name, self.last_error), flush=True)
+        with self._recent_lock:
+            recent = list(self._recent)[-8:]
+        self._record("failure", self.last_error)
+        for line in recent:
+            print("  " + line, flush=True)
+        if self.log_path:
+            print("[makebook] 診断ログ: " + self.log_path, flush=True)
+        return False
+
+    # -- reader thread: stdout 行を UsiLine 化して queue へ (死亡で None 番兵) --
+    def _reader(self):
+        try:
+            for raw in self.proc.stdout:
+                try:
+                    try:
+                        ln = raw.decode("utf-8").rstrip("\r\n")
+                    except UnicodeDecodeError:
+                        ln = raw.decode("cp932" if os.name == "nt" else "utf-8",
+                                        errors="replace").rstrip("\r\n")
+                except AttributeError:
+                    ln = str(raw).rstrip("\r\n")
+                self._record("stdout", ln)
+                self._q.put(_parse_usi_line(ln))
+        except Exception as _e:
+            _flog("[%s] reader error: %r" % (self.name, _e))
+        finally:
+            self._alive = False
+            self._q.put(None)   # 死亡番兵 (readline None 契約)
+
+    def _stderr_reader(self):
+        try:
+            for raw in self.proc.stderr:
+                self._record("stderr", raw.decode("utf-8", errors="replace").rstrip("\r\n"))
+        except (OSError, ValueError) as exc:
+            _flog("[%s] stderr reader: %r" % (self.name, exc))
+
+    def start(self) -> bool:
+        if self.proc is not None:
+            self.quit()
+        self._q = queue.Queue()
+        _abs = os.path.abspath(self.path)
+        if not os.path.isfile(_abs):
+            print("[makebook] エンジンが見つかりません (%s)" % _abs)
+            return False
+        try:
+            _cwd = os.path.dirname(_abs) or None
+            _flags = 0
+            if sys.platform == "win32":
+                _flags = subprocess.CREATE_NEW_PROCESS_GROUP
+            self.proc = subprocess.Popen(
+                [_abs], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, cwd=_cwd, bufsize=8192,
+                creationflags=_flags)
+        except OSError as _e:
+            print("[makebook] エンジン起動失敗 (%s): %s" % (self.path, _e))
+            return False
+        self._record("process", "pid=%d cwd=%s" % (self.proc.pid, _cwd))
+        self._alive = True
+        self._reader_th = threading.Thread(
+            target=self._reader, name="mb_reader_" + self.name, daemon=True)
+        self._reader_th.start()
+        self._stderr_th = threading.Thread(target=self._stderr_reader,
+                                          name="mb_stderr_" + self.name, daemon=True)
+        self._stderr_th.start()
+        return True
+
+    def send(self, cmd: str) -> None:
+        if "\n" in cmd or "\r" in cmd:
+            raise ValueError("USI command must be a single line")
+        with self._wlock:
+            if self.proc is None or self.proc.stdin is None or self.proc.poll() is not None:
+                raise OSError("engine not running")
+            try:
+                self._record("send", cmd)
+                self.proc.stdin.write((cmd + "\n").encode("utf-8"))
+                self.proc.stdin.flush()
+            except (OSError, ValueError) as exc:
+                self._alive = False
+                raise OSError("engine pipe write failed: %s" % exc) from exc
+
+    def readline(self, timeout=1.0):
+        """UsiLine を返す。タイムアウトは "" (空 str)、プロセス死亡は None。"""
+        try:
+            ln = self._q.get(timeout=max(0.0, timeout))
+        except queue.Empty:
+            return ""
+        if ln is None:
+            self._q.put(None)   # 番兵を戻す (以後の readline も None)
+            return None
+        return ln
+
+    def wait_for(self, token: str, timeout=30.0):
+        """token で始まる行が来るまで読む。来たらその行、死亡/超過は None。"""
+        deadline = time.perf_counter() + timeout
+        while time.perf_counter() < deadline:
+            if self.stop_event is not None and self.stop_event.is_set():
+                return None
+            ln = self.readline(timeout=min(1.0, max(
+                0.05, deadline - time.perf_counter())))
+            if ln is None:
+                return None
+            if ln and "Error" in str(ln):
+                print("[makebook][%s] エンジンエラー: %s" % (self.name, ln))
+            if ln and ln.startswith("option name "):
+                match = re.match(r"option name (.+?) type (\S+)(.*)$", ln)
+                if match:
+                    self.advertised_options[match.group(1).lower()] = match.groups()
+            if ln and ln.strip() == token:
+                return ln
+        return None
+
+    def initialize(self) -> bool:
+        """usi/usiok → setoption 群 → isready/readyok → usinewgame。"""
+        try:
+            self.send("usi")
+            if self.wait_for("usiok", timeout=self.usi_timeout) is None:
+                if self.stop_event is not None and self.stop_event.is_set():
+                    self._record("cancel", "停止要求によりUSI初期化を終了")
+                    return False
+                return self.failure("usiok が来ません (終了/時間超過/停止要求)")
+            for _k, _v in self.options.items():
+                if isinstance(_v, bool):
+                    _v = "true" if _v else "false"
+                spec = self.advertised_options.get(_k.lower())
+                if spec is None and _k.lower() == "usi_hash":
+                    spec = self.advertised_options.get("hash")
+                if spec is None:
+                    print("[makebook][%s] 未対応option %s — 送信を省略" % (self.name, _k), flush=True)
+                    continue
+                _k, kind, details = spec
+                if kind == "spin":
+                    value = int(_v)
+                    low = re.search(r"\bmin (-?\d+)", details)
+                    high = re.search(r"\bmax (-?\d+)", details)
+                    if (low and value < int(low.group(1))) or (high and value > int(high.group(1))):
+                        raise ValueError("option %s=%s が許容範囲外: %s" % (_k, _v, details))
+                elif kind == "check" and str(_v).lower() not in ("true", "false"):
+                    raise ValueError("option %s は true/false が必要です" % _k)
+                self.send("setoption name %s value %s" % (_k, _v))
+            self.send("isready")
+            if self.wait_for("readyok", timeout=self.ready_timeout) is None:
+                if self.stop_event is not None and self.stop_event.is_set():
+                    self._record("cancel", "停止要求によりreadyok待ちを終了")
+                    return False
+                return self.failure("readyok が来ません (終了/時間超過/停止要求)")
+            self.send("usinewgame")
+            return True
+        except (OSError, ValueError) as _e:
+            return self.failure("エンジン初期化失敗: %s" % _e)
+
+    def quit(self) -> None:
+        try:
+            if self.proc is not None and self.proc.poll() is None:
+                try:
+                    self.send("quit")
+                except OSError:
+                    pass
+                try:
+                    self.proc.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    self.proc.kill()
+                    self.proc.wait(timeout=2)
+        except Exception as _e:
+            _flog("[%s] quit: %r" % (self.name, _e))
+        finally:
+            self._alive = False
+            if self.proc is not None:
+                if self.proc.poll() is None:
+                    self.proc.kill()
+                    self.proc.wait(timeout=2)
+                for th in (self._reader_th, self._stderr_th):
+                    if th is not None:
+                        th.join(timeout=1)
+                with self._wlock:
+                    for pipe in (self.proc.stdin, self.proc.stdout, self.proc.stderr):
+                        if pipe is not None:
+                            try:
+                                pipe.close()
+                            except OSError:
+                                pass
+                    self.proc = None
+
+
+# ============================================================
+# [B13] ZfDigger — Zyfamate 常駐詰み監視 (原本 Pyfamate.py L49961-50110 移植)
+#
+# makebook 自己対局中、現局面の詰みを go mate infinite で常時探索する。
+# Zyfamate は stop に能動対応しない単一スレッドのブロッキング探索なので、
+# busy 中は watch() がスキップするだけ (kill はしない)。
+# 完了検知には isready/readyok 往復を使う (§13-1)。
+# ============================================================
+
+
+def _bestmove_by_search(eng, byoyomi_ms, sfen, byoyomi_override=None,
+                         cache=None, prev_sfen=None, prev_move=None,
+                         force_search=False, position_cmd=None,
+                         searchmoves=None, strict_budget=False):
+    """子エンジンに position + go byoyomi を送り bestmove を取得。
+
+    戻り値 (bestmove, value_cp, depth)。異常/時間超過は (None, 0, 0)。
+    cache: 要求思考時間以上・同じposition履歴だけ照会する。
+    force_search=True はcache照会を省略し、再探索結果を更新する。
+    position_cmd があれば局面の起点と全手順を送る。
+    prev_sfen/prev_move: [MB-PV-REUSE] 直前局面+手 → moves 追記形式で TT 温存。
+    """
+    if eng.stop_event is not None and eng.stop_event.is_set():
+        return (None, 0, 0)
+    eng.last_search_from_cache = False
+    eng.last_search_generation = None
+    _byo = int(byoyomi_ms if byoyomi_override is None else byoyomi_override)
+    if searchmoves:
+        # 制約付き探索を通常の局面cacheと混ぜない。
+        cache = None
+    cache_key = sfen
+    if position_cmd is not None:
+        cache_key = (sfen, hashlib.blake2b(position_cmd.encode("utf-8"), digest_size=16).digest())
+    _search_generation = cache.generation(cache_key) if cache is not None else None
+    if cache is not None:
+        eng.last_search_generation = (cache_key, _search_generation)
+    scores_by_move = {}
+    saw_scored_pv = False
+
+    def _observe(line, value, depth):
+        nonlocal saw_scored_pv
+        exact = (line.kind == "scored" and line.depth is not None
+                 and (line.multipv is None or line.multipv == 1)
+                 and "lowerbound" not in line.split()
+                 and "upperbound" not in line.split())
+        if exact and line.pv:
+            saw_scored_pv = True
+            move = line.pv.split()[0]
+            previous = scores_by_move.get(move, (0, 0))
+            scores_by_move[move] = _book_score_from_info_line(line, *previous)
+        return _book_score_from_info_line(line, value, depth)
+    def _position_sfen(key):
+        # 定跡DBのキーは手数0、USIへ送る局面の手数は1以上。
+        tokens = key.split()
+        if len(tokens) == 4 and tokens[-1] == "0":
+            tokens[-1] = "1"
+        return " ".join(tokens)
+
+    def _result(line, value, depth):
+        parts = line.split()
+        bm = parts[1] if len(parts) >= 2 else ""
+        if not re.fullmatch(r"(?:[1-9][a-i][1-9][a-i]\+?|[PLNSGBR]\*[1-9][a-i]|resign|win)", bm):
+            eng.failure("不正なbestmove: %s" % line)
+            return (None, 0, 0)
+        if saw_scored_pv and bm not in ("resign", "win"):
+            value, depth = scores_by_move.get(bm, (None, 0))
+        if bm not in ("resign", "win") and (value is None or not depth):
+            # [10-15 修正] bestmove の評価値が取れない時に 0cp として登録・cache すると、既存の深い評価を壊す
+            # 。未知（None, 0）として返し、cache にも入れない。
+            return (bm, None, 0)
+        if cache is not None:
+            cache.put(cache_key, bm, value, depth, time_ms=_byo,
+                      expected_generation=_search_generation)
+        return (bm, value, depth)
+
+    # [MB-TT-CACHE] キャッシュ照会
+    if cache is not None and not force_search:
+        _hit = cache.get(cache_key, min_time_ms=_byo)
+        if _hit is not None:
+            eng.last_search_from_cache = True
+            return _hit
+    # [MB-PV-REUSE] 直前局面から 1 手進んだだけなら moves 追記形式で子 TT を温存
+    try:
+        if position_cmd is not None:
+            eng.send(position_cmd)
+        elif prev_sfen is not None and prev_move is not None:
+            eng.send("position sfen " + _position_sfen(prev_sfen) + " moves " + prev_move)
+        else:
+            eng.send("position sfen " + _position_sfen(sfen))
+        go = "go btime 0 wtime 0 byoyomi %d" % _byo
+        if searchmoves:
+            go += " searchmoves " + " ".join(searchmoves)
+        eng.send(go)
+    except OSError as exc:
+        eng.failure("探索送信失敗: %s" % exc)
+        return (None, 0, 0)
+    deadline = time.perf_counter() + (_byo / 1000.0 if strict_budget else _byo / 1000.0 * 3 + 10)
+    best_value = 0
+    best_depth = 0
+    while time.perf_counter() < deadline:
+        if eng.stop_event is not None and eng.stop_event.is_set():
+            return (None, 0, 0)
+        line = eng.readline(timeout=min(0.25, max(0.01, deadline - time.perf_counter())))
+        if line is None:
+            eng.failure("探索中にエンジンの出力が終了しました")
+            return (None, 0, 0)   # エンジンプロセス死亡 — 呼出側で再起動を試みる
+        if not line:
+            continue              # 個別 read の timeout — deadline まで待つ
+        if line.startswith("info"):
+            best_value, best_depth = _observe(
+                line, best_value, best_depth)
+            continue
+        if line.startswith("bestmove"):
+            return _result(line, best_value, best_depth)
+    # stop 後の bestmove を回収してから次の探索へ進む。回収できなければ
+    # このプロセスを再利用せず、呼出側で交換する (遅延bestmove混入防止)。
+    eng._record("timeout", "bestmove期限超過 — stopを送信")
+    try:
+        eng.send("stop")
+    except OSError:
+        eng.failure("探索時間超過後のstop送信失敗")
+        return (None, 0, 0)
+    deadline = time.perf_counter() + (0.2 if strict_budget else 3)
+    while time.perf_counter() < deadline:
+        if eng.stop_event is not None and eng.stop_event.is_set():
+            return (None, 0, 0)
+        line = eng.readline(timeout=0.1)
+        if line is None:
+            break
+        if line and line.startswith("info"):
+            best_value, best_depth = _observe(line, best_value, best_depth)
+        if line and line.startswith("bestmove "):
+            return _result(line, best_value, best_depth)
+    eng.failure("stop後もbestmoveが来ません — 異常結果を定跡に登録しません")
+    return (None, 0, 0)
+
+
+def _physical_core_count():
+    """物理コア数（Windows は CIM の NumberOfCores 合計）。取れなければ None。"""
+    try:
+        if os.name == "nt":
+            out = subprocess.run(["powershell", "-NoProfile", "-Command",
+                                  "(Get-CimInstance Win32_Processor | Measure-Object NumberOfCores -Sum).Sum"],
+                                 capture_output=True, text=True, timeout=30).stdout.strip()
+            return int(out) if out.isdigit() and int(out) > 0 else None
+        cores = set()
+        with open("/proc/cpuinfo", encoding="utf-8") as f:
+            phys = core = None
+            for ln in f:
+                if ln.startswith("physical id"): phys = ln.split(":")[1].strip()
+                elif ln.startswith("core id"): core = ln.split(":")[1].strip(); cores.add((phys, core))
+        return len(cores) or None
+    except Exception:
+        return None
+
+
+def _makebook_parallel_count(raw):
+    if str(raw).strip().lower() == "auto":
+        # [10-15] 論理コア数だと SMT の兄弟を別の対局が共有し、同じ秒読みでも探索量がそろわない
+        # 。物理コア数を既定にする。取れない時だけ論理コア数。
+        return max(1, _physical_core_count() or os.cpu_count() or 1)
+    try:
+        value = int(raw)
+    except (ValueError, TypeError):
+        raise SystemExit("makebook: parallel は auto または正の整数で指定してください")
+    if value < 1:
+        raise SystemExit("makebook: parallel は1以上が必要です")
+    return value
+
+
+def _makebook_position_command(base, moves):
+    """局面の起点と全実手順をUSIに送る。盤面の一致だけで履歴を捨てない。"""
+    tokens = base.split()
+    if tokens and tokens[0] == "position":
+        tokens = tokens[1:]
+    if tokens and tokens[0] == "sfen" and len(tokens) >= 5 and tokens[4] == "0":
+        tokens[4] = "1"
+    origin_moves = []
+    if "moves" in tokens:
+        idx = tokens.index("moves")
+        origin_moves = tokens[idx + 1:]
+        tokens = tokens[:idx]
+    sequence = origin_moves + list(moves)
+    if sequence:
+        tokens += ["moves"] + sequence
+    return "position " + " ".join(tokens)
+
+
+def _makebook_can_reuse_search(last_actual_search_ply, current_ply, previous_is_best):
+    """直前の着手をこのエンジンで実探索した場合だけTT再利用を仮定する。"""
+    return (current_ply > 0 and last_actual_search_ply == current_ply - 1
+            and previous_is_best)
+
+
+def _makebook_review_loss(eng, base, history, loseturn, budget_ms=1000,
+                         min_depth=6, margin_cp=100):
+    """直近の敗者側一手を、履歴付きの新規探索2回で照合する。
+
+    cacheは使わず、通常手との比較と当該手限定の比較を行う。比較深さの
+    差が大きい・応答不良・合法性不明・僅差なら削除を確定しない。
+    """
+    result = {"confirmed": False, "pair": None, "reason": "no_losing_move"}
+    index = next((n for n in range(len(history)-1, -1, -1)
+                  if history[n][1] not in ("resign", "win", "", "rep_draw")
+                  and _book_turn_of_key(history[n][0]) == loseturn), None)
+    if index is None or budget_ms <= 0:
+        return result
+    key, played = history[index]
+    result["pair"] = (key, played)
+    board = ShogiBoard()
+    board.set(key)
+    if not board.is_legal_lite(played):
+        result["reason"] = "illegal_played_move"
+        return result
+    command = _makebook_position_command(base, [m for _, m in history[:index]])
+    per_search = max(1, int(budget_ms) // 2)
+    constrained = _bestmove_by_search(
+        eng, per_search, key, force_search=True, position_cmd=command,
+        searchmoves=[played], strict_budget=True)
+    result["played_result"] = constrained
+    if constrained[0] is None:
+        eng.quit()  # 遅延bestmoveを次局へ持ち越さない。
+        result["reason"] = "played_search_failed"
+        return result
+    if constrained[0] != played or constrained[2] < min_depth:
+        result["reason"] = "played_search_insufficient"
+        return result
+    alternative = _bestmove_by_search(
+        eng, per_search, key, force_search=True, position_cmd=command,
+        strict_budget=True)
+    result["alternative_result"] = alternative
+    if alternative[0] is None:
+        eng.quit()
+        result["reason"] = "alternative_search_failed"
+    elif (alternative[0] in (played, "win", "resign")
+          or not board.is_legal_lite(alternative[0])):
+        result["reason"] = "no_legal_alternative"
+    elif alternative[2] < min_depth or abs(alternative[2] - constrained[2]) > 2:
+        result["reason"] = "incomparable_depth"
+    elif alternative[1] - constrained[1] < margin_cp:
+        result["reason"] = "gap_too_small"
+    elif eng.stop_event is not None and eng.stop_event.is_set():
+        result["reason"] = "cancelled"
+    else:
+        result["confirmed"] = True
+        result["reason"] = "alternative_better"
+    return result
+
+
+def _makebook_load_seed_jsonl(path):
+    """[施策4] シード JSONL (優先キュー持ち越しファイル) を読む。
+
+    各行は {"sfen": book キー, "ply", "verdict", "loss_cp", "move",
+    "alt_move", "side", "ts"}。壊れた行・
+    sfen 欠落行は読み飛ばす (対局プロセスと書き込みが競合しても育成を
+    止めない寛容パース)。ファイル無し/読めない場合は []。優先度キューへの
+    投入と .consumed 退避は makebook 側の呼出元で行う。
+
+    [B8-OFFSET] Windows では対局プロセスが append でファイルを開いている
+    瞬間に os.replace (退避) が PermissionError で失敗しうる。失敗時に
+    シードが残留すると次回起動で同じ行が再投入され、「常習局面ほど掘られる」
+    の枠を超えた無制限の重複インフレになる。対策: 消費済みバイト位置を
+    <path>.offset サイドカーへ記録し、ロード時にそこまで seek して飛ばす。
+    退避成功時はサイドカーごと削除 (呼出元)。退避中の append (offset 以降の
+    行) は次回ロードで正しく拾われる。
+
+    Returns: (records, consumed_offset) — consumed_offset は退避失敗時に
+    呼出元がサイドカーへ書く「今回読み終えたバイト位置」。
+    """
+    records = []
+    _start = 0
+    try:
+        with open(path + ".offset", encoding="utf-8") as _of:
+            _start = max(0, int(_of.read().strip() or 0))
+    except (OSError, ValueError):
+        _start = 0
+    _end = _start
+    try:
+        with open(path, encoding="utf-8") as f:
+            try:
+                _size = os.fstat(f.fileno()).st_size
+            except OSError:
+                _size = None
+            if _size is not None and _start > _size:
+                # ファイルが作り直された (退避成功後の新規 append 等)。
+                # stale offset で全行を飛ばさないよう先頭へ戻す。
+                _start = 0
+            if _start:
+                f.seek(_start)
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    d = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(d, dict) and d.get("sfen"):
+                    records.append(d)
+            _end = f.tell()
+    except OSError:
+        return [], _start
+    return records, _end
+
+
+# ====================================================================
+# やねうら王式の融合: leaf min-max バックアップ + 探索優先度キュー
+# --------------------------------------------------------------------
+# B3 で各手に value(cp)/depth/count/bad と、bad 手の parent_sfen/parent_move が
+# 入った。B4 はそれを入力に 2 つの機構を足す:
+#
+#   (1) min-max バックアップ (_book_minmax_backup)
+#       葉局面の評価値を根へ後退させ、定跡全体で「最善応手列」を一貫させる。
+#       value のセマンティクスは「その局面の手番から見た cp」(やねうら王 db 互換)。
+#       子局面の手番は相手なので、親から見た手 m の真の価値は -value(子) で
+#       表される (negamax)。親の各手 value を、その手で到達する子局面の最善応手
+#       (= 子 bucket の max value) の符号反転で上書きすることで、葉の評価が
+#       1 手ずつ根へ伝播する。複数手前へは反復適用 (収束まで or 上限) で伝える。
+#
+#   (2) 探索優先度キュー (_BookPriorityQueue)
+#       Taya 式のランダム選択を「掘る価値の高い局面に集中」へ置換する土台。
+#       「評価が僅差 / 有望だが未探索の枝がある局面」
+#       を優先。さらに B3 が残した bad 手の parent_sfen (= 劣勢へ転落する手前局面)
+#       を最優先シードとして積む。本体は優先度付け・重複排除・取り出しのみで、
+#       盤面遷移や探索実行は呼び出し側 (_makebook_cli) が行う。
+# ====================================================================
+
+
+class _LockedEvalCache:
+    """[parallel] _MbEvalCache を RLock で包む (get/put とも排他)。"""
+    def __init__(self, inner, lock):
+        self._inner = inner
+        self._lock = lock
+    def get(self, sfen_key, min_depth=0, min_time_ms=0):
+        with self._lock:
+            return self._inner.get(sfen_key, min_depth, min_time_ms)
+    def put(self, sfen_key, bestmove, value_cp, depth, time_ms=0,
+            expected_generation=None):
+        with self._lock:
+            self._inner.put(sfen_key, bestmove, value_cp, depth, time_ms,
+                            expected_generation)
+    def generation(self, sfen_key):
+        with self._lock:
+            return self._inner.generation(sfen_key)
+    def invalidate(self, sfen_key):
+        with self._lock:
+            self._inner.invalidate(sfen_key)
+
+
+# standalone 版で省略した Default-OFF オーバーレイのノブ (指定されたら優雅拒否)
+_MB_REJECTED_KNOBS = {
+    "verify_s":          "B10 末端 DL/NNUE 二重検証",
+    "verify_margin_cp":  "B10 末端 DL/NNUE 二重検証",
+    "verify_max_leaves": "B10 末端 DL/NNUE 二重検証",
+    "widen_nodes":        "B12 適応的 MultiPV 候補拡張",
+    "widen_delta_cp":     "B12 適応的 MultiPV 候補拡張",
+    "widen_step":         "B12 適応的 MultiPV 候補拡張",
+    "widen_max":          "B12 適応的 MultiPV 候補拡張",
+    "widen_min_priority": "B12 適応的 MultiPV 候補拡張",
+    # zf_digger / zf_digger_hash_mb: standalone 版でも対応済み (B13 移植)
+    "target":       "M-4 ターゲットセレクタ",
+    "target_param": "M-4 ターゲットセレクタ",
+    "fetch_kif":    "K-1 KifManager 棋譜取得",
+    "peta_shock_engine":  "M-6 外部 peta_shock 委譲",
+    "peta_shock_threads": "M-6 外部 peta_shock 委譲",
+    "halve":        "_SpsaUsiEngine (SPSA 半減 config) 専用",
+    "book_fix_dummy": "",   # placeholder (未使用)
+}
+
+
 def _makebook_cli(extra_args: list) -> None:
+    # Windowsのリダイレクト/バッチ環境はcp1252等になり得る。起動メッセージ
+    # 自体のUnicodeEncodeErrorでエンジン起動前に落ちないようにする。
+    for stream in (sys.stdout, sys.stderr):
+        if stream is not None and hasattr(stream, "reconfigure"):
+            try:
+                kwargs = {"errors": "backslashreplace", "line_buffering": True}
+                if not stream.isatty():
+                    kwargs["encoding"] = "utf-8"
+                stream.reconfigure(**kwargs)
+            except (OSError, ValueError, io.UnsupportedOperation):
+                pass
+    # 盤面は統合 ShogiBoard を直接使用する (原本と同一)。
+    Board = ShogiBoard
+
+    import random as _random_mod
+    import datetime as _dt
+
+    # ================================================================
+    # 無人運転のための設定解決。各設定を以下の優先順で決める:
+    #   (1) CLI 引数 key=value  (例: makebook think_s=20 bad_cp=-300 unattended=1)
+    #   (2) 環境変数 MAKEBOOK_<KEY>  (例: MAKEBOOK_THINK_S=20)
+    #   (3) config指定、またはスクリプト横のPymakebook.settings.json
+    #   (4) 対話入力 input()  ※ stdin が TTY のときのみ
+    #   (5) 既定値
+    # unattended=1 (または非 TTY) のときは input() を一切呼ばず、未指定は既定値で
+    # 走る。これにより nohup / systemd / バッチからの無人連続運転が可能になる。
+    # ================================================================
+    _cli_kv = {}
+    _cli_options = []          # option=Key:Value (複数回可 — dict に潰さない)
+    for _a in (extra_args or []):
+        if _a == "makebook":   # `pymakebook makebook ...` 互換
+            continue
+        if "=" in _a:
+            _k, _v = _a.split("=", 1)
+            _k = _k.strip().lower()
+            if _k == "option":
+                _cli_options.append(_v.strip())
+            else:
+                _cli_kv[_k] = _v.strip()
+
+    _config_explicit = _cli_kv.get("config", os.environ.get("MAKEBOOK_CONFIG"))
+    _config_path = (_config_explicit if _config_explicit is not None else
+                    os.path.splitext(os.path.abspath(__file__))[0] + ".settings.json")
+    _file_settings = {}
+    if _config_path:
+        _config_path = os.path.abspath(os.path.expandvars(os.path.expanduser(_config_path.strip('"'))))
+        if os.path.isfile(_config_path):
+            try:
+                with open(_config_path, encoding="utf-8-sig") as _cf:
+                    _raw_settings = json.load(_cf)
+                if not isinstance(_raw_settings, dict):
+                    raise ValueError("設定はJSONオブジェクトで指定してください")
+                for _key, _value in _raw_settings.items():
+                    if not isinstance(_key, str):
+                        raise ValueError("設定キーは文字列で指定してください")
+                    _key = _key.lower()
+                    if _key == "engine_options" and isinstance(_value, dict):
+                        _file_settings[_key] = json.dumps(_value)
+                    elif isinstance(_value, (str, int, float, bool)):
+                        _file_settings[_key] = ("1" if _value else "0") if isinstance(_value, bool) else str(_value)
+                    else:
+                        raise ValueError("設定 %s の値が不正です" % _key)
+                # 設定ファイル由来の相対engineパスは、そのファイルの場所が起点。
+                _ep = _file_settings.get("engine", "").strip().strip('"')
+                _ep = os.path.expandvars(os.path.expanduser(_ep))
+                if _ep and not os.path.isabs(_ep):
+                    _ep = os.path.join(os.path.dirname(_config_path), _ep)
+                if _ep:
+                    _file_settings["engine"] = _ep
+                print("[makebook] 設定ファイル: " + _config_path)
+            except (OSError, ValueError) as _exc:
+                raise SystemExit("makebook: 設定ファイルを読めません: %s (%s)" % (_config_path, _exc))
+        elif _config_explicit is not None:
+            raise SystemExit("makebook: 設定ファイルが見つかりません: " + _config_path)
+
+    def _mb_unattended() -> bool:
+        # 明示フラグ優先。未指定なら stdin が非 TTY のとき無人とみなす。
+        v = _cli_kv.get("unattended", os.environ.get("MAKEBOOK_UNATTENDED", _file_settings.get("unattended")))
+        if v is not None:
+            return _norm_str(v) in ("1", "true", "yes", "on", "y")
+        try:
+            return not sys.stdin.isatty()
+        except Exception:
+            return True
+
+    _unattended = _mb_unattended()
+    if _unattended:
+        print("[makebook] 無人モード (unattended): input() を呼ばず "
+              "CLI/環境変数/既定値で実行します。")
+
+    # 対話モードで実際に質問する設定キー (これ以外は既定値で即続行)。
+    _MB_INTERACTIVE_KEYS = ("engine", "parallel", "basesfen", "readbook",
+                            "think_s", "book_fix", "fv_scale")
+
+    def _mb_setting(key: str, prompt: str, default: str) -> str:
+        """CLI → 環境変数 → 設定ファイル → input() → 既定値。"""
+        if key in _cli_kv:
+            return _cli_kv[key]
+        _env = os.environ.get("MAKEBOOK_" + key.upper())
+        if _env is not None:
+            return _env
+        if key in _file_settings:
+            return _file_settings[key]
+        if _unattended:
+            return default
+        if not prompt or key not in _MB_INTERACTIVE_KEYS:
+            # 対話で質問するのは _MB_INTERACTIVE_KEYS のみ。他の設定は
+            # 既定値で即続行する (key=value / 環境変数 MAKEBOOK_<KEY> での
+            # 指定は従来どおり有効)。旧実装は 16 個超の質問 + 無言の
+            # input("") 待ちがあり、開始まで延々と Enter が必要だった。
+            return default
+        try:
+            ans = input(prompt)
+            return ans if ans != "" else default
+        except EOFError:
+            # 対話入力中に EOF (パイプ閉鎖等) → 既定値で継続 (無人運転へ degrade)。
+            return default
+
+    def _mb_setting_num(key, prompt, default, *, to_int=True,
+                        lo=None, hi=None, scale=1.0):
+        """_mb_setting の数値版。try/int(float())/except を集約。"""
+        raw = _mb_setting(key, prompt, str(default)).strip()
+        try:
+            v = float(raw) * scale
+        except (ValueError, TypeError):
+            v = float(default) * scale
+        if to_int:
+            v = int(v)
+        if lo is not None:
+            v = max(lo, v)
+        if hi is not None:
+            v = min(hi, v)
+        return v
+
+    # ---- 省略オーバーレイのノブは優雅に拒否 (原本 Default-OFF 群) ----
+    for _rk, _rwhy in _MB_REJECTED_KNOBS.items():
+        if not _rwhy:
+            continue
+        _rv = _cli_kv.get(_rk, os.environ.get("MAKEBOOK_" + _rk.upper()))
+        if _rv is not None and str(_rv).strip() != "":
+            print("[makebook] オーバーレイ %s=%s（%s）指定のため、従来の単一スレッド版 makebook で実行します。"
+                  % (_rk, _rv, _rwhy))
+            return _makebook_cli_overlay(extra_args)
+
+    # ---- 各種設定を解決 (CLI/環境変数/対話/既定) ----
+
+    # ---- 子エンジン: 任意の USI エンジン exe ([standalone] _SpsaUsiEngine 代替) ----
+    engine_path = _mb_setting(
+        "engine",
+        "使用する USI エンジン exe のパスを入力してね（例：YaneuraOu.exe）\n",
+        "").strip().strip('"')
+    if not engine_path:
+        raise SystemExit("makebook: engine=<USIエンジンexe> が必要です "
+                         "(例: Pymakebook.py engine=YaneuraOu.exe)")
+    engine_path = os.path.abspath(os.path.expandvars(os.path.expanduser(engine_path)))
+    if not os.path.isfile(engine_path):
+        raise SystemExit("makebook: エンジンが見つかりません: %s" % engine_path)
+
+    # resign_cp は ResignValue 転送のためエンジン起動前に解決する。
+    # 0 = 無効 (既定 = 原挙動)。> 0 で「探索報告値 (手番側視点 cp) が
+    # -resign_cp 以下なら bestmove==resign と同じ終局経路で投了裁定」。
+    resign_cp = _mb_setting_num(
+        "resign_cp",
+        "ハーネス側投了しきい値 cp（探索値がこれ以下で投了裁定。0=無効。空欄なら 0）\n",
+        0, lo=0)
+    if resign_cp > 0:
+        print("[makebook][resign_cp] 投了裁定: ON (score_cp <= -%d で resign 扱い"
+              " / setoption ResignValue も送信)" % resign_cp)
+
+    # parallel: 同時対局ワーカー数 (各ワーカーが自前のエンジン子プロセスを持つ)。
+    parallel = _makebook_parallel_count(_mb_setting(
+        "parallel",
+        "並列数（空欄/auto=論理コア数 %d。1=単独運転）\n" % (os.cpu_count() or 1),
+        "auto"))
+    check_engine = _norm_str(_mb_setting("check_engine", "", "0")) in ("1", "true", "yes", "on")
+    if check_engine:
+        parallel = 1
+    if parallel > 1:
+        print("[makebook][parallel] %d ワーカー並列 (book/pq/transitions は"
+              " RLock 直列化・保存は単一書き手。進行順は非決定的)" % parallel)
+
+    # setoption 群: engine_options=<JSON dict> + option=Key:Value (複数回可)
+    #             + 環境変数 MAKEBOOK_OPTION ("Key:Value;Key2:Value2")
+    _engine_opts = {"USI_OwnBook": "false"}   # 定跡を定跡で育てない (上書き可)
+    _ej = _mb_setting("engine_options", "", "").strip()
+    if _ej:
+        try:
+            _ejd = json.loads(_ej)
+            if isinstance(_ejd, dict):
+                for _k, _v in _ejd.items():
+                    _engine_opts[str(_k)] = ("true" if _v else "false") if isinstance(_v, bool) else str(_v)
+            else:
+                print("[makebook] engine_options は JSON dict で指定してください — 無視")
+        except ValueError as _e:
+            print("[makebook] engine_options の JSON 解釈に失敗 (%s) — 無視" % _e)
+    _env_opt = os.environ.get("MAKEBOOK_OPTION", "")
+    for _tok in ([t for t in _env_opt.split(";") if t.strip()] + _cli_options):
+        if ":" in _tok:
+            _k, _v = _tok.split(":", 1)
+            _engine_opts[_k.strip()] = _v.strip()
+        else:
+            print("[makebook] option=%r は Key:Value 形式ではありません — 無視" % _tok)
+    # fv_scale=<N>: 評価関数のスケール調整。指定時のみ setoption FV_SCALE を送る
+    # (未対応エンジンは黙って無視するだけなので安全)。
+    _fv_scale = _mb_setting(
+        "fv_scale",
+        "FV_SCALE（評価関数スケール。空欄なら送らない。例：24）\n",
+        "").strip()
+    if _fv_scale:
+        _engine_opts.setdefault("FV_SCALE", _fv_scale)
+        print("[makebook] setoption name FV_SCALE value %s を送信します" % _fv_scale)
+
+    if resign_cp > 0 and "ResignValue" not in _engine_opts:
+        # 対応エンジンにはエンジン側投了も併用させる (非対応エンジンは無視するだけ)。
+        _engine_opts["ResignValue"] = str(resign_cp)
+
+    # ユーザー指定の構成: 論理コア数のプロセス、各Threads=1/Hash=1024MB。
+    if not any(k.lower() == "threads" for k in _engine_opts):
+        _engine_opts["Threads"] = "1"
+    if not any(k.lower() in ("usi_hash", "hash") for k in _engine_opts):
+        _engine_opts["USI_Hash"] = "1024"
+    _hash = next(v for k, v in _engine_opts.items() if k.lower() in ("usi_hash", "hash"))
+    _threads_per_engine = next(v for k, v in _engine_opts.items() if k.lower() == "threads")
+    print("[makebook] 起動構成: %d本 / 各Threads=%s / 各Hash=%sMB (Hash合計=%.1fGiB)"
+          % (parallel, _threads_per_engine, _hash, parallel * int(_hash) / 1024), flush=True)
+    _stop_evt = threading.Event()
+    _engine_log = os.path.abspath(_mb_setting("engine_log", "",
+                                   "makebook_engine%s.log" % _dt.datetime.now().strftime("%Y%m%d%H%M%S")))
+    try:
+        os.makedirs(os.path.dirname(_engine_log), exist_ok=True)
+        with open(_engine_log, "a", encoding="utf-8"):
+            pass
+    except OSError as exc:
+        raise SystemExit("makebook: 診断ログに書き込めません: %s (%s)" % (_engine_log, exc))
+    _usi_timeout = _mb_setting_num("usi_timeout", "", 60, to_int=False, lo=0.1)
+    _ready_timeout = _mb_setting_num("ready_timeout", "", 600, to_int=False, lo=0.1)
+    _restart_limit = _mb_setting_num("restart_limit", "", 3, lo=0, hi=20)
+    _loss_review_ms = _mb_setting_num("loss_review_s", "", 1.0,
+                                    to_int=True, lo=0, hi=10000, scale=1000.0)
+    _loss_review_depth = _mb_setting_num("loss_review_depth", "", 6, lo=1)
+    _loss_review_margin = _mb_setting_num("loss_review_margin_cp", "", 100, lo=1)
+    _max_games = _mb_setting_num("max_games", "", 0, lo=0)
+
+    def _new_engine(_wid):
+        return _MbUsiEngine(engine_path, _engine_opts, "makebook%d" % _wid,
+                            log_path=_engine_log, stop_event=_stop_evt,
+                            usi_timeout=_usi_timeout, ready_timeout=_ready_timeout)
+
+    print("[makebook] 診断ログ: " + _engine_log, flush=True)
+    if check_engine:
+        _probe = _new_engine(0)
+        try:
+            if not _probe.start() or not _probe.initialize():
+                raise SystemExit(1)
+            print("[makebook] エンジン起動・USI初期化: OK", flush=True)
+        finally:
+            _probe.quit()
+        return
+
+    book = {}           # 定跡データ  {sfen: {move: visit_count}}
+    book0 = None       # 穴探索モード時の対象局面
+
+    # 既存やねうら王 db の読み込み (原本 L50238-50314 逐語)
+    readbook = _mb_setting(
+        "readbook",
+        "やねうら王dbファイルをロードする場合、パスを入力してね（例：standard_book.db）\n",
+        "").strip()
+    if readbook and not readbook.endswith(".db"):
+        if readbook.lower().endswith(".ybb"):
+            # [M-2] .ybb を _db_parse_ybb で直接読み込み、makebook book dict へ変換
+            try:
+                _ybb_raw = _db_parse_ybb(readbook)
+                _ybb_loaded = 0
+                for _ybb_key, _ybb_moves in _ybb_raw.items():
+                    for _usi, _val, _cnt in _ybb_moves:
+                        if _ybb_key in book:
+                            book[_ybb_key][_usi] = _book_make_entry(_val, 0, max(_cnt, 1))
+                        else:
+                            book[_ybb_key] = {_usi: _book_make_entry(_val, 0, max(_cnt, 1))}
+                        _ybb_loaded += 1
+                print(f"[makebook][M-2] .ybb 読込完了: {len(_ybb_raw)} 局面, "
+                      f"{_ybb_loaded} 手 from '{readbook}'")
+            except Exception as _ybb_err:
+                print(f"[makebook] .ybb 読込失敗: {_ybb_err}")
+                if _unattended:
+                    raise SystemExit(
+                        f"makebook: .ybb 読込失敗 (無人モード): {_ybb_err}")
+                print("空の定跡から開始します。")
+        else:
+            # .bin (Apery バイナリ定跡) 等は makebook ローダ非対応。
+            print(f"[makebook] '{readbook}' は .db 形式ではないため読み込めません "
+                  f"(.bin 等のバイナリ定跡は未対応)。空の定跡から開始します。")
+    if readbook.endswith(".db"):
+        if not os.path.isfile(readbook):
+            print("[makebook] 定跡ファイルが見つかりません: %s — 空の定跡から開始します。"
+                  % readbook)
+            readbook = ""
+    if readbook.endswith(".db"):
+        with open(readbook, "r", encoding="utf-8", errors="ignore") as rfile:
+            rfile.readline()  # 「#YANEURAOU-DB2016 1.00」をスキップ
+            sfen = None
+            while True:
+                s = rfile.readline()
+                if s == "":
+                    break
+                s = s.strip()
+                if s == "":
+                    continue
+                elif s[:4] == "sfen":
+                    # "sfen <board> <turn> <hand> <ply>" → 手数を 0 に正規化し、
+                    # 先頭の "sfen " を除いて board 始まりのキーにする。対局ループの
+                    # キー生成 (_book_key_from_sfen(board.sfen()) ベース) と
+                    # 一致させないと、ロードした定跡が一度も参照されない。
+                    sfen = _book_key_from_sfen(s)
+                    continue
+                else:
+                    if sfen is None:
+                        continue
+                    # やねうら王 db 手順行: "<best> <ponder> <value> <depth> <num>"。
+                    # 旧 makebook はこの value/depth を捨て count のみ使っていたが、
+                    # B3 以降は value(cp)/depth を読み戻して新スキーマ dict にする。
+                    # 値が欠けている (古い他ツール由来等) 行も壊れないよう寛容に解釈。
+                    _toks = s.split()
+                    move = _toks[0]
+                    _val = _book_parse_int(_toks[2] if len(_toks) > 2 else None, 0)
+                    _dep = _book_parse_int(_toks[3] if len(_toks) > 3 else None, 0)
+                    _cnt = _book_parse_int(_toks[4] if len(_toks) > 4 else None, 1)
+                    if _cnt < 1:
+                        _cnt = 1
+                    _entry = _book_make_entry(_val, _dep, _cnt)
+                if sfen in book:
+                    book[sfen][move] = _entry
+                else:
+                    book[sfen] = {move: _entry}
+
+        book_fix = _mb_setting(
+            "book_fix",
+            "定跡の穴探索モード？ b:先手定跡の穴を探す w:後手定跡の穴を探す それ以外:通常モード\n",
+            "")
+        if book_fix == "b" or book_fix == "w":
+            book0 = {}
+            for i in book:
+                if _book_turn_of_key(i) == book_fix:
+                    book0[i] = book[i]
+            book = {}
+
+    # 初期局面 ([standalone 拡張] 原本の "startpos moves ..." に加えて
+    # 生 "sfen <board> <turn> <hands> <ply> [moves ...]" / "position sfen ..." も受理)
+    basesfen = _mb_setting(
+        "basesfen",
+        "usi棋譜（position startpos... または sfen ...）を入力してね。"
+        "入力しなければ平手初期局面\n",
+        "")
+    # "position " プレフィックスを安全に除去（9文字強制スライスのサイレント
+    # 切り捨てバグを修正）。"position " で始まらない入力はそのまま使用する。
+    if basesfen.startswith("position "):
+        basesfen = basesfen[9:]
+    basesfen = basesfen.strip()
+    if len(basesfen) < 13:
+        basesfen = "startpos moves"
+    else:
+        _bs_toks = basesfen.split()
+        _bs_moves = []
+        _bs_origin = basesfen
+        if "moves" in _bs_toks:
+            _bs_mi = _bs_toks.index("moves")
+            _bs_moves = _bs_toks[_bs_mi + 1:]
+            _bs_origin = " ".join(_bs_toks[:_bs_mi])
+        if _bs_toks[0] == "startpos":
+            if "moves" not in _bs_toks:
+                basesfen = basesfen + " moves"
+        elif _bs_toks[0] == "sfen":
+            pass   # ShogiBoard.set が "sfen <board> <stm> <hand> <ply> [moves ...]" を直接受理
+        else:
+            print("[makebook] basesfen を解釈できません (%r) — 平手初期局面で開始"
+                  % basesfen[:40])
+            basesfen = "startpos moves"
+            _bs_moves = []
+            _bs_origin = "startpos"
+        if _bs_moves:
+            # 与えた棋譜手を強制採用させる高 count シード。value/depth は
+            # 未探索なので 0 のままにしておく (実探索で上書きされ得る)。原本同等。
+            bookboard = Board()
+            bookboard.set(_bs_origin if _bs_origin else "startpos")
+            for i in _bs_moves:
+                sfen = _book_key_from_sfen(bookboard.sfen())
+                if sfen:
+                    book[sfen] = {i: _book_make_entry(0, 0, 1000)}
+                bookboard.push(i)
+
+    # 探索ノード数 → go byoyomi (秒) に変更
+    byoyomi_ms = _mb_setting_num(
+        "think_s",
+        "1手あたりの思考時間（秒）を入力してね（例：20）。空欄なら20秒\n",
+        20, scale=1000.0)
+    if byoyomi_ms < 100:
+        byoyomi_ms = 20000
+    _flog("[makebook] go btime 0 wtime 0 byoyomi %d で探索します。" % byoyomi_ms)
+
+    # [12] 先後可変・評価値フラット化（byoyomi秒数版）。
+    # think_s を基準アンカーとする比率指定。既定は先手:後手:収束後 = 10:40:25
+    # （後手を厚く掘り、|eval|<=eval_flatten_cp に収まったら現状の think_s に戻る）。
+    sente_weight = _mb_setting_num("sente_weight", "", 10, lo=0)
+    gote_weight = _mb_setting_num("gote_weight", "", 40, lo=0)
+    flat_weight = _mb_setting_num("flat_weight", "", 25, lo=1)
+    eval_flatten_cp = _mb_setting_num(
+        "eval_flatten_cp",
+        "この絶対値(cp)以下に評価値が収まったら先後共通秒数に切替（空欄なら 0 = "
+        "評価値が完全に 0 のときのみ）\n",
+        0)
+    sg_mode = _mb_setting("sg_mode", "", "1").strip() not in ("0", "false", "no")
+
+    byo_b_ms = byo_w_ms = byo_flat_ms = byoyomi_ms
+    if sg_mode:
+        _sg_scale = byoyomi_ms / float(flat_weight)
+        byo_b_ms = max(100, int(sente_weight * _sg_scale))
+        byo_w_ms = max(100, int(gote_weight * _sg_scale))
+        byo_flat_ms = byoyomi_ms   # flat_weight が既定(25)のとき恒等
+        print("[makebook] 先後可変思考時間: 先手=%.1fs 後手=%.1fs → |eval|<=%dcpでflat=%.1fsへ収束"
+              % (byo_b_ms / 1000, byo_w_ms / 1000, eval_flatten_cp, byo_flat_ms / 1000))
+
+    # [除去] 悪手判定系 (bad_cp / GP 連動 / B6 swing / #5 refute) と
+    # B8 blunder_seeds (Pyfamate 対局側シード読込) は standalone から削除した。
+    # 優先キューの持ち越し (施策4 carryover) は起動時に自動読込する。
+
+    # 千日手処理
+    draw = _mb_setting(
+        "draw",
+        "千日手はどうする？ b:先手負け w:後手負け それ以外:無視\n",
+        "")
+
+    # 優先度キュー起点の育成設定 (常時 ON)。
+    _queue_every = _mb_setting_num("queue_every", "", 3, lo=1)
+    _flog("[makebook][B5] 優先度キュー起点の育成: 常時 ON "
+          "(%d 局ごとに優先局面から再開; キュー空なら basesfen)" % _queue_every)
+
+    # [B9] 既存定跡ヒット時もこの確率 [%] で定跡を無視して探索し直す。0 = 従来。
+    ignore_pct = _mb_setting_num(
+        "ignore_pct",
+        "定跡無視率 %（定跡ヒット時もこの確率で探索し直す。0=従来。空欄なら 0）\n",
+        0, to_int=False, lo=0.0, hi=100.0)
+    if ignore_pct > 0.0:
+        print("[makebook][B9] ノイズ付き自己対局: ON "
+              "(定跡無視率 %.1f%%)" % ignore_pct)
+
+    # ============================================================
+    # 定跡充実パラメータ (施策1〜6)。原本 config キー既定値を定数で継承。
+    # ============================================================
+    _full_backup_max_pos = _mb_setting_num(
+        "full_backup_max_pos",
+        "全 DAG バックアップを行う book 局面数の上限（超過で transitions 限定へ"
+        "退避。空欄なら %d）\n" % _makebook_full_backup_max_pos,
+        _makebook_full_backup_max_pos, lo=0)
+    _flog("[makebook][施策1] peta-shock 全 DAG バックアップ: 常時 ON "
+          "(上限 %d 局面 超で transitions 限定へ退避)" % _full_backup_max_pos)
+
+    eval_diff_cp = _mb_setting_num(
+        "eval_diff_cp",
+        "best-first リーフ選択の許容差 cp（root 主要変化を辿り末端を優先掘削。"
+        "0 で無効。空欄なら %d）\n" % _makebook_eval_diff_cp,
+        _makebook_eval_diff_cp)
+    if eval_diff_cp > 0:
+        _flog("[makebook][施策2] best-first リーフ選択 (peta_next): ON "
+              "(eval_diff=%dcp)" % eval_diff_cp)
+    eval_diff_from_start_cp = _mb_setting_num(
+        "eval_diff_from_start_cp",
+        "s-アンカー枝刈り cp（開始局面評価からこの差を超えて下落した相手番局面を"
+        "展開しない。0 で無効。空欄なら %d）\n" % _makebook_eval_diff_from_start_cp,
+        _makebook_eval_diff_from_start_cp)
+    if eval_diff_from_start_cp > 0:
+        _flog("[makebook][施策2+] s-アンカー枝刈り (やね2025-06): ON "
+              "(eval_diff_from_start=%dcp)" % eval_diff_from_start_cp)
+
+    max_book_ply = _mb_setting_num(
+        "max_ply",
+        "掘削手数の上限（peta_next と自己対局の暴走防止。0 で無制限。"
+        "空欄なら %d）\n" % _makebook_max_ply,
+        _makebook_max_ply, lo=0)
+    if max_book_ply > 0:
+        print("[makebook][施策6] 掘削手数の上限: %d 手" % max_book_ply)
+
+    bestline_node_coef = _mb_setting_num(
+        "bestline_node_coef",
+        "best line 沿いの手の思考時間倍率（直前手が定跡最善だった局面は"
+        "前探索流用で短時間。1.0 で無効。空欄なら %g）\n"
+        % _makebook_bestline_coef,
+        _makebook_bestline_coef, to_int=False)
+    if not (0.0 < bestline_node_coef <= 1.0):
+        bestline_node_coef = 1.0   # 不正値は無効化 (一律フル思考)
+    if bestline_node_coef < 1.0:
+        _flog("[makebook][施策5] best line 思考時間倍率: %.2f" % bestline_node_coef)
+
+    # 共有ロック ([parallel] 変異点: book エントリ / _book_mark_bad /
+    # _apply_book_result / pq push・pop / transitions / kif / カウンタ / 保存)
+    _lk = threading.RLock()
+
+    # [MB-TT-CACHE] 局面評価 LRU キャッシュ (parallel でも単一共有 — ロック包み)
+    _eval_cache_size = _mb_setting_num("eval_cache_size", "",
+                                       _makebook_eval_cache_size, lo=0)
+    # size=0でも世代番号は保持し、並列goの遅延結果を識別する。
+    _eval_cache = _LockedEvalCache(_MbEvalCache(_eval_cache_size), _lk)
+    if _eval_cache_size > 0:
+        _flog("[makebook][MB-TT-CACHE] 局面評価キャッシュ ON (size=%d)" % _eval_cache_size)
+
+    # [MB-SATURATION] 飽和検出窓
+    _sat_window = _mb_setting_num("saturation_window", "",
+                                  _makebook_saturation_window, lo=0)
+    _sat_new_counts = []   # 直近 K 局の新規局面数 (共有 — _lk 下で触る)
+
+    # peta_next BFS の手数上限
+    _PETANEXT_DEFAULT_STEP = 40
+    _petanext_max_step = max_book_ply if max_book_ply > 0 else _PETANEXT_DEFAULT_STEP
+
+    # 施策4: 停止時に持ち越す優先キュー局面数の上限
+    _MB_CARRYOVER_MAX = 5000
+
+    # 保存ファイル名 (日時付き)
+    t_delta = _dt.timedelta(hours=9)
+    JST = _dt.timezone(t_delta, "JST")
+    now = _dt.datetime.now(JST)
+    d = now.strftime("%Y%m%d%H%M%S")
+    kiffile   = "kif" + d + ".sfen"
+    bookfile  = "book" + d + ".db"
+    bookfile2 = "book" + d + "_2.db"
+
+    kif = []           # 棋譜データ (共有)
+    _sh = {"win": 0, "kif_total": 0, "endturn": None}   # 連勝/局数 (共有)
+
+    # ---- 子エンジン起動 ----
+    # single (parallel=1): ここで worker0 用を起動・初期化する。
+    # parallel>1: ここでは起動せず、各ワーカーが自分のエンジンをスレッド内で
+    # 並行起動する (旧実装は worker0 だけ先に直列初期化しており、NNUE 読込等で
+    # 起動が二段に長かった)。
+    _engines = []
+    def _close_engines():
+        _stop_evt.set()
+        for _e in list(_engines):
+            _e.quit()
+    # 初期化後の設定/キュー処理で例外が起きても、子プロセスを残さない。
+    atexit.register(_close_engines)
+    eng = None
+    if parallel <= 1:
+        print("[makebook] 子エンジン (%s) を起動中..." % engine_path)
+        eng = _new_engine(0)
+        _engines.append(eng)
+        try:
+            if not eng.start() or not eng.initialize():
+                raise SystemExit("makebook: エンジン初期化に失敗しました。診断ログを確認してください。")
+        except BaseException:
+            eng.quit()
+            raise
+    else:
+        print("[makebook][parallel] %d 本のエンジン (%s) を並行起動します..."
+              % (parallel, engine_path))
+    print("[makebook] 設定: think=%.0fs parallel=%d 読込book=%d局面"
+          " (詳細ログ: MAKEBOOK_DEBUG=1)"
+          % (byoyomi_ms / 1000.0, parallel, len(book)))
+    print("[makebook] %sCtrl+C で停止 (book/kif 自動書き出し)。\n"
+          % ("エンジン準備完了。連続対局を開始します。" if parallel <= 1
+             else "ワーカーごとに初期化し、準備できたエンジンから対局を開始します。"), flush=True)
+
+    # [B13] Zyfamate 常駐詰み監視。zf_digger=1 (既定) かつ Zyfamate exe が
+    # 見つかったときだけ起動する。起動失敗時は None のままで機能はあくまで上乗せ。
+    _zf_digger = None
+    _zf_digger_setting = _mb_setting("zf_digger", "", "0").strip().lower()
+    if _zf_digger_setting not in ("0", "false", "no"):
+        # Zyfamate exe のパス解決: エンジンと同じディレクトリから探す。
+        _zf_path = _mb_setting("zf_digger_path", "", "").strip().strip('"')
+        if not _zf_path:
+            _eng_dir = os.path.dirname(os.path.abspath(engine_path))
+            for _zf_cand in ("Zyfamate.exe", "Zyfamate", "zyfamate.exe", "zyfamate"):
+                _zf_try = os.path.join(_eng_dir, _zf_cand)
+                if os.path.isfile(_zf_try):
+                    _zf_path = _zf_try
+                    break
+        if _zf_path and os.path.isfile(_zf_path):
+            _zf_hash = _mb_setting_num("zf_digger_hash_mb", "", 1024)
+            _zf_digger = _ZfDigger(_zf_path, hash_mb=_zf_hash)
+            if _zf_digger.start():
+                print("[makebook][B13] Zyfamate 常駐詰み監視: ON (%s, hash=%dMB)"
+                      % (_zf_path, _zf_hash))
+            else:
+                _zf_digger = None
+        elif _zf_digger_setting == "1":
+            # 既定値のまま Zyfamate が見つからない = サイレントに無効化
+            pass
+        else:
+            print("[makebook][B13] Zyfamate が見つかりません: %s (機能無効化)" % _zf_path)
+
+    # SIGTERM / SIGBREAK を KeyboardInterrupt へ変換 (原本と同一の graceful 保存経路)
+    def _mb_term_to_kbint(signum, frame):
+        raise KeyboardInterrupt
+    for _signame in ("SIGTERM", "SIGBREAK"):
+        _sig = getattr(signal, _signame, None)
+        if _sig is not None:
+            try:
+                signal.signal(_sig, _mb_term_to_kbint)
+            except (ValueError, OSError, RuntimeError) as _e:
+                _flog(f"[ignored] _makebook_cli: {_e!r}")
+
+    # 局面遷移の記録 (min-max バックアップの入力・共有)
+    transitions = {}
+    # 再探索優先度キュー (共有)
+    pq = _BookPriorityQueue()
+
+    # [施策2] peta_next の起点 = basesfen を再生した局面の正規化キー。
+    try:
+        _rb = Board()
+        _rb.set(basesfen)
+        _root_key = _book_key_from_sfen(_rb.sfen())
+    except Exception:
+        _root_key = ""
+
+    # [施策4] 前回停止時の持ち越しキュー (makebook_carryover*.txt) を自動読込。
+    # 読込後は .consumed へ退避して重複投入を防ぐ。
+    import glob as _glob_mod
+    for _cf in sorted(_glob_mod.glob("makebook_carryover*.txt")):
+        if ".consumed" in _cf:
+            continue
+        _seeds, _ = _makebook_load_seed_jsonl(_cf)
+        for _sd in _seeds:
+            try:
+                _pri = float(_sd.get("priority", 100.0))
+            except (TypeError, ValueError):
+                _pri = 100.0
+            pq.push(_sd["sfen"], _pri)
+        try:
+            os.replace(_cf, _cf + ".consumed")
+            try:
+                os.remove(_cf + ".offset")
+            except OSError:
+                pass
+        except OSError as _ce:
+            _flog(f"[ignored] carryover 退避失敗: {_ce!r}")
+        if _seeds:
+            print("[makebook][施策4] 持ち越しキュー %d 局面を再投入 (%s)"
+                  % (len(_seeds), _cf))
+
+    _worker_errors = []
+
+    # ================================================================
+    # 対局ワーカー (原本の連続対局ループ L50835-51181 の逐語移植。
+    # [parallel] book/pq/transitions/kif/カウンタの読み書きを _lk で直列化し、
+    # 探索 (go byoyomi) だけロック外で走らせる。per-game 状態はローカル。
+    # 省略: B12 widener (Default-OFF オーバーレイ)。
+    # 追加: resign_cp 投了裁定 / B13 ZfDigger (Zyfamate 常駐詰み監視)。
+    # ================================================================
+    def _game_worker(_wid, eng_w):
+        _rng = _random_mod.Random()
+
+        board = Board()
+        board.set(basesfen)
+        tempbook = []
+        tempkif = [basesfen]
+        end = 0
+        _game_from_queue = False
+        _flattened = False
+        _last_actual_search_ply = -2
+        _pending_mate_moves = []   # [B13] Zyfamate 詰み手順の未消化キュー
+
+        while not _stop_evt.is_set():
+            sfen = _book_key_from_sfen(board.sfen())
+
+            # [B13] Zyfamate 常駐監視 (worker 0 のみ — Zyfamate は単一プロセス)
+            if _wid == 0 and not _pending_mate_moves and _zf_digger is not None:
+                _zf_digger.watch(board.sfen(), len(tempkif))
+                _mate_found = _zf_digger.poll_mate()
+                if _mate_found is not None:
+                    _sfen_at_mate, _movecount_at_mate, _usi_moves = _mate_found
+                    _verified = _zf_digger_verify(
+                        _usi_moves, _movecount_at_mate, tempkif, board)
+                    if _verified is not None:
+                        _pending_mate_moves = list(_verified)
+                        _stale_n = len(tempkif) - _movecount_at_mate
+                        _flog("[makebook][Zyfamate] 詰み発見・検証済 (%d手%s) "
+                              "→ 手順をそのまま指させます"
+                              % (len(_pending_mate_moves),
+                                 "・stale再利用(実戦%d手先行分を突合)" % _stale_n
+                                 if _stale_n else ""))
+
+            _searched = False
+            _val_cp = 0
+            _dep = 0
+            _do_search = False
+            _pv_prev_sfen = _pv_prev_move = None
+            _force_search = _game_from_queue and not tempbook
+            # 量子ガシャ式ノイズ: 定跡ヒット時も ignore_pct% で探索へ迂回。
+            _noise_deviate = (ignore_pct > 0.0
+                              and _rng.random() * 100.0 < ignore_pct)
+
+            with _lk:
+                # [B13] Zyfamate 詰み手順を最優先消費 (探索・定跡より常に優先)
+                if _pending_mate_moves:
+                    bestmove = _pending_mate_moves.pop(0)
+                    _mate_val = -_BOOK_MATE_CP if _pending_mate_moves else _BOOK_MATE_CP
+                    _bucket = book.setdefault(sfen, {})
+                    _cur = _bucket.get(bestmove)
+                    _bucket[bestmove] = _book_make_entry(
+                        _mate_val, len(_pending_mate_moves) + 1,
+                        _book_entry_count(_cur) + 1 if _cur else 1)
+                    # 手選択完了 — 以下の探索/定跡分岐をスキップ
+                else:
+                    bestmove = None  # 以下の分岐で決定する
+
+                # [施策5] best line 思考時間倍率 + [12] 先後可変秒数 (原本逐語)
+                _base_byo_ms = byoyomi_ms
+                if sg_mode:
+                    _side_to_move = _book_turn_of_key(sfen)
+                    _base_byo_ms = byo_flat_ms if _flattened else (
+                        byo_b_ms if _side_to_move == "b" else byo_w_ms)
+                _byo_override = _base_byo_ms if _base_byo_ms != byoyomi_ms else None
+                if bestline_node_coef < 1.0 and tempbook:
+                    _psfen, _pmove = tempbook[-1]
+                    if _makebook_can_reuse_search(
+                            _last_actual_search_ply, len(tempbook),
+                            _book_is_bestline_move(book.get(_psfen), _pmove)):
+                        _byo_override = max(100, int(_base_byo_ms
+                                                     * bestline_node_coef))
+                if bestmove is not None:
+                    pass  # [B13] 詰み手順で決定済み — 探索/定跡分岐をスキップ
+                elif _force_search:
+                    # [MB-PV-REUSE] bestline 降下時は moves 追記形式で子 TT 温存
+                    if bestline_node_coef < 1.0 and _byo_override is not None and tempbook:
+                        _pv_prev_sfen, _pv_prev_move = tempbook[-1]
+                    _do_search = True
+                elif book0 is not None and book0.get(sfen):
+                    bestmove = _book_pick_move(book0[sfen], _rng)
+                elif book.get(sfen) and not _noise_deviate:
+                    bestmove = _book_pick_move(book[sfen], _rng)
+                    _chosen_entry = book[sfen].get(bestmove)
+                    if isinstance(_chosen_entry, dict) and _chosen_entry.get("loss_pending"):
+                        # 保持した負け候補を再生し続けず、次の訪問で評価を更新する。
+                        _force_search = True
+                        _do_search = True
+                        bestmove = None
+                else:
+                    if sfen in book and _noise_deviate:
+                        _flog("[makebook][B9] 定跡無視 (ノイズ注入) — 探索へ迂回")
+                    _do_search = True
+
+            if _do_search:
+                # 探索はロック外 (長時間)。cache はロック包みで共有安全。
+                bestmove, _val_cp, _dep = _bestmove_by_search(
+                    eng_w, byoyomi_ms, sfen, _byo_override,
+                    cache=_eval_cache,
+                    prev_sfen=_pv_prev_sfen, prev_move=_pv_prev_move,
+                    force_search=_force_search or _noise_deviate,
+                    position_cmd=_makebook_position_command(tempkif[0], tempkif[1:]))
+                # [RECOVER] bestmove None = エンジンプロセス死亡 (メモリエラー等)。
+                # 子を作り直して同じ局面を探索し直す。PV-REUSE は新プロセスに
+                # TT が無いため使わない。
+                _retries = 0
+                while bestmove is None and not _stop_evt.is_set():
+                    if _retries >= _restart_limit:
+                        raise RuntimeError("worker %d: 探索復旧が%d回失敗。異常局面は登録せず保存して停止します"
+                                           % (_wid, _restart_limit))
+                    _retries += 1
+                    print("[makebook][recover] worker %d のエンジンが落ちました"
+                          " — 再起動します" % _wid)
+                    with _lk:
+                        if eng_w in _engines:
+                            _engines.remove(eng_w)
+                    eng_w.quit()
+                    if _stop_evt.wait(min(_retries, 3)):
+                        return
+                    eng_w = _new_engine(_wid)
+                    with _lk:
+                        _engines.append(eng_w)
+                    if not eng_w.start() or not eng_w.initialize():
+                        continue
+                    print("[makebook][recover] worker %d 復旧 — 探索を再開します"
+                          % _wid)
+                    bestmove, _val_cp, _dep = _bestmove_by_search(
+                        eng_w, byoyomi_ms, sfen, _base_byo_ms,
+                        cache=_eval_cache, force_search=True,
+                        position_cmd=_makebook_position_command(tempkif[0], tempkif[1:]))
+                if bestmove is None or _stop_evt.is_set():
+                    return
+                _searched = True
+                if not eng_w.last_search_from_cache:
+                    _last_actual_search_ply = len(tempbook)
+
+            _primary_generation = getattr(eng_w, "last_search_generation", None)
+            # 終局に伴う候補の削除は、その局面の評価を確認してから判断する。
+            # 子エンジンのgoを共有ロック中に走らせない。
+            if (resign_cp > 0 and _searched and _dep > 0
+                    and bestmove not in ("resign", "win", "")
+                    and _val_cp <= -resign_cp):
+                _flog("[makebook][resign_cp] 投了裁定: %s (value=%+dcp <= -%d)"
+                      % (bestmove, _val_cp, resign_cp))
+                bestmove = "resign"
+            _review_history = tempbook
+            _review_loser = None
+            if bestmove in ("resign", "win"):
+                _review_loser = _book_turn_of_key(sfen)
+                if bestmove == "win":
+                    _review_loser = "w" if _review_loser == "b" else "b"
+            elif draw in ("b", "w") and bestmove and board.is_legal_lite(bestmove):
+                _preview = board.clone()
+                _preview.push(bestmove)
+                if _preview.is_sennichite():
+                    _review_loser = draw
+                    _review_history = tempbook + [(sfen, bestmove)]
+            _review = None
+            _review_entry = None
+            if _review_loser is not None and _loss_review_ms > 0:
+                _review_pair = next((pair for pair in reversed(_review_history)
+                                     if pair[1] not in ("resign", "win", "", "rep_draw")
+                                     and _book_turn_of_key(pair[0]) == _review_loser), None)
+                if _review_pair is not None:
+                    with _lk:
+                        _review_entry = book.get(_review_pair[0], {}).get(_review_pair[1])
+                        if isinstance(_review_entry, dict):
+                            _review_entry = dict(_review_entry)
+                    _review = _makebook_review_loss(
+                        eng_w, tempkif[0], _review_history, _review_loser,
+                        _loss_review_ms, _loss_review_depth, _loss_review_margin)
+                    eng_w._record("loss_review", json.dumps(_review, ensure_ascii=False))
+                    _flog("[makebook][loss_review] %s: %s"
+                          % (_review_pair[1], _review["reason"]))
+
+            with _lk:
+                if _stop_evt.is_set():
+                    return
+                _generation = _primary_generation
+                if (_searched and _generation is not None and _eval_cache is not None
+                        and _eval_cache.generation(_generation[0]) != _generation[1]):
+                    # 確認・削除前の探索結果が並列workerから遅れて届いた。
+                    # 現在の世代で再探索し、古い結果をbookへ登録しない。
+                    continue
+                _confirmed_loss = None
+                if _review is not None and _review["confirmed"]:
+                    _rp = _review["pair"]
+                    # 他workerが同じ候補を更新したら、古い照合結果では削除しない。
+                    if book.get(_rp[0], {}).get(_rp[1]) == _review_entry:
+                        _alt_move, _alt_cp, _alt_depth = _review["alternative_result"]
+                        _alt_bucket = book.setdefault(_rp[0], {})
+                        _alt_old = _alt_bucket.get(_alt_move)
+                        if not _book_entry_is_bad(_alt_old):
+                            _alt_bucket[_alt_move] = _book_make_entry(
+                                _alt_cp, _alt_depth, max(1, _book_entry_count(_alt_old or 0)))
+                            _confirmed_loss = _rp
+                if bestmove not in ("resign", "win", "") and not board.is_legal_lite(bestmove):
+                    raise RuntimeError("worker %d: 現局面に適用できない手 %s。定跡へ登録せず停止します"
+                                       % (_wid, bestmove))
+
+                # [12-4] 評価値収束判定 (原本逐語)
+                if sg_mode and _searched and not _flattened and _val_cp is not None:
+                    _side_now = _book_turn_of_key(sfen)
+                    _sente_pov_cp = _val_cp if _side_now == "b" else -_val_cp
+                    if abs(_sente_pov_cp) <= eval_flatten_cp:
+                        _flattened = True
+                        _flog("[makebook] 評価値収束 (%+dcp, 先手視点) → 以後 両者%.1fsに切替"
+                              % (_sente_pov_cp, byo_flat_ms / 1000))
+
+                # 探索した合法手を新スキーマ (value/depth/count) で登録 (原本逐語)
+                if _searched and bestmove not in ("resign", "win", ""):
+                    _bucket = book.setdefault(sfen, {})
+                    _cur = _bucket.get(bestmove)
+                    if _val_cp is None:
+                        # 評価未知：既存の値は保持し訪問数だけ数える。新規なら unscored として登録（最善値の計算から除く）
+                        if isinstance(_cur, dict):
+                            _cur["count"] = _book_entry_count(_cur) + 1
+                        else:
+                            _e = _book_make_entry(0, 0, _book_entry_count(_cur) + 1 if _cur else 1)
+                            _e["unscored"] = True
+                            _bucket[bestmove] = _e
+                    elif isinstance(_cur, dict):
+                        _cur["value"] = _val_cp
+                        _cur["depth"] = _dep
+                        _cur["count"] = _book_entry_count(_cur) + 1
+                        _cur.pop("unscored", None)
+                        if _dep > 0:
+                            _cur.pop("loss_pending", None)
+                    else:
+                        _bucket[bestmove] = _book_make_entry(
+                            _val_cp, _dep, _book_entry_count(_cur) + 1 if _cur else 1)
+
+                tempbook.append((sfen, bestmove))
+                tempkif.append(bestmove)
+
+                # 通常手は適用後に千日手/手数上限を判定する。
+                if bestmove not in ("resign", "win", ""):
+                    board.push(bestmove)
+                    _child_key = _book_key_from_sfen(board.sfen())
+                    if sfen and _child_key:
+                        transitions[(sfen, bestmove)] = _child_key
+
+                if bestmove in ("resign", "win"):
+                    _loseturn = _book_turn_of_key(sfen)
+                    if bestmove == "win":
+                        _loseturn = "w" if _loseturn == "b" else "b"
+                    if not _game_from_queue:
+                        if _sh["endturn"] == _loseturn:
+                            _sh["win"] += 1
+                        else:
+                            _sh["win"] = 1
+                        if _loseturn == "w":
+                            print(str(_sh["win"]) + "連勝(先手)")
+                        elif _loseturn == "b":
+                            print(str(_sh["win"]) + "連勝(後手)")
+
+                        if _sh["win"] % 10 == 0:  # 10連勝ごとに自動書き出し
+                            _flog("makeautobook...")
+                            _makebook_save_book(bookfile, book, transitions,
+                                                _full_backup_max_pos, drop_bad=True)
+                        _sh["endturn"] = _loseturn
+                    else:
+                        _flog("[makebook][B5] 優先局面起点の局 — 連勝カウント対象外")
+
+                    _bp = _apply_book_result(book, tempbook, _loseturn, cache=_eval_cache,
+                                             confirmed_loss=_confirmed_loss)
+                    if _bp["killed"]:
+                        _flog("[makebook] book_pass: killed=%s evaporated=%s"
+                              % (_bp["killed"], _bp["evaporated"]))
+                    end = 1
+
+                elif board.is_sennichite():  # 千日手処理 (原本逐語)
+                    tempkif.append("rep_draw")
+                    if not _game_from_queue:
+                        _sh["win"] = 0
+                    _flog("千日手")
+                    if draw == "b" or draw == "w":
+                        _bp = _apply_book_result(book, tempbook, draw, cache=_eval_cache,
+                                                 confirmed_loss=_confirmed_loss)
+                        if _bp["killed"]:
+                            _flog("[makebook] book_pass: killed=%s evaporated=%s"
+                                  % (_bp["killed"], _bp["evaporated"]))
+                    end = 1
+
+                elif max_book_ply > 0 and len(tempbook) >= max_book_ply:
+                    # [施策6] 掘削手数の上限に到達 — 中立終局して次局へ (原本逐語)
+                    _flog("[makebook][施策6] 手数上限 %d 到達 — 中立終局して次局へ"
+                          % max_book_ply)
+                    end = 1
+
+                if end == 1:  # 終局処理 (原本逐語)
+                    kif.append(" ".join(tempkif))
+                    _sh["kif_total"] += 1
+                    kif_total = _sh["kif_total"]
+                    if _max_games and kif_total >= _max_games:
+                        _stop_evt.set()
+                    # [MB-SATURATION] 飽和検出
+                    if _sat_window > 0:
+                        _new_pos = sum(1 for _sf, _ in tempbook
+                                       if _sf not in book or len(book.get(_sf, {})) <= 1)
+                        _sat_new_counts.append(_new_pos)
+                        if len(_sat_new_counts) > _sat_window:
+                            _sat_new_counts.pop(0)
+                        if len(_sat_new_counts) >= _sat_window:
+                            _avg_new = sum(_sat_new_counts) / len(_sat_new_counts)
+                            _total_moves = sum(len(t) for t in [tempbook])
+                            _ratio = _avg_new / max(1, _total_moves)
+                            if _ratio < 0.05:
+                                _stm_counts = {"b": 0, "w": 0}
+                                for _sf, _ in tempbook:
+                                    _t = _book_turn_of_key(_sf)
+                                    if _t in _stm_counts:
+                                        _stm_counts[_t] += 1
+                                _flog("[makebook][MB-SAT] 飽和検出: 直近%d局 新規%.1f局面/局 "
+                                      "(ratio=%.3f) 先手=%d 後手=%d"
+                                      % (_sat_window, _avg_new,                                         _ratio,
+                                         _stm_counts["b"], _stm_counts["w"]))
+                    if kif_total % 100 == 0:
+                        _flog("makeautokif...")
+                        _makebook_save_kif(kiffile, kif)
+                    # 終局時に再探索キューをシードする (原本逐語)
+                    pq.seed_from_bad_markers(book, base_priority=100.0)
+                    for _psf, _pmv in tempbook:
+                        _pr = _book_position_priority(book.get(_psf))
+                        if _pr > 0.0:
+                            pq.push(_psf, _pr)
+
+                    # [施策2] best-first リーフ選択 (peta_next) (原本逐語)
+                    if eval_diff_cp > 0 and \
+                            (kif_total % _queue_every == 0):
+                        _nseed = _book_seed_pq_petanext(
+                            book, pq, _root_key, eval_diff_cp, _petanext_max_step,
+                            bad_threshold_cp=None,
+                            max_positions=_full_backup_max_pos,
+                            eval_diff_from_start_cp=eval_diff_from_start_cp)
+                        if _nseed:
+                            _flog("[makebook][施策2] peta_next: 主要変化の末端 %d "
+                                  "局面を優先キューへ投入" % _nseed)
+
+                    # 次局の起点を決める (原本逐語)
+                    _next_start = basesfen
+                    _game_from_queue = False
+                    if len(pq) > 0 and \
+                            (kif_total % _queue_every == 0):
+                        _popped = pq.pop_highest()
+                        if _popped is not None:
+                            _qkey, _qpri = _popped
+                            _next_start = "sfen " + _qkey
+                            _game_from_queue = True
+                            _flog(f"[makebook][B5] 優先局面から再開 (priority={_qpri:.0f}): "
+                                  f"{_qkey}")
+                    tempkif = [_next_start]
+                    tempbook = []
+                    _flattened = False                          # [12] 局またぎ禁止
+                    _last_actual_search_ply = -2
+                    _pending_mate_moves = []                    # [B13] 局またぎ禁止
+                    if (not _stop_evt.is_set() and eng_w.proc is not None
+                            and eng_w.proc.poll() is None):
+                        eng_w.send("gameover draw")  # 同じエンジンで両側を探索する自己対局
+                        eng_w.send("usinewgame")
+                    board.set(_next_start)
+                    end = 0
+                    continue
+
+                # 局面遷移を記録 (min-max バックアップの辺) (原本逐語)
+    def _worker_entry(_wid):
+        eng_w = _new_engine(_wid)
+        with _lk:
+            _engines.append(eng_w)
+        try:
+            if not eng_w.start() or not eng_w.initialize():
+                if _stop_evt.is_set():
+                    return
+                raise RuntimeError("worker %d のエンジン初期化に失敗" % _wid)
+            print("[makebook][parallel] worker %d 準備完了" % _wid, flush=True)
+            _game_worker(_wid, eng_w)
+        except KeyboardInterrupt:
+            pass
+        except Exception as _we:
+            print("[makebook][parallel] worker %d 例外で停止: %r" % (_wid, _we))
+            with _lk:
+                _worker_errors.append(str(_we))
+            eng_w._record("exception", traceback.format_exc())
+            _stop_evt.set()
+        finally:
+            eng_w.quit()
+
+    # ---- 連続対局 (single: メインスレッド直走 / parallel: ワーカースレッド) ----
+    _threads = []
+    try:
+        if parallel <= 1:
+            _game_worker(0, eng)
+            raise KeyboardInterrupt
+        else:
+            for _i in range(parallel):
+                if _stop_evt.is_set():
+                    break
+                _t = threading.Thread(target=_worker_entry, args=(_i,),
+                                      name="mb_worker%d" % _i, daemon=True)
+                _t.start()
+                _threads.append(_t)
+                if _i < parallel - 1:
+                    _stop_evt.wait(0.1)
+            while True:
+                if _worker_errors:
+                    raise RuntimeError("; ".join(_worker_errors))
+                if _stop_evt.is_set() or not any(_t.is_alive() for _t in _threads):
+                    print("[makebook][parallel] 全ワーカーが終了しました — 保存へ")
+                    raise KeyboardInterrupt
+                time.sleep(0.5)
+
+    except (KeyboardInterrupt, Exception) as _failure:
+        _failed = isinstance(_failure, Exception)
+        if _failed:
+            print("\n[makebook] 異常停止: %s" % _failure, flush=True)
+            try:
+                with _MB_ENGINE_LOG_LOCK:
+                    with open(_engine_log, "a", encoding="utf-8") as _ef:
+                        _ef.write(traceback.format_exc())
+            except OSError as _log_error:
+                print("[makebook] 診断ログ書込失敗: %s" % _log_error, flush=True)
+        print("\n[makebook] 停止します。book / kif を書き出します...", flush=True)
+        _abort = {"flag": False}
+        def _mb_save_phase_sig(signum, frame):
+            if not _abort["flag"]:
+                print("\n[makebook][B11] 停止要求 (2回目) — 保存完了後に終了します")
+            _abort["flag"] = True
+        for _signame in ("SIGINT", "SIGTERM", "SIGBREAK"):
+            _sig = getattr(signal, _signame, None)
+            if _sig is not None:
+                try:
+                    signal.signal(_sig, _mb_save_phase_sig)
+                except (ValueError, OSError, RuntimeError) as _e:
+                    _flog(f"[ignored] _makebook_cli: {_e!r}")
+
+        _stop_evt.set()
+        for _e in list(_engines):
+            try:
+                _e.send("stop")
+            except OSError:
+                pass
+        _join_s = 5
+        for _t in _threads:
+            _t.join(timeout=_join_s)
+        _alive_left = [_t.name for _t in _threads if _t.is_alive()]
+        if _alive_left:
+            print("[makebook][parallel] 未終了ワーカー %s — 保存は排他ロック下で"
+                  "続行します" % _alive_left)
+
+        with _lk:
+            _bs = _book_bad_summary(book)
+            if _bs:
+                print("[makebook][B6] 悪手マーカー集計: "
+                      + " ".join(f"{k}={v}" for k, v in sorted(_bs.items())))
+
+            _export_book = _makebook_save_book(
+                bookfile, book, transitions, _full_backup_max_pos, drop_bad=True)
+            _makebook_save_kif(kiffile, kif)
+            print("[makebook][B11] book/kif を先行保存しました (検証前確定):")
+            print("           " + bookfile)
+            print("           " + kiffile)
+
+            _makebook_save_book(bookfile2, _export_book, transitions, _full_backup_max_pos,
+                                min_visits=2, drop_bad=True,
+                                skip_backup=True)
+            print("[makebook] 書き出し完了:")
+            print("           " + bookfile)
+            print("           " + bookfile2 + " (訪問2回以上・上位手のみ)")
+            print("           " + kiffile)
+
+            _carry = pq.top_n(_MB_CARRYOVER_MAX)
+            if _carry:
+                _carryfile = "makebook_carryover" + d + ".txt"
+                _crecs = [{
+                    "sfen":     _k,
+                    "ply":      0,
+                    "verdict":  "pq_carryover",
+                    "loss_cp":  0,
+                    "move":     "",
+                    "alt_move": "",
+                    "side":     _book_turn_of_key(_k),
+                    "ts":       now.isoformat(),
+                    "priority": _pri,
+                } for _k, _pri in _carry]
+                if _makebook_write_seed_jsonl(_carryfile, _crecs):
+                    print("[makebook][施策4] 優先キュー %d 局面を持ち越し → %s "
+                          "(次回起動時に自動読込して掘削継続)"
+                          % (len(_carry), _carryfile))
+        if _failed:
+            raise SystemExit(1)
+    finally:
+        # [B13] Zyfamate 常駐監視も確実に停止する。
+        try:
+            if _zf_digger is not None:
+                _zf_digger.stop()
+        except Exception as _ze:
+            _flog(f"[ignored] _makebook_cli zf_digger stop: {_ze!r}")
+        for _e in list(_engines):
+            try:
+                _e.send("gameover draw")
+            except Exception as _ie:
+                _flog(f"[ignored] _makebook_cli: {_ie!r}")
+            try:
+                _e.quit()
+            except (Exception, KeyboardInterrupt):
+                pass
+        _book_child_key.cache_clear()
+        atexit.unregister(_close_engines)
+
+
+def _makebook_cli_overlay(extra_args: list) -> None:
     # 盤面は統合 ShogiBoard を直接使用する。外部 Board.py / _BoardFallback への
     # 依存を撤廃し、exe 配布時の同梱要件を解消する。ShogiBoard は set()/sfen()/
     # push()/turn()/is_sennichite() を makebook 互換 API として備える。
@@ -51369,7 +53232,7 @@ def _makebook_cli(extra_args: list) -> None:
                 _pv_prev_sfen = _pv_prev_move = None
                 if bestline_node_coef < 1.0 and _byo_override is not None and tempbook:
                     _pv_prev_sfen, _pv_prev_move = tempbook[-1]
-                bestmove, _val_cp, _dep = _bestmove_by_search(
+                bestmove, _val_cp, _dep = _bestmove_by_search_legacy(
                     eng, byoyomi_ms, sfen, _byo_override,
                     cache=_eval_cache,
                     prev_sfen=_pv_prev_sfen, prev_move=_pv_prev_move)
@@ -51384,7 +53247,7 @@ def _makebook_cli(extra_args: list) -> None:
             else:
                 if sfen in book and _noise_deviate:
                     print("[makebook][B9] 定跡無視 (ノイズ注入) — 探索へ迂回")
-                bestmove, _val_cp, _dep = _bestmove_by_search(
+                bestmove, _val_cp, _dep = _bestmove_by_search_legacy(
                     eng, byoyomi_ms, sfen, _byo_override, cache=_eval_cache)
                 _searched = True
 
