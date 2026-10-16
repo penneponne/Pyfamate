@@ -49671,6 +49671,35 @@ class _BookPriorityQueue:
         return seeded
 
 
+def _book_seed_pq_backup_gap(book, exported, pq, min_gap_cp=100, cap=99.0):
+    """[10-16] 伝播値と直接探索値の差で再探索候補を積む。
+
+    book は実探索の値 (value/depth) のまま、exported は保存時の min-max 伝播後の写し
+    (_makebook_save_book の戻り値)。同じ手で両者が min_gap_cp 以上離れた局面は、子の
+    より深い情報が直接探索の値を否定している = 掘り直す価値がある。優先度は差 (cp) を
+    cap で頭打ちにした値 (bad マーカー由来の 100 より下、peta_next の 60 と競う帯)。
+    depth 0 (評価の無観測) と bad 手は対象外。戻り値は push した局面数。
+    """
+    if not exported:
+        return 0
+    pushed = 0
+    for key, bucket in book.items():
+        ebucket = exported.get(key)
+        if not ebucket:
+            continue
+        gap = 0
+        for move, entry in bucket.items():
+            if not isinstance(entry, dict) or _book_entry_is_bad(entry) or not _book_entry_depth(entry):
+                continue
+            e2 = ebucket.get(move)
+            if isinstance(e2, dict):
+                gap = max(gap, abs(_book_entry_value(e2) - _book_entry_value(entry)))
+        if gap >= min_gap_cp:
+            pq.push(key, min(float(gap), cap))
+            pushed += 1
+    return pushed
+
+
 def _book_position_priority(bucket, close_margin_cp: int = 80,
                             min_candidates: int = 2) -> float:
     """局面 bucket の「掘る価値」を数値化する (高いほど先に掘る)。
@@ -52255,8 +52284,11 @@ def _makebook_cli(extra_args: list) -> None:
 
                         if _sh["win"] % 10 == 0:  # 10連勝ごとに自動書き出し
                             _flog("makeautobook...")
-                            _makebook_save_book(bookfile, book, transitions,
-                                                _full_backup_max_pos, drop_bad=True)
+                            _exp_book = _makebook_save_book(bookfile, book, transitions,
+                                                            _full_backup_max_pos, drop_bad=True)
+                            _ngap = _book_seed_pq_backup_gap(book, _exp_book, pq)
+                            if _ngap:
+                                _flog("[makebook] 伝播値と直接値の差 ≥100cp: %d 局面を優先キューへ" % _ngap)
                         _sh["endturn"] = _loseturn
                     else:
                         _flog("[makebook][B5] 優先局面起点の局 — 連勝カウント対象外")
