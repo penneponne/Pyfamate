@@ -49318,7 +49318,9 @@ def _bestmove_by_search_legacy(eng, byoyomi_ms, sfen, byoyomi_override=None,
         if line.startswith("bestmove"):
             bm = (line.split() + [""])[1]
             # [MB-TT-CACHE] キャッシュ格納
-            if cache is not None:
+            # [10-16 修正] 評価値を観測しなかった探索 (depth 0) を 0cp として cache に入れると、
+            # 既存の深い評価を壊す。cache に入れず depth 0 で返し、呼出側は depth 0 を定跡登録・判定に使わない。
+            if cache is not None and best_depth > 0:
                 cache.put(sfen, bm, best_value, best_depth)
             return (bm, best_value, best_depth)
     return ("resign", 0, 0)
@@ -51560,6 +51562,18 @@ def _makebook_cli(extra_args: list) -> None:
         _engine_opts["USI_Hash"] = "1024"
     _hash = next(v for k, v in _engine_opts.items() if k.lower() in ("usi_hash", "hash"))
     _threads_per_engine = next(v for k, v in _engine_opts.items() if k.lower() == "threads")
+    # [10-16 Hash×worker 上限] 1本あたり Hash＋評価関数と探索の固定分（約 512MB と見積る）が
+    # 空き物理メモリの 85% に収まる本数までに絞る。ページングすると秒読みの探索量が本ごとに崩れる。
+    try:
+        _per_mb = int(_hash) + 512
+        _avail_mb = _sv_avail_ram_mb()
+        _fit = max(1, int(_avail_mb * 0.85) // _per_mb)
+        if parallel > _fit:
+            print("[makebook][parallel] 空きメモリ %dMB では各 %dMB×%d本が収まらない → %d本に絞ります"
+                  % (_avail_mb, _per_mb, parallel, _fit), flush=True)
+            parallel = _fit
+    except (TypeError, ValueError) as _me:
+        _flog(f"[ignored] makebook memory cap: {_me!r}")
     print("[makebook] 起動構成: %d本 / 各Threads=%s / 各Hash=%sMB (Hash合計=%.1fGiB)"
           % (parallel, _threads_per_engine, _hash, parallel * int(_hash) / 1024), flush=True)
     _stop_evt = threading.Event()
@@ -53301,7 +53315,7 @@ def _makebook_cli_overlay(extra_args: list) -> None:
             # [12-4] 評価値収束判定。実探索でのみ判定 (定跡ヒットで指した手は
             # 対象外)。先手視点の cp が eval_flatten_cp 以下に収まったら、
             # 以後この局は先後共通の byo_flat_ms (=既存 think_s) へ切り替える。
-            if sg_mode and _searched and not _flattened:
+            if sg_mode and _searched and _dep > 0 and not _flattened:
                 _side_now = _book_turn_of_key(sfen)
                 _sente_pov_cp = _val_cp if _side_now == "b" else -_val_cp
                 if abs(_sente_pov_cp) <= eval_flatten_cp:
@@ -53317,7 +53331,8 @@ def _makebook_cli_overlay(extra_args: list) -> None:
             # (tempbook の直前要素のキー) を親として記録する。いい手 (有利局面)
             # ではなく、劣勢へ転落する手前局面こそ再探索の価値がある、という
             # 方針の基盤づくり。優先探索キュー本体は B4。
-            if _searched and bestmove not in ("resign", "win", ""):
+            # [10-16] depth 0 (評価値の無観測) は登録しない (0cp で既存の値を上書きしないため)。
+            if _searched and _dep > 0 and bestmove not in ("resign", "win", ""):
                 _bucket = book.setdefault(sfen, {})
                 _cur = _bucket.get(bestmove)
                 if isinstance(_cur, dict):
