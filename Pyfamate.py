@@ -51312,6 +51312,30 @@ _MB_REJECTED_KNOBS = {
 }
 
 
+def _mb_perpetual_checker(tempkif):
+    """[2026-10-16] 千日手が連続王手か。直近の同一局面2回の間（1周期）で、片側の手がすべて王手なら
+    その側（"b"/"w"）を返す（連続王手の千日手は王手した側の負け）。そうでなければ None。"""
+    try:
+        b = ShogiBoard(); b.set(tempkif[0])
+        keys = [b.sfen_key()]; movers = []; checks = []
+        for m in tempkif[1:]:
+            if m in ("resign", "win", "", "rep_draw"):
+                break
+            movers.append(b.side if getattr(b, "side", None) in ("b", "w") else ("b" if b.turn() == -1 else "w")); checks.append(bool(b.gives_check(m)))
+            b.push(m); keys.append(b.sfen_key())
+        last = keys[-1]; idx = [i for i, k in enumerate(keys) if k == last]
+        if len(idx) < 2:
+            return None
+        lo, hi = idx[-2], idx[-1]          # moves lo .. hi-1 make one cycle
+        for side in ("b", "w"):
+            mine = [checks[j] for j in range(lo, hi) if movers[j] == side]
+            if mine and all(mine):
+                return side
+    except Exception as _e:
+        _flog(f"[makebook] perpetual check test failed: {_e!r}")
+    return None
+
+
 def _makebook_cli(extra_args: list) -> None:
     # Windowsのリダイレクト/バッチ環境はcp1252等になり得る。起動メッセージ
     # 自体のUnicodeEncodeErrorでエンジン起動前に落ちないようにする。
@@ -52231,11 +52255,15 @@ def _makebook_cli(extra_args: list) -> None:
                     end = 1
 
                 elif board.is_sennichite():  # 千日手処理 (原本逐語)
+                    _perp = _mb_perpetual_checker(tempkif)   # [2026-10-16] 連続王手の千日手は王手側の負け
                     tempkif.append("rep_draw")
                     if not _game_from_queue:
                         _sh["win"] = 0
-                    _flog("千日手")
-                    if draw == "b" or draw == "w":
+                    _flog("千日手" + (" (連続王手: %s の負け)" % _perp if _perp else ""))
+                    if _perp in ("b", "w"):
+                        _bp = _apply_book_result(book, tempbook, _perp, cache=_eval_cache,
+                                                 confirmed_loss=_confirmed_loss)
+                    elif draw == "b" or draw == "w":
                         _bp = _apply_book_result(book, tempbook, draw, cache=_eval_cache,
                                                  confirmed_loss=_confirmed_loss)
                         if _bp["killed"]:
