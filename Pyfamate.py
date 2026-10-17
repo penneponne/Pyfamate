@@ -9877,7 +9877,7 @@ class MoveBudget:
         return f"{_p} |left={'inf' if self.eff_s <= 0 else round(_l, 2)}"
 
 
-def _allocate_time_budget(eff_s, dl_timeout_s, cfg):
+def _relay_share_s(eff_s):
     """[TA-CENTRIC 2026-07-13] eff_s のスロット分割を Time_aggression 連動化。
     旧: 固定比率(overhead0.20/arb0.15/dl1 0.30/conv0.20/relay_floor0.40)。
     新: relay share = clamp(0.60 * TA_gain, 0.40, 0.90)。高 aggression -> relay へ多く
@@ -9885,12 +9885,12 @@ def _allocate_time_budget(eff_s, dl_timeout_s, cfg):
     各々元の意味(DL_1完了待ち/DL_2確信待ち/裁定)の上限でクランプ。TA_gain は動的
     _time_dyn.time_aggression(game_phase/score/time_norm 込み)由来。
     不変条件(§3): relay+dl1+conv+arb+overhead = eff_s(§2⑩ 超過なし)。層2/Fischer は
-    relay/parse 側で不変。"""
+    relay/parse 側で不変。
+    [ROLES-20261017] 戻り値は relay 秒のみ。旧 TimeBudget の dl1/conv/arb/overhead 枠は計算される
+    だけで誰も読まず (それらの予算は MoveBudget 台帳 st.ledger.draw が実際に配る)、同じ役割の
+    予算機構が 2 つ並んでいた。"""
     if eff_s is None or eff_s <= 0.0:
-        return TimeBudget(
-            relay_s=120.0, dl1_recovery_s=10.0, conviction_s=5.0,
-            arb_s=5.0, overhead_s=0.20, total_s=0.0,
-            binding_summary="infinite")
+        return 120.0
     _overhead = 0.20
     _usable = max(0.0, eff_s - _overhead)
     _ta = getattr(_time_dyn, "time_aggression", _TA_BASE_ANCHOR) or _TA_BASE_ANCHOR
@@ -9909,18 +9909,7 @@ def _allocate_time_budget(eff_s, dl_timeout_s, cfg):
     _gain = _time_aggression_base_gain(_ta)
     _relay_ratio = _clamp(0.60 * _gain, 0.40, 0.90)
     _relay = _usable * _relay_ratio
-    _reserve = _usable - _relay
-    _dl1 = min(_reserve * 0.40, dl_timeout_s * 0.30)
-    _conv = min(_reserve * 0.40, cfg.dl_conviction_council_wait_ms / 1000.0)
-    _arb = min(_reserve * 0.20, 0.30)
-    _summary = (f"[TA] ta={_ta:.2f} gain={_gain:.2f} "
-                f"relay={_relay:.2f}({_relay_ratio:.2f}) dl1={_dl1:.2f} "
-                f"conv={_conv:.2f} arb={_arb:.2f} | eff_s={eff_s:.2f}")
-    return TimeBudget(
-        relay_s=_relay, dl1_recovery_s=_dl1,
-        conviction_s=_conv, arb_s=_arb,
-        overhead_s=_overhead, total_s=eff_s,
-        binding_summary=_summary)
+    return _relay
 
 
 def _mate_solver_movetime_core(eff_s, cfg):
@@ -11821,26 +11810,7 @@ byo_ms        : int    — raw byoyomi ms (Move_Overhead 減算前)。
 
 
 # ============================================================
-# TimeBudget — [FIX-6] 時間予算の事前分割
-# ============================================================
-TimeBudget = namedtuple(
-    "TimeBudget",
-    ["relay_s", "dl1_recovery_s", "conviction_s", "arb_s",
-     "overhead_s", "total_s", "binding_summary"],
-)
-"""
-[FIX-6] _allocate_time_budget() が返す時間予算の事前分割。
-
-Fields
-------
-relay_s         : float  — NNUE relay の上限 [s]
-dl1_recovery_s  : float  — DL_1 結果回収の上限 [s]
-conviction_s    : float  — conviction wait の上限 [s]
-arb_s           : float  — ARB (blocking) の上限 [s]
-overhead_s      : float  — bestmove 送信等の安全余裕 [s]
-total_s         : float  — = eff_s (検証用)
-binding_summary : str    — 各スロットサイズの1行サマリー (stats.txt 記録用)
-"""
+# [ROLES-20261017] TimeBudget (relay/dl1/conv/arb 枠の namedtuple) は relay 以外が未使用のため撤去 → _relay_share_s。
 
 
 # ============================================================
@@ -17787,20 +17757,6 @@ def _lc_dispatch_core(is_infinite, dl1_alive,
 
 
 
-def _lc_prefetch_gate_core(dl_timeout_s, cfg):
-    """[B/C/D 準備 core#6e] Light Council 後の DL_1 prefetch 抑制判定の純粋 core。
-
-    dl_timeout が DL_Time_Min_ms を下回る帯では次の自手も Light Council に
-    留まるため、DL_1 prefetch を起動しても次 go 冒頭の cancel() で即捨てられ
-    GPU 時間の無駄になる → 抑制 (suppress=True)。閾値以上はフォールスルー
-    (設定変更等の edge case) として prefetch を起動する。global 非参照。
-
-    Returns: (suppress, threshold_s)  — threshold_s はログ用。
-    """
-    threshold_s = cfg.dl_time_min_ms / 1000.0
-    return dl_timeout_s < threshold_s, threshold_s
-
-
 def _pv_overlap_count(pv_lines, top_move, n_top=3):
     """
      DL 上位手の PV[1] (immediate next move) 一致数を返す。
@@ -23044,7 +23000,7 @@ class _UVote(enum.Enum):
 class _UCache(enum.Enum):
     DL_POLICY = enum.auto(); DL3 = enum.auto(); MATE_PV = enum.auto()
 class _UPref(enum.Enum):
-    UNCOND = enum.auto(); GATED = enum.auto(); SIMPLE = enum.auto()
+    UNCOND = enum.auto(); SIMPLE = enum.auto()
 
 @dataclasses.dataclass(frozen=True)
 class _UVar:
@@ -23851,7 +23807,7 @@ def _u_setup(st, dl_timeout):
             _flog(f"[ignored] _u_setup: {_e!r}")
     if v.reserve_dl1_budget:
         try:
-            st.budget = _allocate_time_budget(st.eff_s, dl_timeout, ctx.cfg)
+            st.budget = _relay_share_s(st.eff_s)   # relay に回す秒 (float)
         except Exception:
             st.budget = None
 
@@ -23970,7 +23926,7 @@ def _u_harvest_mate(st):
 
 def _u_relay(st):
     ctx, v = st.ctx, st.variant
-    relay_eff_s = (st.budget.relay_s
+    relay_eff_s = (st.budget
                    if (v.relay_reduced_eff_s and st.budget) else st.eff_s)
     if st.ledger is not None:
         st.ledger.note("relay", relay_eff_s)   # [LEDGER] relay 予算は budget 機構が決定済み — 記帳のみ
@@ -25058,8 +25014,10 @@ def _u_finalize(st):
     try:
         if st.verdict in ("resign", "win", "", None):
             pass   # 指し手でないので prefetch しない
-        elif not (v.prefetch is _UPref.GATED
-                and not _lc_prefetch_gate_core(getattr(st.budget, "dl_timeout_s", 0.0), ctx.cfg)):
+        else:
+            # [ROLES-20261017] 旧 GATED 分岐 (Light Council 後の prefetch 抑制) は撤去: GATED を使う
+            #   variant が存在せず、しかも判定は tuple の真偽 (常に真) + 存在しない budget.dl_timeout_s
+            #   (常に 0) で、元から常に prefetch していた。
             # [FIX 2026-07-19] 旧: ctx.current_position (= 自手適用前の局面) を
             # そのまま渡していたため、_start_prefetch_after_bestmove 内で
             # ponder_pos = position + ponder_move を組み立てると自手が丸ごと
