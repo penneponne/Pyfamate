@@ -9633,6 +9633,11 @@ _nnue_slowmover_user_set = (
 # [Step 5B 2026-07-17] _nnue_2_slowmover_user_set ダミー撤去
 # — EngineConfig.nnue_2_slowmover_user_set field と from_cfg 注入も同時撤去済 (3点 sync)。
 
+# [AUDIT-20261017] 受理した/しないに関わらず「go ponder を受けて、まだ bestmove で
+#   答えていない」。stop は USI 上必ず bestmove を要する: ゲート不通過 (USI_Ponder を
+#   GUI が送らない) や nnue_1 死亡で ps.phase=IDLE のまま stop が来ると、旧 _handle_stop
+#   はどの分岐にも入らず沈黙 → 厳密な GUI はハング/時間切れ。
+_GO_PONDER_OWED = [False]
 _early_ponder = False  # Pyfamate 内部の「go ponder を子へ転送するか」のゲート。USI_Ponder=true 受信で True (やねうら王に EarlyPonder というエンジンオプションは無い; 早期 Ponder は GUI/ドライバ側の機能)。
 
 # [Step 4C 2026-07-17] NNO-c _endgame_promote_in_place / _NNUE_PROMOTION_ALLOWED_KEYS
@@ -9827,7 +9832,10 @@ class MoveBudget:
         left = _move_budget_left_s(self.eff_s, self.t0, safety_s)
         if (self.eff_s > 0 and self.remaining_ms is not None
                 and self.remaining_ms > 0):
-            left = min(left, max(0.0, self.remaining_ms / 1000.0
+            # [AUDIT-20261017] 秒読みも今手の壁時計に含める (draw の床と同じ式)。旧: 主時間
+            #   だけで切り、`btime 400 byoyomi 10000` で eff≈9.6s なのに left≤0 → DL/詰み join
+            #   が床 0.05s しか貰えず、使える 10s を捨てていた。
+            left = min(left, max(0.0, (self.remaining_ms + (self.byo_ms or 0)) / 1000.0
                                  - self.elapsed_s() - _move_overhead_s))
         return left
 
@@ -15599,7 +15607,17 @@ def _parse_go_clock_base(go_line, our_side_ply=None, cfg=None):
     _dl_skip_sudden_ms = _clamp(5000.0 / _ta_dlskip_gain, 3000.0, 8000.0)
     if remaining_ms > 0 and remaining_ms < _dl_skip_sudden_ms and floor_ms == 0:
         _dl_skip = True
-        _dlog(f"DL skip: sudden death emergency ({remaining_ms}ms < {_dl_skip_sudden_ms:.0f})")
+        # [AUDIT-20261017] 旧: この分岐は eff_s を計算せず既定 0.0 のまま返していた。
+        #   eff_s <= 0 は全域で「go infinite / nodes = 無制限」の意味 → MoveBudget.left_s=120s、
+        #   tonshi/PV-mate/mate join が無制限に予算を引き、残り数秒の切れ負け終盤で毎手
+        #   1-3s 余計に使っていた。残時間を十分な手数で割った正の窓を与える。
+        try:
+            _rm = _calc_remaining_moves(our_side_ply, remaining_ms, cfg=cfg) if _clock_is_sente is not None else 30
+        except Exception:
+            _rm = 30
+        eff_s = max(0.05, (remaining_ms - _move_overhead_ms) / 1000.0 / max(10.0, float(_rm or 30)))
+        _dlog(f"DL skip: sudden death emergency ({remaining_ms}ms < {_dl_skip_sudden_ms:.0f}) "
+              f"eff_s={eff_s:.3f}")
     elif remaining_ms == 0 and floor_ms == 0:
         eff_s = 0.0
     else:
@@ -16683,8 +16701,12 @@ def _check_council_stale(ctx, dl_top_move):
     # stale withdrawal を抑制する。score_gap が gap_min の2倍超 or 100cp超なら除外。
     _last_rec = recent[-1] if recent else None
     if _last_rec is not None:
+        # [AUDIT-20261017] 旧キー dl_score_gap / dl_gap_min_used は誰も書かず (record は
+        #   score_gap_dl_nnue)、例外が常に不発・dl_gap_min_used=None なら 2*None で TypeError。
         _sgap = _last_rec.get("dl_score_gap")
-        _gmin = _last_rec.get("dl_gap_min_used", 50)
+        if _sgap is None:
+            _sgap = _last_rec.get("score_gap_dl_nnue")
+        _gmin = _last_rec.get("dl_gap_min_used") or 50
         if _sgap is not None and _sgap > max(100, 2 * _gmin):
             _dlog(
                 "[COUNCIL-STALE-EXEMPT] dl_top=%s repeated %d wins but "
@@ -17056,7 +17078,18 @@ def _apply_csm_and_regime(ctx, nnue_info, final_move, *,
         _flog(f"[METRICS-{label}] compute failed: {_met_e!r}")
 
 
-_RE_MATE         = re.compile(r"score mate (-?\d+)")
+# [AUDIT-20261017] USI は `score mate +` / `score mate -` (手数不明) と `mate +5` も許す。
+#   旧 (-?\d+) はこれらに不一致 → 詰み行が score 0 として扱われ詰み検出も漏れた。
+_RE_MATE         = re.compile(r"score mate ([+-]?\d+|[+-])")
+
+
+def _mate_ply(tok) -> int:
+    """_RE_MATE の group(1) → 符号付き手数 (`+`/`-` は ±1 = 符号だけ確か)。"""
+    if tok == "+":
+        return 1
+    if tok == "-":
+        return -1
+    return int(tok)
 _RE_SCORE_CP     = re.compile(r"score cp (-?\d+)")
 _RE_DEPTH        = re.compile(r"\bdepth\s+(\d+)")
 _RE_NODES        = re.compile(r"\bnodes\s+(\d+)")   # early-stop node count parse
@@ -17074,7 +17107,9 @@ _RE_WTIME        = re.compile(r"wtime\s+(\d+)")
 _RE_BINC         = re.compile(r"binc\s+(\d+)")
 _RE_WINC         = re.compile(r"winc\s+(\d+)")
 _RE_BYOYOMI      = re.compile(r"byoyomi\s+(\d+)")
-_RE_SETOPTION    = re.compile(r"setoption name (\S+) value (.+)")
+# [AUDIT-20261017] `setoption name X value` (空値 = リストのクリア) も受ける (旧: (.+) で不一致
+#   → 黙殺され OppID_*_Names 等が古い内容のまま)。
+_RE_SETOPTION    = re.compile(r"setoption name (\S+) value ?(.*)$")
 _RE_SFEN_STM     = re.compile(r"\bsfen\s+\S+\s+([bw])\b")   # SFEN 手番抽出
 _RE_MULTIPV      = re.compile(r"\bmultipv\s+(\d+)")
 
@@ -17242,7 +17277,7 @@ def _parse_usi_line(ln: str) -> UsiLine:
             o.score_cp = int(_sm.group(1))
         _mm = _RE_MATE.search(ln)
         if _mm:
-            o.mate = int(_mm.group(1))
+            o.mate = _mate_ply(_mm.group(1))
         _pv = _RE_PV_FULL.search(ln)
         if _pv:
             o.pv = _pv.group(1)
@@ -17256,6 +17291,45 @@ def _parse_usi_line(ln: str) -> UsiLine:
         o.kind = "info"
 
     return o
+
+
+def _drain_until_outstanding(eng, allowed, timeout_s, label, send_stop=True):
+    """[AUDIT-20261017] 未回収 bestmove の残骸を読み捨て、未応答 go を allowed 個以下にする。
+
+    子の bestmove は go 1 回に 1 個 (FIFO)。_go_sent (送信 go 数) と _bm_seen (消費した
+    bestmove 数) の差 = まだキューに/これから来る bestmove 数。DL harvest の timeout や
+    ponder 局面不一致の早期 return、pre-flush の時間切れで前の探索の bestmove が残ると、
+    次の読み手 (fetch / harvest) が最初の bestmove = 前の探索の結果を自分の答えとして
+    採っていた (2 手前の局面の policy で投票)。pyfa_ack 世代タグは DL 子が出さないため
+    classify_bestmove は 'unknown' で役に立たない — 個数で判定する。
+    戻り: 目標達成なら True。"""
+    try:
+        if eng._go_sent - eng._bm_seen <= allowed:
+            return True
+        if send_stop:
+            eng.send("stop")
+        deadline = time.perf_counter() + max(0.0, timeout_s)
+        n_bm = 0
+        while eng._go_sent - eng._bm_seen > allowed:
+            rem = deadline - time.perf_counter()
+            if rem <= 0:
+                break
+            try:
+                ln = eng._q.get(timeout=min(0.05, rem))
+            except queue.Empty:
+                continue
+            eng._note_line(ln)
+            if ln is None:
+                return False
+            if isinstance(ln, str) and _usi_is(ln, "bestmove"):
+                n_bm += 1
+        ok = eng._go_sent - eng._bm_seen <= allowed
+        _flog(f"[STALE-BM/{label}] discarded {n_bm} stale bestmove(s); "
+              f"outstanding={eng._go_sent - eng._bm_seen} ok={ok}")
+        return ok
+    except Exception as _e:
+        _flog(f"[STALE-BM/{label}] {_e!r}")
+        return False
 
 
 def _run_dl_1_search(dl_1, position_cmd, n, nodes, timeout,
@@ -17298,6 +17372,11 @@ def _run_dl_1_search(dl_1, position_cmd, n, nodes, timeout,
     per dl_1 instance.
     """
     if not dl_1._alive:
+        return {}, {}, {}, {}, False
+
+    # [AUDIT-20261017] 前の探索の bestmove が未回収なら、ここで送る go の答えと取り違える。
+    if not _drain_until_outstanding(dl_1, 0, min(1.5, max(0.2, timeout * 0.25)), "dl1-search"):
+        _flog("[STALE-BM/dl1-search] 前探索の bestmove を回収できず — この fetch は空で返す")
         return {}, {}, {}, {}, False
 
     if dl_1._last_multipv_sent != n:
@@ -17820,6 +17899,7 @@ def _dl_conviction_mate_core(council_override, dl_top_vote, nnue_top_vote,
         not council_override
         and dl_top_vote is not None
         and dl_top_vote != (nnue_top_vote or "")
+        and nnue_top_vote != "win"      # [AUDIT-20261017] 入玉宣言を通常手で上書きしない
         and mate_detected
     )
 
@@ -23905,8 +23985,7 @@ def _run_search(ctx, line, move_count, variant, *, go_clock=None,
             # mate→endgame 遷移 (旧 _activate_endgame) を撤去。council 一本化。
             _u_vote(st)
             _u_override(st)
-            if st.council_override:
-                st.ponder_move = None   # 旧: override 時は predicted ponder を捨てる
+            _u_align_ponder(st)
             _u_ph_capture_emit(st)
             _u_ph_cm_dl_restore(st)   # cache_miss のみ (内部ゲート)
         try:
@@ -23947,6 +24026,7 @@ def _run_search(ctx, line, move_count, variant, *, go_clock=None,
         return
     _u_vote(st)
     _u_override(st)
+    _u_align_ponder(st)
     if variant.apply_boost:
         # [NEXT-5] boost を母関数 TA へ回帰: 不一致度を次手 TA の倍率として書き戻す。
         # 旧 _council_apply_boost の eff_s 乗算 + §4.1 clamp を撤去し TA-centric 予算経由で反映。
@@ -23974,7 +24054,7 @@ def _u_setup(st, dl_timeout):
         return
     if st.go_clock is None and not st.is_infinite:
         try:
-            st.go_clock = _parse_go_clock(st.line, move_count=st.move_count, cfg=ctx.cfg)
+            st.go_clock = _parse_go_clock(st.line, our_side_ply=st.move_count, cfg=ctx.cfg)
         except Exception:
             st.go_clock = None
     st.eff_s = (getattr(st.go_clock, "eff_s", 0.0) if st.go_clock else 0.0) or 0.0
@@ -24197,7 +24277,6 @@ def _u_harvest_dl1(st):
     # [WP2-S2 2026-07-14] fetch/cache の形状分岐 (len(res)<6) を撤去 — 両系統とも
     # DlFetchResult に正準化済み (cache は from_cache=True で pv_lines=None)。
     policy = res.policy
-    st.dl_mate = bool(res.mate)   # [WP3-5] 条件A / ARB gate "mate" の入力
     pv_lines = res.pv_lines
     st.dl1_pv_lines = pv_lines   # [SV-ARBITER §3.2] finalize sampler / judge() 用に保持
     depth_best = res.depth_best
@@ -24211,6 +24290,13 @@ def _u_harvest_dl1(st):
     if not move:
         return None
     st.dl_top_score = score
+    # [WP3-5] 条件A の入力。[AUDIT-20261017] res.mate は「どの MultiPV 行・どの反復でも
+    #   一度 mate>0 が出た」で立ち、dl_top 自身の詰みとは限らなかった → top 手の最終
+    #   スコアが詰み (+_MATE_CP) のときだけ立てる。
+    try:
+        st.dl_mate = bool(res.mate) and score is not None and int(score) >= _MATE_CP
+    except Exception:
+        st.dl_mate = False
     try:
         st.dl_top_depth = depth_best.get(move) if depth_best else None
     except Exception:
@@ -24338,6 +24424,11 @@ def _u_vote(st):
         st.dl_top = _u_harvest_dl1(st)
         try:
             _cp0 = st.nnue_info.get("score_cp")
+            if st.dl_top is None:
+                # [AUDIT-20261017] DL 票が withdraw/不在なら確信度も無い。旧: withdraw 前に
+                #   書かれた dl_top_score 等から conviction を計算し、高確信なら頓死ガードを省略していた。
+                st.conviction = None
+                raise _NoDlVote()
             st.conviction = _conviction(
                 (st.dl_top_score - int(_cp0))
                 if (st.dl_top_score is not None and _cp0 is not None) else None,
@@ -24346,6 +24437,8 @@ def _u_vote(st):
             _dlog(f"[CONV-HUB/{v.label}] conviction={st.conviction:.3f} "
                   f"(gap={st.dl_top_score}-{_cp0} stab={st.dl_stability_spread} "
                   f"d={st.dl_top_depth} ovl={st.dl_pv_overlap})")
+        except _NoDlVote:
+            pass
         except Exception as _ce:
             _flog(f"[unify:{v.label}] conviction hub: {_ce!r}")
     if v.name in ("council", "ponderhit"):
@@ -24372,6 +24465,33 @@ def _u_vote(st):
             st.verdict = st.nnue_top or st.dl_top
     else:
         st.verdict = st.nnue_top
+
+class _NoDlVote(Exception):
+    """_u_vote 内部: DL 票なし (conviction を計算しない)。"""
+
+
+def _u_align_ponder(st):
+    """[AUDIT-20261017] ponder 手を最終 verdict に合わせる。
+
+    st.ponder_move は NNUE relay の「nnue_top に対する予想応手」。arbiter / mate solver /
+    conviction-mate が verdict を差し替えても残っていたため、`bestmove D ponder P` の P が
+    D の後では非合法になり得た (GUI の go ponder・_start_prefetch_after_bestmove が
+    非合法局面を子へ送り Illegal Input Move → drain → 再起動)。
+    verdict ≠ nnue_top なら DL_1 の PV 応手 (verdict == dl_top のとき) か None。
+    PV-MATE は自分で verdict の PV 応手を入れているので触らない。"""
+    try:
+        v = st.verdict
+        if v in (None, "", "resign", "win") or v == st.nnue_top or st.pv_mate_override:
+            return
+        nxt = None
+        if v == st.dl_top:
+            pv = _arb_pv_after_move(v, (st.dl1_pv_lines or {}).get(v))
+            nxt = pv[0] if pv else None
+        st.ponder_move = nxt
+    except Exception as _e:
+        st.ponder_move = None
+        _flog(f"[ponder-align] {_e!r}")
+
 
 def _u_override(st):
     """[STEP-SPLIT 2026-07-14] override 適用の司令部。各段は独立関数 —
@@ -24527,6 +24647,60 @@ def _u_council_overrides(st):
     except Exception as _e:
         _flog(f"[unify:council] tonshi-guard: {_e!r}")
 
+def _u_alt_moves(st, limit=4):
+    """[AUDIT-20261017] verdict の代替候補 (千日手拒否 / 頓死ガード用)。
+    順: nnue_top → dl_top → DL_1 policy 上位。現局面での確定非合法
+    (illegal_drop_reason: 先後違い・自殺手・二歩・行き所のない駒) は除く。
+    戻り: [(move, dl_score|None)]  (verdict 自身は含まない)。"""
+    ctx = st.ctx
+    res = st.dl1_cache
+    if res is None and st.dl1_state is not None:
+        res = getattr(st.dl1_state, "result", None)
+    pol = list(getattr(res, "policy", None) or []) if res is not None else []
+    score_of = {}
+    order = []
+    for it in pol:
+        mv, sc = ((it.get("move"), it.get("score")) if isinstance(it, dict)
+                  else (it[0], it[1] if len(it) > 1 else None))
+        if mv and mv not in score_of:
+            score_of[mv] = sc
+            order.append(mv)
+    cands = []
+    for mv in [st.nnue_top, st.dl_top] + order:
+        if (mv and mv not in (st.verdict, "resign", "win")
+                and mv not in [c for c, _ in cands]):
+            cands.append((mv, score_of.get(mv)))
+    board = _get_tracking_board(ctx)
+    out = []
+    for mv, sc in cands:
+        try:
+            if board is not None and board.illegal_drop_reason(mv) is not None:
+                continue
+        except Exception:
+            continue
+        out.append((mv, sc))
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _u_dl_score_of(st, move):
+    """DL_1 policy 上の move のスコア (無ければ None)。"""
+    res = st.dl1_cache
+    if res is None and st.dl1_state is not None:
+        res = getattr(st.dl1_state, "result", None)
+    for it in (getattr(res, "policy", None) or []) if res is not None else []:
+        mv, sc = ((it.get("move"), it.get("score")) if isinstance(it, dict)
+                  else (it[0], it[1] if len(it) > 1 else None))
+        if mv == move:
+            return sc
+    return None
+
+
+# 千日手拒否の代替手が verdict より DL 評価で悪くてよい上限 [cp]。
+_SENNICHITE_ALT_MAX_LOSS_CP = 150
+
+
 def _u_council_mate_ponder(st):
     """[MPON] 相手番 df-pn 証明済み詰みを ponderhit 時に収穫 (原 ≈27834)。採用は
     _mate_move_accepted (連続王手千日手) 検問を通す。consume-once。"""
@@ -24557,8 +24731,32 @@ def _u_council_sennichite(st):
     board = _get_tracking_board(ctx)
     if board is None or not board.would_repeat_position(st.verdict, 2):
         return
+    # [AUDIT-20261017] 旧: 検出してログを出すだけで代替を探さず、Sennichite_Reject_* は
+    #   着手に効いていなかった。DL policy で verdict より _SENNICHITE_ALT_MAX_LOSS_CP
+    #   以上悪くない非千日手を採る (スコア不明の候補は nnue_top/dl_top のみ許す)。
+    _vs = _u_dl_score_of(st, st.verdict)
+    for mv, sc in _u_alt_moves(st, limit=4):
+        try:
+            if board.would_repeat_position(mv, 2):
+                continue
+        except Exception:
+            continue
+        if sc is None or _vs is None:
+            if mv not in (st.nnue_top, st.dl_top):
+                continue
+        elif int(sc) < int(_vs) - _SENNICHITE_ALT_MAX_LOSS_CP:
+            continue
+        if not _mate_move_accepted(ctx, mv, "sennichite-alt"):
+            continue
+        _flog(f"[SENNICHITE-REJECT] ply={mc} {st.verdict} repeats → {mv} "
+              f"(dl score {sc} vs {_vs})")
+        st.verdict = mv
+        st.ponder_move = None
+        st.council_override = True
+        st.council_override_source = "sennichite_reject"
+        return
     _flog(f"[SENNICHITE-REJECT] ply={mc} {st.verdict} repeats but no "
-          "non-repeating alternative; keeping original")
+          "acceptable non-repeating alternative; keeping original")
 
 def _u_council_tonshi_guard(st):
     """[S-1 頓死ガード / 最重要] verdict 後の相手番局面で自玉が危険なら短手数 df-pn
@@ -24589,7 +24787,10 @@ def _u_council_tonshi_guard(st):
     sig = _board_for_position(ctx.current_position).stance_signals(mc % 2 == 0)
     if not (sig.get("in_check_self") or sig.get("king_pressure_self", 0) >= kp):
         return
-    ladder = [st.verdict]
+    # [AUDIT-20261017] 旧: ladder = [verdict] のみ → 頓死を証明しても差替先が無く、
+    #   予算を使うだけで着手は変わらなかった。代替候補を後ろに並べ、最初に
+    #   「相手の詰みが出ない」候補を採る (全候補 mate なら verdict 維持)。
+    ladder = [st.verdict] + [mv for mv, _sc in _u_alt_moves(st, limit=3)]
     for cand in ladder:
         jt = (st.ledger.draw(f"tonshi/{cand}", ctx.cfg.tonshi_guard_movetime_max_s)
               if st.ledger is not None
@@ -24606,7 +24807,10 @@ def _u_council_tonshi_guard(st):
                       f"→ 次善 {cand} へ差替 (king_danger; unify council)")
                 st.verdict = cand
                 st.ponder_move = None
+                st.council_override = True
+                st.council_override_source = "tonshi_guard"
             break
+        _flog(f"[TONSHI-GUARD] ply={mc} {cand}: 相手の詰みを検出 — 次候補へ")
 
 def _gps_writeback(st):
     """[NEXT-6/連結 2026-07-13] 探索結果 → ctx.game_progress 書戻し(母関数フィードバックの再結線)。
@@ -24635,7 +24839,10 @@ def _gps_writeback(st):
             _wb = ni.get("decision_cp")
             if _wb != ni.get("score_cp"):
                 _pinfo_count("ta_feedback_changed_" + str(ni.get("decision_src")))
-        gps.last_nnue_score_cp = int(_wb or 0)
+        # [AUDIT-20261017] relay 失敗等で score が無い手は前手の値を残す
+        #   (旧: int(None or 0) = 0 = 互角を書き、次手の TA / momentum を誤らせた)。
+        if _wb is not None:
+            gps.last_nnue_score_cp = int(_wb)
     except Exception as _e:
         _flog(f"[ignored] _gps_writeback: {_e!r}")
     # [hub: _compute_go_time_dynamics(TA) trivial_cap が last_nnue_mate_ply を読む]
@@ -26829,7 +27036,26 @@ def _run_infinite_council(ctx, eng, move_count):
             _ni["sharpness"] = _shp
         _safe_bestmove(_final, _nnue_bestmove[1], label="infinite-council", nnue_info=_ni)
 
-    _spawn("inf-council-relay", _relay_and_vote)
+    _INF_RELAY_THREAD[0] = _spawn("inf-council-relay", _relay_and_vote)
+
+
+# [AUDIT-20261017] go infinite の relay スレッド。stop → position → go を連続で送る解析 GUI で、
+#   旧スレッドが nnue_1 のキューを読んでいる最中に新しい go の relay が同じキューを読み、
+#   旧探索の bestmove を新局面の答えとして出していた。次の go の前に join する。
+_INF_RELAY_THREAD = [None]
+
+
+def _join_infinite_relay(ctx, label, timeout_s=3.0):
+    th = _INF_RELAY_THREAD[0]
+    if th is None or not th.is_alive():
+        return
+    try:
+        ctx.nnue_1.send("stop")
+    except Exception:
+        pass
+    th.join(timeout=timeout_s)
+    _flog(f"[INF-RELAY-JOIN/{label}] previous infinite relay "
+          f"{'finished' if not th.is_alive() else 'STILL ALIVE after %.1fs' % timeout_s}")
 
 
 # ------------------------------------------------------------------
@@ -27143,8 +27369,11 @@ def _handle_setoption(ctx, line):
     global _draw_ply, _tournament_mode, _opponent_style  # [GP-POL/OPP-ID v6.4]
     global _opponent_id_nnue_names, _opponent_id_dl_names, _opponent_id_hybrid_names  # [OPP-ID 名前断定]
     m = _RE_SETOPTION.match(line)
+    if m and m.group(2).strip() == "" and not m.group(1).endswith("_Names"):
+        _flog(f"setoption {m.group(1)}: empty value ignored")   # 数値キー等は空値を受けない
+        m = None
     if m:
-        key, val = m.group(1), m.group(2)
+        key, val = m.group(1), m.group(2).strip()
         if key == _K_POLICY_MOVES:
             _params[_K_POLICY_MOVES] = int(val)
         elif key == _K_POLICY_NODES:
@@ -27325,6 +27554,22 @@ def _handle_isready(ctx, line):
             or (_DL_START_FAILED and _eng_alive(getattr(ctx, "nnue_1", None)))):
         _flog("isready: engines already initialized — skipping re-init, "
               "replying readyok only")
+        # [AUDIT-20261017] fast path でも局間リセットを行う (旧: return が先で、2 局目以降
+        #   SP / SlowMover の局間リセットが走らなかった)。
+        _nnue_1_opts["Stochastic_Ponder"] = (
+            str(_cfg["nnue_1_Stochastic_Ponder"]) if _early_ponder else "false")
+        if not _nnue_slowmover_user_set:
+            _nnue_1_opts["SlowMover"] = str(round(_lerp(*_LERP_SLOWMOVER, _time_aggression_nnue)))
+        # [AUDIT-20261017] dl_1 だけ生きていて nnue_1 が死んでいる (前局終盤の crash) なら
+        #   readyok の前に起こす。旧: そのまま readyok → 次局初手の go が自分の時計で
+        #   同期 restart (Hash 確保) か emergency/resign 経路へ落ちた。
+        _n1 = getattr(ctx, "nnue_1", None)
+        if _n1 is not None and not _eng_alive(_n1):
+            try:
+                _ok = _restart_nnue_1(ctx, "isready-fastpath")
+                _flog(f"isready: nnue_1 was dead — restart {'ok' if _ok else 'FAILED'}")
+            except Exception as _re:
+                _flog(f"isready: nnue_1 restart raised: {_re!r}")
         if not _suppress_info_print:
             print("readyok", flush=True)
         _flog("readyok sent (already-initialized fast path)")
@@ -27978,16 +28223,24 @@ def _locked_usinewgame(lock, eng, label: str) -> None:
 
 
 _usinewgame_last_t = [0.0]
+# [AUDIT-20261017] 前回 usinewgame 以降に go / go ponder / gameover があったか。
+#   P6-6 の 7s 重複スキップは「grid pre-setup + 本番」の空打ちだけが対象。旧実装は壁時計
+#   だけで判定し、7s 未満で終わった対局 (即投了・反則・中断) の次局の usinewgame を
+#   丸ごと飛ばしていた (reset_game / 世代リセット / nnue_1 stop+flush も無し → 前局の
+#   bestmove 残骸や状態が次局へ持ち越し)。
+_GAME_ACTIVITY_SINCE_UNG = [False]
 
 def _handle_usinewgame(ctx, line):
     _ARB_LIVE_GAME_ID[0] = "live-%d-%d" % (os.getpid(), int(time.time() * 1000))
     # [P6-6] 7s 以内の二重 usinewgame (grid pre-setup + 本番) をスキップ。
     _now_ung = time.perf_counter()
-    if _now_ung - _usinewgame_last_t[0] < 7.0 and _usinewgame_last_t[0] > 0:
+    if (_now_ung - _usinewgame_last_t[0] < 7.0 and _usinewgame_last_t[0] > 0
+            and not _GAME_ACTIVITY_SINCE_UNG[0]):
         _flog("[P6-6] usinewgame: duplicate within %.1fs — skipping heavyweight re-init"
               % (_now_ung - _usinewgame_last_t[0]))
         return
     _usinewgame_last_t[0] = _now_ung
+    _GAME_ACTIVITY_SINCE_UNG[0] = False
     _MGMT_GEN[0] += 1   # [MGMT-HUB] 旧世代の遅延管理コマンドを失効させる
     # [ZENREI-RESET-FIX 2026-07-17] 前例照会の kill-switch を局頭で戻す。
     # _zenrei_consec_zero は「連続3回 count=0 (=新手領域) なら以降照会停止」の
@@ -28375,6 +28628,13 @@ def _ps_begin_ponder(ctx, line, label):
 def _gp_gates(ctx):
     """[WP5-§4.1 2026-07-15] go ponder 受理ゲート: EarlyPonder/USI_Ponder 判定、
     live_info_cb の解除、GEN-HUB bump。False = 受理しない。"""
+    global _early_ponder
+    if not _early_ponder and _nnue_1_opts.get("USI_Ponder", "true") != "false":
+        # [AUDIT-20261017] USI_Ponder は default true で広告しているが、_early_ponder は
+        #   `setoption USI_Ponder value true` 受信でしか立たなかった。変更分だけ送る GUI では
+        #   go ponder が永久に捨てられる (+ stop 沈黙)。明示 false が無い go ponder は受理する。
+        _early_ponder = True
+        _flog("go ponder: USI_Ponder not explicitly false — enabling ponder forwarding")
     if not _early_ponder:
         _dlog("go ponder ignored (EarlyPonder=false)")
         return False
@@ -28624,6 +28884,9 @@ def _gp_normal_branch(ctx, line):
 def _handle_go_ponder(ctx, line):
     """[WP5-§4.1 2026-07-15] go ponder 司令部: gates → 通常枝。
     [Step 4C 2026-07-17] endgame 枝分岐撤去 (endgame lane 全廃)。"""
+    _GO_PONDER_OWED[0] = True
+    _GAME_ACTIVITY_SINCE_UNG[0] = True
+    _join_infinite_relay(ctx, "go-ponder")
     if not _gp_gates(ctx):
         return
     _gp_normal_branch(ctx, line)
@@ -29220,6 +29483,8 @@ def _apply_time_dynamics(ctx, line, move_count, label="go", clock_base=None):
 
 
 def _handle_go(ctx, line):
+    _GAME_ACTIVITY_SINCE_UNG[0] = True
+    _join_infinite_relay(ctx, "go")
     # [USI-SFEN-KIFU 2026-07-09] 確定局面の追跡: 通常 go を受けた時点の
     # current_position は「実際に指された手のみ」を含む (go ponder の予測局面
     # と区別)。ponderhit ハンドラも同様に更新する。局後 SFEN 出力の予測手除去
@@ -29364,6 +29629,12 @@ def _handle_go(ctx, line):
     # nnue1_ponder_sent をガードするので二重呼び出しは無害)。
     if "nnue_1" in ctx.ps.pending_bestmove:
         _stop_nnue_ponders(ctx, "go fresh-go nnue-drain")
+    # [AUDIT-20261017] stop なしの go = 前の go ponder は終わった。phase を IDLE へ戻す
+    #   (旧: active のまま残り、本 go の bestmove 後の stop が ponder-miss 分岐に入って
+    #   emergency 手を作り、_STOP_REARM で dedup も外れて 2 個目の bestmove を出した)。
+    _GO_PONDER_OWED[0] = False
+    if ctx.ps.phase in _PS_PHASE_ACTIVE or ctx.ps.phase is PsPhase.MATE_SKIP:
+        _ps_transition(ctx, PsPhase.IDLE, "go-without-stop")
     # [OPP-ID v6.4] 本番 go = 相手の実手が確定した観測機会 (ponder miss /
     # 直接 go)。go ponder はここを通らない (予測局面で観測してはならない)。
     # 局面が pending 基底の 1 手延長でなければ黙って破棄 (one-shot)。
@@ -30088,6 +30359,13 @@ def _harvest_one_dl_ponder(eng, n, timeout_s, label, *, cfg=None):
     score_hist    = {}
     mate_detected = False
     _got_bestmove = False
+    # [AUDIT-20261017] 読むべきは最新の go ponder の bestmove 1 個だけ。それより前の
+    #   未回収 bestmove (前回 harvest の timeout / 局面不一致 return の残骸) を先に捨てる
+    #   (stop は呼び出し側が送信済み)。
+    _t_h0 = time.perf_counter()
+    if not _drain_until_outstanding(eng, 1, timeout_s * 0.5, f"harvest/{label}", send_stop=False):
+        return None
+    timeout_s = max(0.01, timeout_s - (time.perf_counter() - _t_h0))
     for line in eng.iter_until("bestmove", timeout=timeout_s):  # [PATCH-ITER-UNTIL 2026-07-07]
         if line.kind == "bestmove":
             _got_bestmove = True
@@ -30641,6 +30919,7 @@ def _handle_ponderhit(ctx, line):
     gen-dedup が最終 bestmove を潰し GUI ハング)、(b) PREARB 停止 + 鮮度クリア —
     「pred は消すが gen は温存」の契約 (進めると現役キャッシュが失効)。
     move_count は _u_ph_setup が position から再計算する (0 はプレースホルダ)。"""
+    _GO_PONDER_OWED[0] = False       # ponderhit 後の探索が bestmove で答える
     _gen_new_thinking("ponderhit")   # [H1-FIX→GEN-HUB]
     _phit_trace_start()              # [PH-TRACE]
     ctx.game_progress.sp_move_diag = {}   # [SP-STATS v6.6]
@@ -30651,6 +30930,8 @@ def _handle_stop(ctx, line):
     # [WO-1/G-03 2026-07-08] stop 応答 bestmove の送出許可を再武装する。
     global _STOP_REARM
     _STOP_REARM = True
+    _ponder_owed = _GO_PONDER_OWED[0]
+    _GO_PONDER_OWED[0] = False
     ctx.nnue_1._live_info_cb = None
     if ctx.dl_1 is not None:
         ctx.dl_1._live_info_cb = None
@@ -30953,7 +31234,10 @@ def _handle_stop(ctx, line):
                 f"— overriding {_em_engine_name} bestmove ({_em_best})"
             )
         else:
-            _final_em = _em_best or "resign"
+            # [AUDIT-20261017] 旧 `or "resign"`: 自分の詰みスコアで入るこの経路で、短い relay が
+            #   空振りしただけで明示 resign を送っていた。空を渡し _safe_bestmove の回収
+            #   (relay 捕捉 → 生存エンジン emergency → revive 待ち) に委ねる。
+            _final_em = _em_best or ""
 
         _safe_bestmove(_final_em)
         _flog(f"stop emergency: bestmove {_final_em} sent to GUI")
@@ -30969,6 +31253,24 @@ def _handle_stop(ctx, line):
                 _count_moves(_em_pos),
             )
         _ps_transition(ctx, PsPhase.IDLE, "stop-emergency-finalize")  # (_ponderhit_finalize との対称性)
+
+    elif _ponder_owed:
+        # [AUDIT-20261017] go ponder を受けたが子へ転送していない (ゲート不通過 / nnue_1 死亡で
+        #   async revive 中) まま stop。USI 上 bestmove が要る (旧: 沈黙)。ponder-miss の
+        #   bestmove は GUI が破棄するが、返さないと厳密な GUI は次の go を送らない。
+        if _ACTIVE_BESTMOVE_SINK is not None:
+            _flog("stop (go ponder not forwarded): bestmove sink active — skip")
+        else:
+            _emerg_ow = None
+            try:
+                _emerg_ow = _emergency_move_from_any_engine(ctx, 1.0)
+            except Exception as _ee:
+                _flog(f"stop (go ponder not forwarded): emergency raised: {_ee!r}")
+            if _emerg_ow and _emerg_ow not in ("resign", "win"):
+                _safe_bestmove(_emerg_ow, label="stop-ponder-unforwarded")
+            else:
+                _flog("stop (go ponder not forwarded): no engine move — "
+                      "bestmove を出せない (resign にはしない)")
 
     # ----------------------------------------------------------------
     # gameover
@@ -31091,6 +31393,7 @@ def _usi_game_sfen_flush(ctx, tag: str) -> None:
 
 
 def _handle_gameover(ctx, line):
+    _GAME_ACTIVITY_SINCE_UNG[0] = True
     _MGMT_GEN[0] += 1   # [MGMT-HUB] 旧世代の遅延管理コマンドを失効させる
     _flog(f"[PARENT-INFO-STATS] mode={_PARENT_INFO_MODE} {json.dumps(_PARENT_INFO_STATS, sort_keys=True)}")
     # [unified] all ponder stop + prefetch cancel
@@ -40178,7 +40481,7 @@ def _selfplay_game(eng_sente: "_SpsaUsiEngine",
                         if _adj_sm:
                             _adj_score_obs = (
                                 move_no,
-                                _mate_sign_score(int(_adj_sm.group(1))))
+                                _mate_sign_score(_mate_ply(_adj_sm.group(1))))
                 # [LIVE-FEED 2026-07-16] reader loop 内 attribution/throttle/sticky
                 # fresh を _LiveFeed に集約。旧: dl_live_policy パスは pos_hash8 gate
                 # (44705) + attribution filter (44708-44711) + update_think_pv 呼び。
@@ -40216,7 +40519,7 @@ def _selfplay_game(eng_sente: "_SpsaUsiEngine",
                             _mm_sp = _RE_MATE.search(line)
                             if _mm_sp:
                                 _scp_sp = _mate_sign_score(
-                                    int(_mm_sp.group(1)))
+                                    _mate_ply(_mm_sp.group(1)))
                         _pv_sp = None
                         if " pv " in line:
                             _fpv_sp = _RE_PV_FULL.search(line)
@@ -44224,6 +44527,17 @@ _ZOBRIST_VERIFY = bool(os.environ.get("PYFAMATE_ZOBRIST_VERIFY", "").strip())
 del _zb_rng, _zb_random
 
 # ====================== §12 ShogiBoard (簡易盤 + USI/CSA 相互変換) ======================
+def _dead_end_piece(base, to_row, sente):
+    """[AUDIT-20261017] 行き所のない駒: 歩/香 は敵陣最奥段、桂 は最奥 2 段に置けない
+    (row 1 = 一段目 = 先手から見た最奥)。"""
+    far = to_row if sente else 10 - to_row
+    if base in ("P", "L"):
+        return far <= 1
+    if base == "N":
+        return far <= 2
+    return False
+
+
 class ShogiBoard:
     """[B0/B2] 統合盤面クラス — 唯一の盤面実装・単一の真実源。
 
@@ -44686,6 +45000,8 @@ class ShogiBoard:
                 # 打先占有: 目的マスに駒があれば打てない (敵駒も自駒も不可)。
                 if self.board.get((to_col, to_row), ""):
                     return "occupied"
+                if _dead_end_piece(base, to_row, mover_is_sente):
+                    return "dead_end"   # [AUDIT-20261017] 行き所のない駒 (歩/香 1段目・桂 1-2段目)
                 # 二歩: 歩打ちで、同じ筋に自分の「不成の歩」が既にあれば反則。
                 # と金 (成り歩 '+P'/'+p') は二歩の対象外。
                 if base == "P":
@@ -44712,6 +45028,13 @@ class ShogiBoard:
             dest_side = self.piece_side(to_col, to_row)
             if dest_side is not None and dest_side == self.side:
                 return "self_capture"
+            if not usi_move.endswith("+"):
+                # [AUDIT-20261017] 不成で行き所のない升へ動く歩/香/桂は確定非合法。
+                fc, fr = self._to_rc(body[0:2])
+                _pc = self.board.get((fc, fr), "")
+                if _pc and not _pc.startswith("+") and _dead_end_piece(
+                        _pc.upper(), to_row, mover_is_sente):
+                    return "dead_end"
             # [FIX-CHECK-EVASION 2026-07-12] 王手放置検出: 現局面で自玉が王手されて
             # いるとき、この手を指した後も自玉が王手のままであれば確定非合法。
             # DL_1 の Stochastic_Ponder が別局面用の手を返し、council override で
@@ -44746,9 +45069,9 @@ class ShogiBoard:
         (既存フローに委ねる — illegal_drop_reason 全体の設計規律と同一)。
         """
         try:
-            if not self._is_king_attacked(self.side):
-                return None  # 王手されていない — この検問の対象外
-            # 仮適用して王手解除を確認する。
+            # [AUDIT-20261017] 旧: 現局面で王手されていなければ即 None。ピンされた駒を動かす /
+            #   玉を利きへ動かす「自殺手」(王手でない局面からの非合法手) を素通ししていた
+            #   (stale DL 手の採用 → #ILLEGAL_MOVE と同じ事故類型)。常に仮適用して確認する。
             scratch = ShogiBoard.__new__(ShogiBoard)
             scratch.board      = self.board.copy()
             scratch.sente_hand = self.sente_hand.copy()
