@@ -155,14 +155,7 @@ kif = ["sfen 8k/9/9/9/9/9/9/9/4K2R1 b - 1"] + (cyc.strip() + " 2i1i").split()
 check("makebook_perpetual_checker_sente", g["_mb_perpetual_checker"](kif) == "b")
 check("makebook_no_repetition_none", g["_mb_perpetual_checker"](kif[:5]) is None)
 
-# 12. 打ち歩詰め (ported from Zyfamate's definition: pawn-drop check with no legal reply).
-bu = SB(sfen="sfen 7lk/9/7G1/9/9/9/9/9/4K4 b P 1")
-check("uchifuzume_detected", bu.illegal_drop_reason("P*1b") == "uchifuzume", bu.illegal_drop_reason("P*1b"))
-bu2 = SB(sfen="sfen 7lk/9/9/9/9/9/9/9/4K4 b P 1")
-check("pawn_check_king_can_take_is_legal", bu2.illegal_drop_reason("P*1b") is None, bu2.illegal_drop_reason("P*1b"))
-bu3 = SB(sfen="sfen 6l1k/9/7G1/9/9/9/9/9/4K4 b P 1")
-check("pawn_check_king_escapes_is_legal", bu3.illegal_drop_reason("P*1b") is None, bu3.illegal_drop_reason("P*1b"))
-check("pawn_drop_no_check_is_legal", bu.illegal_drop_reason("P*5e") is None)
+# 12. 打ち歩詰め is Zyfamate's job (gen_checks excludes pawn-drop mates); Pyfamate no longer duplicates it.
 
 bad = [k for k, v in R.items() if not v]
 print("%d/%d PASS" % (len(R) - len(bad), len(R)))
