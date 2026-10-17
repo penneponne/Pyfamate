@@ -34685,23 +34685,31 @@ class SvStridedSplit:
     val = i % stride == 0 の位置。パック内で盤面はゲーム順に並ぶため、
     ストライド抽出は全体から満遍なくサンプリングされる。"""
 
+    # [AUDIT-20261017] 1 局面単位のストライドは「ゲーム順に並ぶ」パックでは同じ対局の隣接
+    #   局面が train/val に交互に入り、val がほぼ train の複製になっていた (val 損失が楽観)。
+    #   BLOCK 局面 (≈数局) の塊単位で val を取る。境界の 1 局ぶんだけが跨る。
+    BLOCK = 512
+
     def __init__(self, ds, val_frac, train):
         self.ds = ds
         self.stride = max(2, int(round(1.0 / max(val_frac, 1e-9))))
         self.train = train
         n = len(ds)
-        n_val = (n + self.stride - 1) // self.stride
+        cyc = self.stride * self.BLOCK
+        n_val = (n // cyc) * self.BLOCK + min(n % cyc, self.BLOCK)
         self._len = (n - n_val) if train else n_val
 
     def __len__(self):
         return self._len
 
     def __getitem__(self, k):
+        B, cyc = self.BLOCK, self.stride * self.BLOCK
         if self.train:
-            b, r = divmod(k, self.stride - 1)
-            i = b * self.stride + r + 1
+            c, r = divmod(k, (self.stride - 1) * B)
+            i = c * cyc + B + r
         else:
-            i = k * self.stride
+            c, r = divmod(k, B)
+            i = c * cyc + r
         return self.ds[i]
 
 
@@ -37537,6 +37545,13 @@ def spsa_perturbation(state: SpsaState) -> "tuple[dict, dict]":
         if p.is_int:
             plus_val  = int(round(plus_val))
             minus_val = int(round(minus_val))
+            if plus_val == minus_val:
+                # [AUDIT-20261017] ck*step < 0.5 だと丸めで θ+ = θ- になり、その次元は同一設定
+                #   同士の対局結果 (純ノイズ) で更新され続ける (ランダムウォーク)。最小 ±1 の
+                #   摂動を保証する (範囲端では片側だけ動く)。
+                _c = int(round(p.value))
+                plus_val  = int(p.clamp(_c + (1 if d > 0 else -1)))
+                minus_val = int(p.clamp(_c - (1 if d > 0 else -1)))
         else:
             plus_val  = round(plus_val,  4)
             minus_val = round(minus_val, 4)
@@ -47219,6 +47234,12 @@ class _CsaGame:
             board = self.csa_board
             turn = "b" if self.turn == "+" else "w"
             ok = board.can_declare_win(turn)
+            # [AUDIT-20261017] 王手されていないこと (宣言条件)。旧: 「重いのでエンジン確認済みと信頼」
+            #   としていたが、_is_king_attacked は合法手生成不要で軽い。win を作るのは NNUE 子だけ
+            #   ではない (override / stale 経路) ので権威盤で確かめる。誤宣言は即負け。
+            if ok and board._is_king_attacked(turn):
+                _flog("[CSA] declaration check: king is in check — declining")
+                ok = False
             pts, in_zone = board.nyugyoku_score(turn)
         except Exception as e:
             _flog(f"[CSA] declaration check failed ({e}) — declining")
@@ -53707,11 +53728,19 @@ def _makebook_cli_overlay(extra_args: list) -> None:
                 end = 1
 
             elif board.is_sennichite():  # 千日手処理
-                tempkif[-1] = "rep_draw"
+                # [AUDIT-20261017] 本流 (_makebook_cli) の 10-16 修正 (連続王手の千日手は王手側の
+                #   負け) が overlay 経路に入っていなかった。印を付ける前の棋譜で判定する。
+                _perp = _mb_perpetual_checker(tempkif)
+                tempkif.append("rep_draw")   # [AUDIT-20261017] 旧 tempkif[-1]= は千日手を完成させた実手を上書きしていた (本流は append)
                 if not _game_from_queue:
                     win = 0
-                print("千日手")
-                if draw == "b" or draw == "w":
+                print("千日手" + (" (連続王手: %s の負け)" % _perp if _perp else ""))
+                if _perp in ("b", "w"):
+                    _bp = _apply_book_result(book, tempbook, _perp)
+                    if _bp["killed"]:
+                        print("[makebook] book_pass: killed=%s evaporated=%s"
+                              % (_bp["killed"], _bp["evaporated"]))
+                elif draw == "b" or draw == "w":
                     # draw は "b" または "w" — 負けた側の手番を直接 _apply_book_result へ渡す。
                     _bp = _apply_book_result(book, tempbook, draw)
                     if _bp["killed"]:
