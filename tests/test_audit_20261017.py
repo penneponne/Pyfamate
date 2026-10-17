@@ -135,9 +135,11 @@ check("setoption_value_parses", m.group(1) == "USI_Hash" and m.group(2) == "1024
 cyc = "2i1i 1a2a 1i2i 2a1a " * 3
 bp = SB(sfen="sfen 8k/9/9/9/9/9/9/9/4K2R1 b - 1 moves " + cyc.strip())
 check("perpetual_check_detected", bp.is_perpetual_check_move("2i1i") is True)
-bq = bp.clone()
-bq._hist_check[len(bq._hist_check) - 4] = False   # pretend one of our moves in the cycle was quiet
-check("plain_repetition_completed_by_check_not_perpetual", bq.is_perpetual_check_move("2i1i") is False)
+nb = bp._after_usi("2i1i")
+fl = nb._hist_check_flags()
+check("check_flags_rebuilt_lazily", fl is not None and len(fl) == 13 and all(fl[0::2]), fl)
+fl[8] = False   # pretend one of sente's moves in the cycle was quiet
+check("plain_repetition_completed_by_check_not_perpetual", nb.perpetual_checker(flags=fl) is None)
 
 # 10. dedup helpers keep behaviour.
 acc = g["_DlInfoAcc"]()

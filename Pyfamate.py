@@ -44278,9 +44278,11 @@ class ShogiBoard:
         self.ply: int = 1
         self._last_to = None            # [LAST-INV] 直前着手の着点 (筋,段) / None
         self._history: list[int] = []
-        # [AUDIT-20261017] _hist_check[k] = 通算 k+1 手目 (=_history[k+1] を作った手) が王手だったか。
-        #   連続王手の千日手判定 (区間内の片側の全手が王手) に使う。
-        self._hist_check: list = []
+        # [AUDIT-20261017] 連続王手の千日手判定用: 開始局面 SFEN と適用した手。各手が王手だったかは
+        #   千日手成立時にだけ再生して求める (_hist_check_flags)。毎手 _is_king_attacked を記録すると
+        #   履歴付き盤の構築が 2.5 倍遅くなった (709k → 288k 手/秒, 実測) ため遅延計算。
+        self._hist_moves: list = []
+        self._hist_start = None
         self._zhash: int = 0
         self._hist_counter: dict[int, int] = {}  # [perf] Zobrist key → 出現回数
         self._kpos: list = [None, None]  # [perf] [先手玉pos, 後手玉pos] O(1) キャッシュ
@@ -44326,6 +44328,7 @@ class ShogiBoard:
         if getattr(self, "_track_history", True):
             self._history.append(self._zhash)
             self._hist_counter[self._zhash] = self._hist_counter.get(self._zhash, 0) + 1
+            self._hist_start = (board_part, side, hand_part)
 
         for m in moves:
             self.apply_usi(m)
@@ -44397,7 +44400,8 @@ class ShogiBoard:
         nb.ply        = self.ply
         nb._last_to   = getattr(self, "_last_to", None)   # [LAST-INV] 直前着手着点
         nb._history   = list(self._history)
-        nb._hist_check = list(getattr(self, "_hist_check", []))
+        nb._hist_moves = list(getattr(self, "_hist_moves", []))
+        nb._hist_start = getattr(self, "_hist_start", None)
         nb._zhash = self._zhash
         nb._hist_counter = self._hist_counter.copy()
         nb._track_history = getattr(self, "_track_history", True)
@@ -44532,12 +44536,9 @@ class ShogiBoard:
                     self._zhash = _ref
             self._history.append(self._zhash)
             self._hist_counter[self._zhash] = self._hist_counter.get(self._zhash, 0) + 1
-            try:
-                _hc = getattr(self, "_hist_check", None)
-                if _hc is not None:
-                    _hc.append(bool(self._is_king_attacked(self.side)))   # 指した手が王手か
-            except Exception:
-                pass
+            _hm = getattr(self, "_hist_moves", None)
+            if _hm is not None:
+                _hm.append(usi_move)
 
     def push(self, move: str) -> None:
         """makebook 互換エイリアス。"""
@@ -45294,12 +45295,26 @@ class ShogiBoard:
         """
         return self.repetition_count_after(usi_move) >= min_count
 
-    def perpetual_checker(self, unknown=None):
+    def _hist_check_flags(self):
+        """各手が王手だったか ([k] = 通算 k+1 手目)。開始局面から再生して求める。作れなければ None。"""
+        start, moves = getattr(self, "_hist_start", None), getattr(self, "_hist_moves", None)
+        if start is None or moves is None or len(moves) != len(self._history) - 1:
+            return None
+        board_part, side, hand_part = start
+        nb = ShogiBoard(sfen="sfen %s %s %s 1" % (board_part, side, hand_part or "-"), track_history=False)
+        flags = []
+        for m in moves:
+            nb.apply_usi(m)
+            flags.append(bool(nb._is_king_attacked(nb.side)))
+        return flags
+
+    def perpetual_checker(self, unknown=None, flags=None):
         """[DEDUP-20261017] 現局面で千日手が成立しているとき、連続王手側 ("b"/"w") を返す。そうでなければ None。
         判定 = 最終局面の初出から現在までの区間で、一方の手が全て王手 (_sprt_sennichite_verdict_core)。
-        王手履歴 (_hist_check) が履歴と揃っていない盤では unknown を返す。
+        王手履歴 (_hist_check_flags) が作れない盤では unknown を返す。flags は検証用の差し替え口。
         is_perpetual_check_move / makebook (_mb_perpetual_checker) が共有する唯一の実装。"""
-        hist, flags = self._history, getattr(self, "_hist_check", None)
+        hist = self._history
+        flags = self._hist_check_flags() if flags is None else flags
         if flags is None or len(flags) != len(hist) - 1 or len(hist) < 2:
             return unknown
         if not self.is_sennichite():
