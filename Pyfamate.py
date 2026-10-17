@@ -21489,6 +21489,25 @@ def _restart_nnue_impl(ctx, caller, *, slot, readyok_timeout=None, async_launch=
         _r_lock.release()   # [RESTART-MUTEX]
 
 
+def _nnue1_restart_busy():
+    """[AUDIT-20261017] nnue_1 の restart/revive が進行中か (lock 保持中)。"""
+    try:
+        return _NNUE_RESTART_LOCKS["nnue_1"].locked()
+    except Exception:
+        return False
+
+
+def _nnue1_wait_restart(timeout_s):
+    """[AUDIT-20261017] 進行中の nnue_1 restart の完了を最大 timeout_s 待つ。完了/不在なら True。"""
+    _lk = _NNUE_RESTART_LOCKS["nnue_1"]
+    if not _lk.locked():
+        return True
+    if _lk.acquire(timeout=max(0.0, timeout_s)):
+        _lk.release()
+        return True
+    return False
+
+
 def _restart_nnue_1(ctx, caller, readyok_timeout=None, async_launch=False):
     """
     Restart ctx.nnue_1 after a crash. Called from go / ponderhit handlers.
@@ -23339,6 +23358,11 @@ def _u_ph_relay(st):
         _dlog("[PH-MISS/B-c] nnue_1 債務なし → bypass ponderhit; "
               "send position+go directly to idle nnue_1")
         _bp_mt = max(100, int(eff_s * 1000)) if eff_s and eff_s > 0 else 1000
+        # [AUDIT-20261017] async revive の初期化中 (readyok 前) なら完了を待つ。待てなければ
+        #   送らずに短絡 (同じキューを revive スレッドと読み合わない)。
+        if not _nnue1_wait_restart(min(2.0, max(0.2, (eff_s or 1.0) * 0.5))):
+            _u_ph_short_empty(st, "nnue_1 revive in progress (B-c)")
+            return
         ctx.nnue_1.send(st.position_cmd)
         ctx.nnue_1.send(f"go movetime {_bp_mt}")
         _bp_to = max(0.5, _bp_mt / 1000.0 + 0.5)
@@ -26013,7 +26037,8 @@ def _emergency_move_from_any_engine(ctx, eff_s):
     # (2) この手は生存 DL に指させる。探索ノード/タイムアウトは控えめに。
     # [Step 4B] DL_3 廃止に伴い _dl_3_effective_nodes → _params[_K_POLICY_NODES] へ repoint。
     _nodes   = _params[_K_POLICY_NODES]
-    _timeout = _clamp(eff_s if eff_s else 3.0, 1.0, 5.0)
+    # [AUDIT-20261017] 下限 1.0s → 0.3s (呼び出し側が秒読み残りで縛った値を床で潰さない)。
+    _timeout = _clamp(eff_s if eff_s else 3.0, 0.3, 5.0)
     _board = _get_tracking_board(ctx)
 
     # [Step 4B 2026-07-17] 生存 DL を優先順位順に試すループだが、DL_2/DL_3 は
@@ -29326,6 +29351,24 @@ def _handle_go(ctx, line):
         # (物理停止往復の最小)。起こせなければ下の emergency 委譲へ早く落ちる (合法手は必ず返る)。
         _readyok_to = 60
         _gc_dead = None
+        # [AUDIT-20261017] この手の壁時計上限 (主時間 + 秒読み/加算 − Move_Overhead)。旧実装は
+        #   remaining_ms だけで各段を決め、`btime 0 byoyomi 1000` では restart 1.6s + revive 床
+        #   2.0s + emergency 床 1.0s = 3–5s で秒読み 1s を確実に超えた。各段をこの残りで縛る。
+        _dead_t0 = time.perf_counter()
+        _dead_hard_s = None
+        if not is_infinite:
+            try:
+                _gch, _, _ = _parse_go_clock_base(line, move_count, cfg=ctx.cfg)
+                _dead_hard_s = ((_gch.remaining_ms or 0) + max(_gch.byo_ms or 0, _gch.inc_ms or 0)) / 1000.0 \
+                    - _move_overhead_s
+                if _dead_hard_s <= 0:
+                    _dead_hard_s = None
+            except Exception:
+                _dead_hard_s = None
+
+        def _dead_left():
+            return (None if _dead_hard_s is None
+                    else max(0.05, _dead_hard_s - (time.perf_counter() - _dead_t0)))
         if not is_infinite:
             try:
                 _gc_dead, _, _ = _parse_go_clock_base(line, move_count, cfg=ctx.cfg)
@@ -29341,6 +29384,8 @@ def _handle_go(ctx, line):
                 _readyok_to = _clamp(max(_ef * 2.0, _rem_s * 0.5), _move_overhead_s, 60.0)
             except Exception:
                 _readyok_to = 30
+        if _dead_left() is not None:
+            _readyok_to = min(_readyok_to, max(0.05, _dead_left() * 0.35))
         _ok_restart = _restart_nnue_1(ctx, "go", readyok_timeout=_readyok_to)
         if not _ok_restart or not ctx.nnue_1._alive:
             _flog("go: ctx.nnue_1 restart failed — delegating this move to a "
@@ -29360,7 +29405,10 @@ def _handle_go(ctx, line):
                     _wv_rem if _wv_rem > 0 else 9999.0)
             except Exception:
                 _wv_deadline = 3.0
-            _wait_mv = _wait_revive_nnue_and_move(ctx, caller="go", deadline_s=_wv_deadline)
+            if _dead_left() is not None:
+                _wv_deadline = min(_wv_deadline, max(0.05, _dead_left() * 0.4))
+            _wait_mv = _wait_revive_nnue_and_move(ctx, caller="go", deadline_s=_wv_deadline,
+                                                  go_clock=_gc_dead)   # [AUDIT-20261017] 今手の時計 (旧: 前手の ps.go_clock)
             if _wait_mv:
                 try:
                     _record = _build_move_record({
@@ -29382,6 +29430,8 @@ def _handle_go(ctx, line):
                 _emerg_movetime = _clamp(min(3.0, _emerg_rem * 0.5), 0.5, 5.0)
             except Exception as _e:
                 _flog(f"[ignored] _handle_go: {_e!r}")
+            if _dead_left() is not None:
+                _emerg_movetime = min(_emerg_movetime, max(0.2, _dead_left() * 0.7))
             _emerg = None
             try:
                 _emerg = _emergency_move_from_any_engine(ctx, _emerg_movetime)
@@ -29770,8 +29820,12 @@ def _ponderhit_restart_nnue1_and_movetime(ctx, position_cmd, move_count, eff_s,
         return None
     _rec_readyok_to = (_clamp(_rec_rem_ms / 1000.0 * 0.5, 0.5, 30.0)
                        if _rec_rem_ms is not None else None)
-    _restart_nnue_1(ctx, restart_caller, readyok_timeout=_rec_readyok_to)
-    if not ctx.nnue_1._alive:
+    _rs_ok = _restart_nnue_1(ctx, restart_caller, readyok_timeout=_rec_readyok_to)
+    # [AUDIT-20261017] 戻り値を見る。USIEngine.start() は spawn 直後に ALIVE になるため、
+    #   別スレッドの async revive が readyok 待ち中だと _alive=True でも未初期化。旧実装は
+    #   _alive だけ見て position/go を送り、revive 側の wait_for(readyok) と relay が同じ
+    #   キューを読み合った (bestmove を捨てる / readyok を飲む)。
+    if not _rs_ok or not ctx.nnue_1._alive or _nnue1_restart_busy():
         return None
     # 再起動後は ponderhit で使っていた探索木が失われているため、
     # ponderhit ではなく position + go movetime で確実に bestmove を取りに行く。
@@ -44200,6 +44254,9 @@ class ShogiBoard:
         self.ply: int = 1
         self._last_to = None            # [LAST-INV] 直前着手の着点 (筋,段) / None
         self._history: list[int] = []
+        # [AUDIT-20261017] _hist_check[k] = 通算 k+1 手目 (=_history[k+1] を作った手) が王手だったか。
+        #   連続王手の千日手判定 (区間内の片側の全手が王手) に使う。
+        self._hist_check: list = []
         self._zhash: int = 0
         self._hist_counter: dict[int, int] = {}  # [perf] Zobrist key → 出現回数
         self._kpos: list = [None, None]  # [perf] [先手玉pos, 後手玉pos] O(1) キャッシュ
@@ -44316,6 +44373,7 @@ class ShogiBoard:
         nb.ply        = self.ply
         nb._last_to   = getattr(self, "_last_to", None)   # [LAST-INV] 直前着手着点
         nb._history   = list(self._history)
+        nb._hist_check = list(getattr(self, "_hist_check", []))
         nb._zhash = self._zhash
         nb._hist_counter = self._hist_counter.copy()
         nb._track_history = getattr(self, "_track_history", True)
@@ -44450,6 +44508,12 @@ class ShogiBoard:
                     self._zhash = _ref
             self._history.append(self._zhash)
             self._hist_counter[self._zhash] = self._hist_counter.get(self._zhash, 0) + 1
+            try:
+                _hc = getattr(self, "_hist_check", None)
+                if _hc is not None:
+                    _hc.append(bool(self._is_king_attacked(self.side)))   # 指した手が王手か
+            except Exception:
+                pass
 
     def push(self, move: str) -> None:
         """makebook 互換エイリアス。"""
@@ -45169,7 +45233,20 @@ class ShogiBoard:
         条件: (a) この手で千日手局面が成立し、かつ (b) この手が王手である。
         連続王手の千日手は王手し続けた側の負けなので、自分が王手側の場合に True。
         """
-        return self.gives_check(usi_move) and self.would_be_sennichite(usi_move)
+        if not (self.gives_check(usi_move) and self.would_be_sennichite(usi_move)):
+            return False
+        # [AUDIT-20261017] 旧: 「この手が王手 + 千日手成立」だけで True → 普通の千日手 (引分け) を
+        #   最後に王手で完成させる手まで連続王手扱いで拒否していた。反復区間の自分の手が全て
+        #   王手のときだけ連続王手 (_sprt_sennichite_verdict_core と同じ判定)。
+        try:
+            nb = self._after_usi(usi_move)
+            hist, flags = nb._history, getattr(nb, "_hist_check", None)
+            if flags is None or len(flags) != len(hist) - 1:
+                return True   # 王手履歴が無い盤 (旧挙動 = 安全側)
+            verdict, parity = _sprt_sennichite_verdict_core(hist, flags)
+            return verdict == "perpetual" and parity == (len(hist) - 2) % 2
+        except Exception:
+            return True
 
     def nyugyoku_score(self, side: str):
         """side 側の入玉点数と敵陣内自駒数 (玉除く) を返す。(points, pieces_in_zone)。"""

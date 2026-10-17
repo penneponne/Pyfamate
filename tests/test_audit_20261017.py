@@ -17,13 +17,13 @@ tree = ast.parse(SRC.read_text(encoding="utf-8-sig"))
 WANT = {"_mate_ply", "_mate_sign_score", "_parse_usi_line", "UsiLine", "_usi_is", "_dead_end_piece",
         "ShogiBoard", "_dl_conviction_mate_core", "MoveBudget", "_move_budget_left_s",
         "_drain_until_outstanding", "_u_align_ponder", "_arb_pv_list", "_arb_pv_after_move",
-        "_check_council_stale", "_clamp", "_clamp01"}
+        "_check_council_stale", "_clamp", "_clamp01", "_sprt_sennichite_verdict_core"}
 ASSIGN = {"_RE_MATE", "_MATE_CP", "_USI_TERMINATORS", "_RE_SETOPTION"}
 g = {}
 g.update(dataclasses=dataclasses, enum=enum, os=os, re=re, json=json, math=math, queue=queue, sys=sys,
          threading=threading, time=time, collections=collections, namedtuple=collections.namedtuple,
          _flog=lambda *a, **k: None, _dlog=lambda *a, **k: None, _move_overhead_s=0.1,
-         _move_overhead_ms=100)
+         _move_overhead_ms=100, _ZOBRIST_VERIFY=False)
 nodes = []
 _seg = ast.get_source_segment
 _src = SRC.read_text(encoding="utf-8-sig")
@@ -130,6 +130,14 @@ m = g["_RE_SETOPTION"].match("setoption name OppID_DL_Names value")
 check("setoption_empty_value_parses", m is not None and m.group(2) == "", m and m.groups())
 m = g["_RE_SETOPTION"].match("setoption name USI_Hash value 1024")
 check("setoption_value_parses", m.group(1) == "USI_Hash" and m.group(2) == "1024")
+
+# 9. perpetual check: all of our moves in the cycle were checks -> refuse; a cycle with one quiet move -> not perpetual.
+cyc = "2i1i 1a2a 1i2i 2a1a " * 3
+bp = SB(sfen="sfen 8k/9/9/9/9/9/9/9/4K2R1 b - 1 moves " + cyc.strip())
+check("perpetual_check_detected", bp.is_perpetual_check_move("2i1i") is True)
+bq = bp.clone()
+bq._hist_check[len(bq._hist_check) - 4] = False   # pretend one of our moves in the cycle was quiet
+check("plain_repetition_completed_by_check_not_perpetual", bq.is_perpetual_check_move("2i1i") is False)
 
 bad = [k for k, v in R.items() if not v]
 print("%d/%d PASS" % (len(R) - len(bad), len(R)))
