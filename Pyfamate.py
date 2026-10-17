@@ -44735,6 +44735,8 @@ class ShogiBoard:
                             continue  # と金は二歩にならない
                         if pc == ("P" if mover_is_sente else "p"):
                             return "nifu"
+                    if self._uchifuzume(usi_move):
+                        return "uchifuzume"   # [ZYFAMATE-PORT] 打ち歩詰め
                 # [FIX-CHECK-EVASION 2026-07-12] drop でも王手放置を検出する。
                 # 合駒 (王手ラインを遮る打ち) は apply_usi 後に王手解除されるため
                 # 正しく素通しし、解除しない打ちだけ "in_check" を返す。
@@ -44794,19 +44796,7 @@ class ShogiBoard:
             # [AUDIT-20261017] 旧: 現局面で王手されていなければ即 None。ピンされた駒を動かす /
             #   玉を利きへ動かす「自殺手」(王手でない局面からの非合法手) を素通ししていた
             #   (stale DL 手の採用 → #ILLEGAL_MOVE と同じ事故類型)。常に仮適用して確認する。
-            scratch = ShogiBoard.__new__(ShogiBoard)
-            scratch.board      = self.board.copy()
-            scratch.sente_hand = self.sente_hand.copy()
-            scratch.gote_hand  = self.gote_hand.copy()
-            scratch.side       = self.side
-            scratch._kpos      = list(self._kpos)
-            scratch._kzp_memo  = {}
-            scratch.ply        = self.ply
-            scratch._last_to   = self._last_to
-            scratch._history   = []
-            scratch._zhash     = 0
-            scratch._hist_counter = {}
-            scratch._track_history = False
+            scratch = self._light_clone()
             scratch.apply_usi(usi_move)
             # apply_usi は side を反転する。元の自玉 (self.side) が
             # まだ攻撃されているか確認する。
@@ -45241,6 +45231,14 @@ class ShogiBoard:
         """
         if usi_move in self._NON_BOARD_MOVES:
             return False
+        nb = self._light_clone()
+        nb.apply_usi(usi_move)
+        opponent_side = "w" if self.side == "b" else "b"
+        return nb._is_king_attacked(opponent_side)
+
+    def _light_clone(self) -> "ShogiBoard":
+        """[DEDUP-20261017] 履歴なしの軽量複製 (盤・持駒・手番・玉位置のみ)。gives_check /
+        _check_evasion_reason / _uchifuzume が同じ 14 行の複製コードを各自持っていた。"""
         nb = ShogiBoard.__new__(ShogiBoard)
         nb.board      = self.board.copy()
         nb.sente_hand = self.sente_hand.copy()
@@ -45254,9 +45252,54 @@ class ShogiBoard:
         nb._zhash     = 0
         nb._hist_counter = {}
         nb._track_history = False
+        return nb
+
+    def _uchifuzume(self, usi_move: str) -> bool:
+        """[ZYFAMATE-PORT 2026-10-17] 歩打ち usi_move が打ち歩詰め (反則) か。
+        Zyfamate (gen_checks / is_mated) と同じ定義: 歩打ちで王手 かつ 受け方に合法な応手が無い。
+        歩の王手は接触王手 1 枚なので応手は「玉が逃げる (歩を取るを含む)」か「玉以外で歩を取る」だけ
+        (合駒は無い)。利きは検証済みの _attacks_square、自玉の安全は _is_king_attacked で見る。"""
+        if not usi_move.startswith("P*"):
+            return False
+        nb = self._light_clone()
         nb.apply_usi(usi_move)
-        opponent_side = "w" if self.side == "b" else "b"
-        return nb._is_king_attacked(opponent_side)
+        dfd = "w" if self.side == "b" else "b"
+        if not nb._is_king_attacked(dfd):
+            return False
+        kp = nb._king_pos(dfd)
+        if kp is None:
+            return False
+        pc_col, pc_row = self._to_rc(usi_move[2:4])
+
+        def _sq(c, r):
+            return "%d%s" % (c, chr(ord("a") + r - 1))
+
+        def _owner_is_dfd(pc):
+            return pc[-1].isupper() == (dfd == "b")
+
+        def _escapes(mv):
+            t = nb._light_clone()
+            t.apply_usi(mv)
+            return not t._is_king_attacked(dfd)
+        kc, kr = kp
+        for dc in (-1, 0, 1):
+            for dr in (-1, 0, 1):
+                if dc == 0 and dr == 0:
+                    continue
+                c, r = kc + dc, kr + dr
+                if not (1 <= c <= 9 and 1 <= r <= 9):
+                    continue
+                occ = nb.board.get((c, r))
+                if occ and _owner_is_dfd(occ):
+                    continue
+                if _escapes(_sq(kc, kr) + _sq(c, r)):
+                    return False
+        for (c, r), pc in list(nb.board.items()):
+            if not _owner_is_dfd(pc) or pc.lstrip("+").upper() == "K":
+                continue
+            if nb._attacks_square(c, r, pc, pc_col, pc_row) and _escapes(_sq(c, r) + _sq(pc_col, pc_row)):
+                return False
+        return True
 
     def would_be_sennichite(self, usi_move: str) -> bool:
         """現手番が usi_move を指した結果、その局面が千日手 (4回目) になるか。
