@@ -23136,6 +23136,7 @@ class _USS:
     pv_mate_step: object = None      # 証明が立った PV 上の手数オフセット (2k)
     pv_mate_source: object = None    # "dl_pv" / "nnue_pv"
     pv_mate_override: bool = False
+    pv_mate_checked: bool = False    # [ROLES-20261017] PV-MATE が df-pn 検問を 1 回以上実行したか
     extra_stats: dict = dataclasses.field(default_factory=dict)  # _live_dl1_policy 等
 
 def _ucfg_int(key, default):
@@ -24274,8 +24275,13 @@ def _u_override(st):
     if v.name == "council":
         _u_council_overrides(st)
         _v_guarded = st.verdict
-        _u_override_conviction_mate(st)
     _u_override_pv_mate(st)   # [PV-MATE v2] DL_1 PV 上の df-pn 詰み検問
+    # [ROLES-20261017] conviction-mate (DL の「詰みあり」申告だけで DL 手を強制) と PV-MATE (DL PV 上を
+    #   df-pn で証明) は同じ役割 (DL が見た詰みを採る) の弱い版/強い版。旧: 申告版が先に走り、証明版の
+    #   結果に関係なく DL 手を採っていた。証明が実際に走ったら (証明成立でも不成立でも) 申告版は使わない
+    #   — 証明 > 申告。証明が走れない局面 (solver 無効・GP/予算ゲート外) だけ申告版で補う。
+    if v.name == "council" and not st.pv_mate_checked:
+        _u_override_conviction_mate(st)
     # [AUDIT-20261017] conviction-mate / PV-MATE は頓死ガードの後に手を差し替える。どちらも
     #   「相手が PV どおり応じれば」の条件付きで、差し替え先は頓死検査を受けていなかった。
     if v.name == "council" and st.verdict != _v_guarded:
@@ -24354,6 +24360,7 @@ def _u_override_pv_mate(st):
                     return   # 予算枯渇
                 _pos = _position_after_moves(ctx.current_position, _pv[:_n])
                 _go = _mate_go_cmd(ctx, int(min(_jt, cfg.pv_mate_join_timeout_s) * 1000))
+                st.pv_mate_checked = True
                 _res, _bm = _run_single_pv_mate_check(
                     ctx, _pos, _go, st.eff_s, _jt, f"pv-mate-dl1-{_n}")
                 if _res != "mate":
@@ -45286,6 +45293,24 @@ class ShogiBoard:
         """
         return self.repetition_count_after(usi_move) >= min_count
 
+    def perpetual_checker(self, unknown=None):
+        """[DEDUP-20261017] 現局面で千日手が成立しているとき、連続王手側 ("b"/"w") を返す。そうでなければ None。
+        判定 = 最終局面の初出から現在までの区間で、一方の手が全て王手 (_sprt_sennichite_verdict_core)。
+        王手履歴 (_hist_check) が履歴と揃っていない盤では unknown を返す。
+        is_perpetual_check_move / makebook (_mb_perpetual_checker) が共有する唯一の実装。"""
+        hist, flags = self._history, getattr(self, "_hist_check", None)
+        if flags is None or len(flags) != len(hist) - 1 or len(hist) < 2:
+            return unknown
+        if not self.is_sennichite():
+            return None
+        verdict, parity = _sprt_sennichite_verdict_core(hist, flags)
+        if verdict != "perpetual":
+            return None
+        n_moves = len(hist) - 1
+        start_side = self.side if n_moves % 2 == 0 else ("w" if self.side == "b" else "b")
+        first_mover = start_side
+        return first_mover if parity == 0 else ("w" if first_mover == "b" else "b")
+
     def is_perpetual_check_move(self, usi_move: str) -> bool:
         """usi_move が「連続王手の千日手」を成立させる手か。
 
@@ -45294,18 +45319,15 @@ class ShogiBoard:
         """
         if not (self.gives_check(usi_move) and self.would_be_sennichite(usi_move)):
             return False
-        # [AUDIT-20261017] 旧: 「この手が王手 + 千日手成立」だけで True → 普通の千日手 (引分け) を
-        #   最後に王手で完成させる手まで連続王手扱いで拒否していた。反復区間の自分の手が全て
-        #   王手のときだけ連続王手 (_sprt_sennichite_verdict_core と同じ判定)。
         try:
-            nb = self._after_usi(usi_move)
-            hist, flags = nb._history, getattr(nb, "_hist_check", None)
-            if flags is None or len(flags) != len(hist) - 1:
-                return True   # 王手履歴が無い盤 (旧挙動 = 安全側)
-            verdict, parity = _sprt_sennichite_verdict_core(hist, flags)
-            return verdict == "perpetual" and parity == (len(hist) - 2) % 2
+            _pc = self._after_usi(usi_move).perpetual_checker(unknown="?")
+            if _pc != "?":
+                return _pc == self.side
         except Exception:
-            return True
+            pass
+        # [AUDIT-20261017] 旧: 「この手が王手 + 千日手成立」だけで True (普通の千日手を王手で完成させる手も
+        #   拒否)。反復区間の自分の手が全て王手のときだけ連続王手。王手履歴が無い盤は旧挙動 (安全側)。
+        return True
 
     def nyugyoku_score(self, side: str):
         """side 側の入玉点数と敵陣内自駒数 (玉除く) を返す。(points, pieces_in_zone)。"""
@@ -51513,24 +51535,17 @@ _MB_REJECTED_KNOBS = {
 
 
 def _mb_perpetual_checker(tempkif):
-    """[2026-10-16] 千日手が連続王手か。直近の同一局面2回の間（1周期）で、片側の手がすべて王手なら
-    その側（"b"/"w"）を返す（連続王手の千日手は王手した側の負け）。そうでなければ None。"""
+    """[2026-10-16] 千日手が連続王手か。連続王手の千日手は王手した側の負け → その側 ("b"/"w")、
+    そうでなければ None。[DEDUP-20261017] 判定は ShogiBoard.perpetual_checker に一本化 (旧: 独自実装で
+    「直近 1 周期」だけを見ており、規定 (同一局面の初出から 4 回目までの間、一方の手が全て王手) より
+    緩く、普通の千日手を王手側の負けとして book に記録し得た)。"""
     try:
         b = ShogiBoard(); b.set(tempkif[0])
-        keys = [b.sfen_key()]; movers = []; checks = []
         for m in tempkif[1:]:
             if m in ("resign", "win", "", "rep_draw"):
                 break
-            movers.append(b.side if getattr(b, "side", None) in ("b", "w") else ("b" if b.turn() == -1 else "w")); checks.append(bool(b.gives_check(m)))
-            b.push(m); keys.append(b.sfen_key())
-        last = keys[-1]; idx = [i for i, k in enumerate(keys) if k == last]
-        if len(idx) < 2:
-            return None
-        lo, hi = idx[-2], idx[-1]          # moves lo .. hi-1 make one cycle
-        for side in ("b", "w"):
-            mine = [checks[j] for j in range(lo, hi) if movers[j] == side]
-            if mine and all(mine):
-                return side
+            b.push(m)
+        return b.perpetual_checker()
     except Exception as _e:
         _flog(f"[makebook] perpetual check test failed: {_e!r}")
     return None

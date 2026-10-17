@@ -17,7 +17,7 @@ tree = ast.parse(SRC.read_text(encoding="utf-8-sig"))
 WANT = {"_mate_ply", "_mate_sign_score", "_parse_usi_line", "UsiLine", "_usi_is", "_dead_end_piece",
         "ShogiBoard", "_dl_conviction_mate_core", "MoveBudget", "_move_budget_left_s",
         "_drain_until_outstanding", "_u_align_ponder", "_arb_pv_list", "_arb_pv_after_move",
-        "_check_council_stale", "_clamp", "_clamp01", "_sprt_sennichite_verdict_core", "_DlInfoAcc", "_mb_parse_num", "_makebook_load_blunder_seeds", "_makebook_load_seed_jsonl"}
+        "_check_council_stale", "_clamp", "_clamp01", "_sprt_sennichite_verdict_core", "_DlInfoAcc", "_mb_parse_num", "_makebook_load_blunder_seeds", "_makebook_load_seed_jsonl", "_mb_perpetual_checker"}
 ASSIGN = {"_RE_MATE", "_MATE_CP", "_USI_TERMINATORS", "_RE_SETOPTION"}
 g = {}
 g.update(dataclasses=dataclasses, enum=enum, os=os, re=re, json=json, math=math, queue=queue, sys=sys,
@@ -147,6 +147,11 @@ for ln in ("info depth 5 multipv 1 score cp 120 pv 7g7f 3c3d", "info depth 9 mul
 check("dl_acc_scores", acc.moves_scores == {"7g7f": 80, "2g2f": g["_MATE_CP"]}, acc.moves_scores)
 check("dl_acc_deepest_pv", acc.pv_lines["7g7f"] == ["7g7f", "8c8d"] and acc.depth_best["7g7f"] == 9)
 check("mb_parse_num", g["_mb_parse_num"]("x", 5) == 5 and g["_mb_parse_num"](" 2.5 ", 0, to_int=False, hi=2.0) == 2.0)
+
+# 11. one perpetual-check rule: makebook uses the board's (first occurrence -> now, all checks).
+kif = ["sfen 8k/9/9/9/9/9/9/9/4K2R1 b - 1"] + (cyc.strip() + " 2i1i").split()
+check("makebook_perpetual_checker_sente", g["_mb_perpetual_checker"](kif) == "b")
+check("makebook_no_repetition_none", g["_mb_perpetual_checker"](kif[:5]) is None)
 
 bad = [k for k, v in R.items() if not v]
 print("%d/%d PASS" % (len(R) - len(bad), len(R)))
