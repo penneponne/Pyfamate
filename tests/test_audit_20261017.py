@@ -17,7 +17,7 @@ tree = ast.parse(SRC.read_text(encoding="utf-8-sig"))
 WANT = {"_mate_ply", "_mate_sign_score", "_parse_usi_line", "UsiLine", "_usi_is", "_dead_end_piece",
         "ShogiBoard", "_dl_conviction_mate_core", "MoveBudget", "_move_budget_left_s",
         "_drain_until_outstanding", "_u_align_ponder", "_arb_pv_list", "_arb_pv_after_move",
-        "_check_council_stale", "_clamp", "_clamp01", "_sprt_sennichite_verdict_core"}
+        "_check_council_stale", "_clamp", "_clamp01", "_sprt_sennichite_verdict_core", "_DlInfoAcc", "_mb_parse_num", "_makebook_load_blunder_seeds", "_makebook_load_seed_jsonl"}
 ASSIGN = {"_RE_MATE", "_MATE_CP", "_USI_TERMINATORS", "_RE_SETOPTION"}
 g = {}
 g.update(dataclasses=dataclasses, enum=enum, os=os, re=re, json=json, math=math, queue=queue, sys=sys,
@@ -138,6 +138,15 @@ check("perpetual_check_detected", bp.is_perpetual_check_move("2i1i") is True)
 bq = bp.clone()
 bq._hist_check[len(bq._hist_check) - 4] = False   # pretend one of our moves in the cycle was quiet
 check("plain_repetition_completed_by_check_not_perpetual", bq.is_perpetual_check_move("2i1i") is False)
+
+# 10. dedup helpers keep behaviour.
+acc = g["_DlInfoAcc"]()
+for ln in ("info depth 5 multipv 1 score cp 120 pv 7g7f 3c3d", "info depth 9 multipv 1 score cp 80 pv 7g7f 8c8d",
+           "info depth 9 multipv 2 score mate + pv 2g2f", "info depth 3 score cp 10"):
+    acc.add(P(ln))
+check("dl_acc_scores", acc.moves_scores == {"7g7f": 80, "2g2f": g["_MATE_CP"]}, acc.moves_scores)
+check("dl_acc_deepest_pv", acc.pv_lines["7g7f"] == ["7g7f", "8c8d"] and acc.depth_best["7g7f"] == 9)
+check("mb_parse_num", g["_mb_parse_num"]("x", 5) == 5 and g["_mb_parse_num"](" 2.5 ", 0, to_int=False, hi=2.0) == 2.0)
 
 bad = [k for k, v in R.items() if not v]
 print("%d/%d PASS" % (len(R) - len(bad), len(R)))
