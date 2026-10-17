@@ -3519,6 +3519,45 @@ sys.stdout = _force_utf8_stream(sys.stdout, "w", "backslashreplace")
 sys.stderr = _force_utf8_stream(sys.stderr, "w", "backslashreplace")
 sys.stdin  = _force_utf8_stream(sys.stdin,  "r", "replace")
 
+
+class _LineAtomicStdout:
+    """[AUDIT-20261017] stdout を行単位で原子的に書く薄いラッパ。
+
+    print() は本文と改行を別 write で出すため、複数スレッド (infinite relay / go-mate
+    forward / main thread の info string 等) が同時に print すると GUI へ届く USI 行が
+    混ざり得た (`info ... bestmove 7g7f` のような壊れ行)。スレッドごとに改行まで溜め、
+    完成した行だけを lock 下で書く。flush() は未完の行も書き出す (ライブ盤の部分描画)。"""
+
+    def __init__(self, inner):
+        self._inner = inner
+        self._lock = threading.Lock()
+        self._tls = threading.local()
+
+    def write(self, s):
+        buf = getattr(self._tls, "buf", "") + s
+        if "\n" not in buf:
+            self._tls.buf = buf
+            return len(s)
+        head, _, tail = buf.rpartition("\n")
+        self._tls.buf = tail
+        with self._lock:
+            self._inner.write(head + "\n")
+        return len(s)
+
+    def flush(self):
+        buf = getattr(self._tls, "buf", "")
+        with self._lock:
+            if buf:
+                self._tls.buf = ""
+                self._inner.write(buf)
+            self._inner.flush()
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+
+sys.stdout = _LineAtomicStdout(sys.stdout)
+
 # [文字化け根治] コンソールのコードページ UTF-8 化 + ANSI 有効化を *import 時に無条件* で
 # 行う。旧実装は _LiveConsole._ready() の isatty ゲート内 (初回ライブ盤描画時) でしか呼ばず、
 # それ以前の起動バナー/USI ハンドシェイク/init ログが cp932 のまま化けていた。
@@ -24250,10 +24289,19 @@ def _u_override(st):
         if _m:
             st.verdict = _m
             return
+    _v_guarded = None
     if v.name == "council":
         _u_council_overrides(st)
+        _v_guarded = st.verdict
         _u_override_conviction_mate(st)
     _u_override_pv_mate(st)   # [PV-MATE v2] DL_1 PV 上の df-pn 詰み検問
+    # [AUDIT-20261017] conviction-mate / PV-MATE は頓死ガードの後に手を差し替える。どちらも
+    #   「相手が PV どおり応じれば」の条件付きで、差し替え先は頓死検査を受けていなかった。
+    if v.name == "council" and st.verdict != _v_guarded:
+        try:
+            _u_council_tonshi_guard(st)
+        except Exception as _e:
+            _flog(f"[unify:council] tonshi-guard (post-override): {_e!r}")
     # [PHASE2 Step 0] Arbiter 必須化 = ARB / endgame veto は廃止 (GP 連動 τ が代替)。
     #   mate solver / PV-MATE は維持 (証明 > 裁定)。endgame veto 本体は Step 4 で削除。
 
@@ -27601,7 +27649,8 @@ def _stop_dl_ponders(ctx, reason="", eff_s=None):
     for _ek, _eng in (("dl_1", ctx.dl_1),):
         if _ek in ctx.ps.pending_bestmove:
             _ps_debt_clear(ctx, _ek, f"stop-dl-ponders/{reason}")
-            if _eng_alive(_eng):
+            # [AUDIT-20261017] 未応答 go が無い (bestmove を別の読み手が既に消費) なら待たない。
+            if _eng_alive(_eng) and getattr(_eng, "_go_sent", 1) - getattr(_eng, "_bm_seen", 0) > 0:
                 _to_drain.append(_eng)
     _incomplete = _parallel_stop_drain(
         _to_drain, _drain_s, _drain_s + 0.5,
@@ -29926,6 +29975,24 @@ def _ponderhit_try_collect_sp_early(ctx, position_cmd, eff_s, caller):
     if _sp_track_board is not None:
         _own_legal = _bestmove_is_for_board(_sp_bm, _sp_track_board)
         _sp_board_attr = "own" if _own_legal else "none"
+    # [AUDIT-20261017] 駒打ちは USI 文字列に手番が無く、盤上の移動元で帰属を判別できない。
+    #   SP 早期 bestmove (= 予測手を指す前の局面の相手の解) が駒打ちで、自分も同じ駒を持ち
+    #   打ち先が空なら「自分の合法手」として通ってしまう。予測手適用前の局面でも相手の合法手
+    #   なら帰属不明として採らない (下流の正規 ponderhit relay が現局面から取り直す)。
+    if "*" in str(_sp_bm or "") and _sp_track_board is not None:
+        try:
+            _pt = str(position_cmd).split()
+            if "moves" in _pt and len(_pt) > _pt.index("moves") + 1:
+                _pre = ShogiBoard(sfen=" ".join(_pt[:-1]), track_history=False)
+                if _bestmove_is_for_board(_sp_bm, _pre):
+                    _flog(f"[{caller}/SP-echo] early drop {_sp_bm!r} is also legal for the "
+                          "opponent before the predicted move — ambiguous, rejecting")
+                    _spd = ctx.game_progress.sp_move_diag
+                    if _spd is not None:
+                        _spd["sp_echo_rejected"] = _spd.get("sp_echo_rejected", 0) + 1
+                    return None
+        except Exception as _de:
+            _flog(f"[{caller}/SP-echo] drop attribution check failed: {_de!r}")
     if _sp_track_board is not None and not _bestmove_is_for_board(_sp_bm, _sp_track_board):
         _flog(f"[{caller}/SP-echo] collected early bestmove {_sp_bm!r} is not a "
               "move for the current board — rejecting, fall through to ponderhit relay")
@@ -30081,6 +30148,10 @@ def _harvest_one_dl_ponder(eng, n, timeout_s, label, *, cfg=None):
     #   (stop は呼び出し側が送信済み)。
     _t_h0 = time.perf_counter()
     if not _drain_until_outstanding(eng, 1, timeout_s * 0.5, f"harvest/{label}", send_stop=False):
+        return None
+    if eng._go_sent - eng._bm_seen <= 0:
+        # ponder の bestmove は既に別の読み手 (emergency fetch 等) が消費済み — 待っても来ない。
+        _dlog(f"[DL-HARVEST/{label}] 未応答 go なし — 収穫対象なし")
         return None
     timeout_s = max(0.01, timeout_s - (time.perf_counter() - _t_h0))
     for line in eng.iter_until("bestmove", timeout=timeout_s):  # [PATCH-ITER-UNTIL 2026-07-07]
@@ -30815,11 +30886,20 @@ def _handle_stop(ctx, line):
                       "emit せず直後の本 go に委ねる (resign にはしない)")
         _ps_debt_clear(ctx, "nnue_1", "stop-ponder-miss")   # relay で bestmove 消費済み
         _ps_transition(ctx, PsPhase.IDLE, "stop-ponder-miss")
-        # [DL-Ponder] go ponder 中の全DLへ stop を送りフラグ消費 (旧実装は
-        # フラグのみクリアし dl_2/dl_3 に stop が届かず、自分番中も ponder 探索が
-        # 走り続けて council fetch と GPU を奪い合っていた)。bestmove 残骸は
-        # 後続 council fetch の flush (_prefetch_flush / flush_with_stop) が破棄。
-        _stop_dl_ponders(ctx, "stop-ponder-miss")
+        # [DL-Ponder] go ponder 中の DL へ stop を送る (自分番に GPU を奪い合わない)。
+        # [AUDIT-20261017] 旧: ここで _stop_dl_ponders が drain して債務を消し、ShogiHome 系の
+        #   stop→position→go (予測命中でも ponderhit を送らない) では go 経路の F06-HARVEST が
+        #   毎手空振り = 当たった DL ponder 木を毎回捨てていた。stop だけ送り、債務と
+        #   dl_ponder_pos は残す: 次の go の _harvest_dl_ponders が局面一致なら収穫、不一致なら
+        #   破棄 (残骸は _drain_until_outstanding が個数で処理)。gameover / go ponder /
+        #   usinewgame は従来どおり _stop_dl_ponders / dispatch が drain する。
+        if "dl_1" in ctx.ps.pending_bestmove and _eng_alive(ctx.dl_1):
+            try:
+                ctx.dl_1.send("stop")
+            except Exception as _se:
+                _flog(f"[ignored] stop-ponder-miss dl_1 stop: {_se!r}")
+        else:
+            _stop_dl_ponders(ctx, "stop-ponder-miss")
 
     elif ctx.ps.phase is PsPhase.MATE_SKIP:
         # go ponder ハンドラで nnue_1/nnue_2 に何も送っていないため、
