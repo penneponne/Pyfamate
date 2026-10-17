@@ -200,8 +200,6 @@ GoTimeDynamics = namedtuple("GoTimeDynamics", [
     "dl_time_fallback_ms"])  # [Step 4D] dl_3_rescue/empty_eff_s_min 撤去
 
 _PerMoveThresholds = namedtuple("_PerMoveThresholds", ["gap_min", "stab", "slow_mover"])
-_COUNCIL_WEIGHT_FLOOR = 0.30
-
 _dl1_mb_for_stab = 115.0
 
 
@@ -1307,20 +1305,6 @@ def _sv_leaf_winrate(sb):
         return None
 
 
-def _model_wr_for_position(position_cmd):
-    """[MODEL-3RD] position コマンド → ビジョンモデル勝率 (手番側視点) or None。
-    モデル未ロード/CUDA 不可/失敗時は None (呼出側は第3意見なしで続行)。"""
-    try:
-        b = _board_for_position(position_cmd)
-        r = _sv_infer_get().infer_board(b)
-        if not r:
-            return None
-        v = r["value"]   # 先手視点
-        return v if getattr(b, "side", "b") == "b" else 1.0 - v
-    except Exception:
-        return None
-
-
 _GP_XCHK_LAST = [0.0]
 
 
@@ -1758,12 +1742,6 @@ def _sr_linger_split(hold_rec, hold_pos, hold_policy, cur_side=None):
     # NNUE / DL₁ / Arbiter で、Arbiter は現局面依存の presence-gate のため残留させない。
     head.extend(_sr_pred_ease_lines(_rec, b, hold_policy, _ja, multi_engine=True))
     return head, _sr_multipv_lines(hold_policy, _ja)
-
-
-def _sr_linger_lines(hold_rec, hold_pos, hold_policy):
-    """旧 API 互換: head+mpv を連結して返す。"""
-    _h, _m = _sr_linger_split(hold_rec, hold_pos, hold_policy)
-    return _h + _m
 
 
 # [Step 7B 2026-07-17] _sr_render_endgame 撤去 (endgame lane 全廃、DL_3 prefetch 経路
@@ -5027,8 +5005,6 @@ else:
 
 # ====================== §3d エンジンパス / プール定数 / cfg キー定数 ======================
 
-_DL_ENGINE_BASENAME  = "engine.bat" if sys.platform == "win32" else "engine"
-
 # [TRT-LD 2026-07-11] pip install tensorrt で入る .so を DL 子エンジンが見つけられるよう
 # LD_LIBRARY_PATH へ追加。Windows では不要 (DLL は PATH / 同一ディレクトリで解決)。
 if sys.platform != "win32":
@@ -5140,9 +5116,6 @@ def _dl_slot_allowed_indices(slot: str, all_indices) -> list:
 
 _MATE_SCORE_CP = 29000
 _MATE_CP = 30000
-_SCORE_CLAMP_CP = 3000
-_WINRATE_EPSILON = 1e-6
-
 _REGIME_CRUISE = "cruise"
 _REGIME_ALERT  = "alert"
 _REGIME_CRISIS = "crisis"
@@ -14890,79 +14863,6 @@ def _book_consult(ctx, position_cmd: str):
     return (None, "")
 
 
-def _book2_fire(ctx) -> None:
-    """第2 Book エンジンを起動・初期化する (v6.0)。
-
-    メイン Book が定跡切れを検出した瞬間に呼ばれる。メインが Book_Consec で
-    落ちるまで二重起動になるが、落ちた後は第2が主定跡として継続する。
-    起動は Book2_Pool_Index のプールを引く。失敗時は静かに無効化し通常探索へ。
-    """
-    if _eng_alive(ctx.book2):
-        return  # 既に Fire 済み
-    # [BOOK2-OFF 2026-07-11] マスタトグル: cfg.book2_enable=false で Fire を止める。
-    if not ctx.cfg.book2_enable:
-        return
-    _idx = ctx.cfg.book2_pool_index
-    _bf = _book_resolve_file(_idx)
-    if not _bf:
-        _flog(f"[bookloader2] Book2_Pool_Index={_idx} の BookFile 未解決 — 第2 Book 起動中止。")
-        return
-    _b2_kind = "sbk" if _book_file_is_sbk(_bf) else "db"
-    _flog(f"[bookloader2] 定跡切れ検出 (main consec={ctx.book_state.consec}) — "
-          f"第2 Book ({_b2_kind}) を Fire します pool={_idx} book_file={_bf!r}")
-    try:
-        ctx.book2 = _NullBookEngine()
-        st = ctx.book2_state
-        st.active = True
-        st.consec = 0
-        st.turn = ctx.book_state.turn
-        _ok = _book_apply_file(ctx, "book2", _idx, _bf, send_isready=False)
-        st.initialized = _ok
-        if not _ok:
-            _flog(f"[bookloader2] 第2 Book ({_b2_kind}) apply 失敗 pool={_idx} "
-                  f"book_file={_bf!r} — 初期化未完了扱い。")
-        else:
-            _flog(f"[bookloader2] 第2 Book ({_b2_kind}) 起動成功 pool={_idx} book_file={_bf!r} "
-                  f"label={st.label!r} trust={st.trust!r}")
-    except Exception as e:
-        _flog(f"[bookloader2] {_b2_kind} 起動例外 — 第2 Book 無効化: {e}")
-        ctx.book2 = None
-        ctx.book2_state.active = False
-
-
-def _book2_fire_async(ctx) -> None:
-    """[BOOK2-ASYNC] 第2 Book を *別スレッドで* 起動する。
-
-    定跡切れ初手で council を回している裏で第2 Book を立ち上げるための非同期版。
-    _book2_fire (同期: start→initialize→readyok 待ち最大 60s) をワーカースレッドで
-    実行し、メイン (council 探索) をブロックしない。起動が同一手の council 投票
-    締め切りまでに間に合えば、_run_council_search 側が probe して advisory seed を
-    その手の votes に「遅れて」合流させる。間に合わなければ seed 無しで council 結果。
-
-    二重起動防止: firing フラグが立っている / 既に alive の間は再 fire しない。
-    """
-    # [BOOK2-OFF 2026-07-11] マスタトグル: async fire も止める。
-    if not ctx.cfg.book2_enable:
-        return
-    st = ctx.book2_state
-    if st.firing:
-        return  # 起動スレッドが既に走っている
-    if _eng_alive(ctx.book2):
-        return  # 既に起動済み
-    st.firing = True
-
-    def _run():
-        try:
-            _book2_fire(ctx)
-        except Exception as _e:
-            _flog(f"[bookloader2] async fire 例外 (無視): {_e}")
-        finally:
-            ctx.book2_state.firing = False
-
-    _spawn('book2-async-fire', _run)
-    _flog("[bookloader2] 非同期 fire 開始 — council を回す裏で第2 Book を起動")
-
-
 def _book2_start_resident(ctx) -> None:
     """[Book2 v7.0 常駐] 第2 Book を常駐フォールバックとして起動する。
 
@@ -15008,29 +14908,6 @@ def _book2_start_resident(ctx) -> None:
         _flog(f"[bookloader2] 常駐起動例外: {e}")
         ctx.book2 = None
         ctx.book2_state.active = False
-
-
-def _book2_probe_seed_if_ready(ctx, position_cmd: str):
-    """[BOOK2-ASYNC] 第2 Book が起動済みなら *純 probe* して advisory seed を返す。
-
-    council 投票の締め切り直前に呼ばれる同一手合流用。第2 Book が initialized
-    (非同期 fire が同一手の council 探索中に間に合った) なら _book_probe で 1 手
-    引く。重要: これは consec を進めず kill もしない (_book_try_move ではなく
-    _book_probe を直接使う)。理由は、第2 Book は _book_consult で既にこの手の
-    probe を済ませている場合があり、ここで _book_try_move を再度呼ぶと同一手で
-    consec が二重に進み consec_max=1 で即 kill → exhausted 誤発火するため。
-    合流 probe は「間に合ったら拾う」だけの非破壊操作に徹する。
-
-    Returns: (move, trust) | (None, "")
-    """
-    st = ctx.book2_state
-    if not (_eng_alive(ctx.book2)
-            and st.active and st.initialized):
-        return (None, "")
-    hit, move = _book_probe(ctx, position_cmd, eng=ctx.book2, st=st)
-    if hit and move not in (None, ""):
-        return (move, st.trust)
-    return (None, "")
 
 
 def _book2_kill(ctx, reason: str = "") -> None:
@@ -15965,35 +15842,6 @@ def _calc_dl_model_aware_stability_threshold(eff_s: float, model_mb: float = Non
     return int(round(min(adjusted, 1500.0)))
 
 
-def _calc_weight_floor_gp(game_phase, floor_early, floor_late):
-    """[IMP-2] GP 連動 weight floor。game_phase ∈ [0,1] で線形補間。
-
-    序盤 (GP≈0) は floor_early、終盤 (GP≈1) は floor_late。
-    GP > 1.0 (入玉域) は 1.0 へクランプして floor_late を返す。
-    """
-    gp = _clamp01(game_phase if game_phase is not None else 0.0)
-    return floor_early + (floor_late - floor_early) * gp
-
-
-def _apply_weight_floor(raw_weight, floor=None, game_phase=None, cfg=None):
-    """Minimum effective weight for DL votes.
-
-    [IMP-2] cfg が渡された場合は GP 連動 floor を使用する。
-    floor が明示的に渡された場合はそちらを優先 (後方互換)。
-    """
-    if floor is None:
-        if cfg is not None and game_phase is not None:
-            floor = _calc_weight_floor_gp(
-                game_phase,
-                cfg.council_weight_floor_early,
-                cfg.council_weight_floor_late)
-        else:
-            floor = _COUNCIL_WEIGHT_FLOOR
-    if raw_weight <= 0:
-        return 0.0
-    return max(floor, raw_weight)
-
-
 # [PNDR] go / ponderhit 行に現れる時計フィールド。やねうら王の非標準 ponderhit は
 # これらを ponderhit に付与できる (ShogiHome の早期 Ponder が使う拡張)。
 _PONDER_CLOCK_KEYS = ("btime", "wtime", "binc", "winc", "byoyomi", "movetime")
@@ -16624,45 +16472,6 @@ def _calc_game_phase_features(position_cmd: str) -> tuple:
 # (旧 _council_vote 消費で Step 6A 連座 orphan 化)。
 
 
-def _calc_dl_pv_overlap_boost(pv_overlap, cfg):
-    """
-    Return a weight multiplier in [1.0, Max_Boost] based on dl_pv_overlap.
-
-    dl_pv_overlap counts how many of the top-3 DL moves share the same
-    PV[1] (immediate response) as the DL top move (range 0..2).  When all
-    three agree on the *opponent*'s best reply they are effectively
-    endorsing the same strategic direction — a signal of DL confidence
-    that depth alone cannot capture.
-
-    Formula (linear interpolation):
-        boost = lerp(1.0, Max_Boost, overlap / 2)
-
-    Default (Max_Boost=1.10):
-        overlap=None → 1.00  (no data — safe neutral)
-        overlap=0    → 1.00  (no agreement)
-        overlap=1    → 1.05  (partial agreement)
-        overlap=2    → 1.10  (full agreement — Max_Boost)
-
-    Combined with depth_trust:
-        effective_w_dl1 = phase_weight × depth_trust × overlap_boost
-
-    Edge cases:
-      - pv_overlap is None (cache hit, gap_skip path, POLICY_NODES too
-        small for MultiPV): returns 1.0.  Missing data is never penalised.
-      - Max_Boost == 1.0: boost is always 1.0; feature effectively off.
-
-    Parameters
-    ----------
-    cfg : EngineConfig（必須）
-    """
-    if pv_overlap is None:
-        return 1.0
-    _max_boost = cfg.dl1_pv_overlap_max_boost
-    # overlap は 0..2; 範囲外クランプで防御
-    t = _clamp01(pv_overlap / 2.0)
-    return 1.0 + (_max_boost - 1.0) * t
-
-
 def _check_council_stale(ctx, dl_top_move):
     """ Council stale-move sanity check.
 
@@ -16800,9 +16609,6 @@ _REGIME_EMA_ALPHA               = 0.20
 _REGIME_CRUISE_THRESHOLD        = 0.65
 _REGIME_CRISIS_THRESHOLD        = 0.35
 _REGIME_COLLAPSE_THRESHOLD      = 0.15
-_REGIME_CRUISE_EFF_S_SCALE      = 0.85
-_REGIME_CRUISE_CS_DEPTH_SCALE   = 0.70
-_REGIME_CRISIS_EFF_S_BOOST      = 1.25
 _REGIME_ALERT_TONSHI_KP_REDUCE  = 1
 _REGIME_CRISIS_TONSHI_KP_REDUCE = 2
 _REGIME_CONVICTION_RAW_W_CONF    = 0.55
@@ -17939,36 +17745,6 @@ def _lc_dispatch_core(is_infinite, dl1_alive,
 
 
 
-def _lc_fallback_move_core(nnue_top_vote, seed_move, seed_weight):
-    """[B/C/D 準備 core#6d] DL_3 不参加時の Light Council 縮退採択の純粋 core。
-
-    DL_3 票が得られないとき nnue 単独へ縮退するが、定跡 seed があれば本来の
-    _council_vote と同じ算術 (seed_weight vs nnue=1.0) の 2 者重み比較で
-    決める。global 非参照。
-
-    Returns: (final_move, w_nnue, reason)
-      w_nnue : 比較に使った nnue 重み (1.0 / 0.0)。seed 比較が行われなかった
-               とき None (ログ用)。
-      reason : "seed"       seed 採用 (seed_weight > w_nnue)
-               "nnue"       seed はあるが nnue 採用 (seed_weight <= w_nnue)
-               "endgame"  seed なし・nnue 票あり
-               "resign"     seed なし・nnue 票もなし
-      不変条件:
-        ・reason=="seed" ⇔ final_move==seed_move (seed 採択時のみ)。
-        ・reason=="resign" ⇔ final_move=="resign" かつ seed 比較なし。
-        ・reason はログ分岐の単一の真実源。
-    """
-    final_move = nnue_top_vote or "resign"
-    if (seed_move is not None
-            and seed_weight > 0.0
-            and seed_move != "resign"):
-        w_nnue = 1.0 if (nnue_top_vote and nnue_top_vote != "resign") else 0.0
-        if seed_weight > w_nnue:
-            return seed_move, w_nnue, "seed"
-        return final_move, w_nnue, "nnue"
-    return final_move, None, ("endgame" if nnue_top_vote else "resign")
-
-
 def _lc_prefetch_gate_core(dl_timeout_s, cfg):
     """[B/C/D 準備 core#6e] Light Council 後の DL_1 prefetch 抑制判定の純粋 core。
 
@@ -18029,82 +17805,6 @@ def _pv_overlap_count(pv_lines, top_move, n_top=3):
 # [WP3-6 2026-07-14] PV token と同じ字句だが、bestmove 行に直接載せる値のため fullmatch で検証する
 # (PV 末尾の切断・info 行の混入トークンを ponder として emit しないための門番)。
 _RE_USI_MOVE_STRICT = re.compile(r"\d[a-z]\d[a-z]\+?|[A-Z]\*\d[a-z]")
-
-
-def _multi_ponder_alt_reply(pv_lines, our_move, primary_reply, policy=None, alt_min_gap=0.0):
-    """[SMP v6.2] DL_1 の PV から第2予測応手 (alt) を導出する純粋関数。
-
-    主予測 primary_reply は nnue の bestmove ponder (または OVR-PONDER 経由の
-    DL PV[1]) 由来。DL_1 が our_move に対して読んでいた応手 pv[1] が主予測と
-    「不一致」のときだけ、それを alt として返す — エンジン間で応手予測が
-    割れた局面に第2スロットを割く (合議/RY2A と同じ不一致駆動原則)。
-
-    [R3 OVR-ALT 2026-06-23] override 経路 (primary が `_override_ponder_core` で
-    DL_1 PV[1] 由来) では primary == pv[1] が **構造的に成立** し alt が永久 None
-    だった (council override 全件 = 最も alt の価値が高い局面)。これを救済するため
-    fallback chain を追加:
-      1. pv[1] != primary なら pv[1] を返す (従来挙動・NNUE 採用経路)
-      2. 別 our_move の pv[1] で primary と異なる手を探す
-         (他手探索の応手分布を借用)
-    いずれも primary 一致は除外 (不一致駆動原則を維持)。
-    全候補は _RE_USI_MOVE_STRICT で門番 (_override_ponder_core と対称)。
-
-    dlshogi Stochastic Multi Ponder との対応: dlshogi は方策分布から複数応手を
-    サンプルするが、Pyfamate では「nnue 予測 vs DL 予測」という既に手元にある
-    エンジン多様性を予測源に使う (追加 GPU 探索ゼロ・bestmove 遅延ゼロ)。
-    """
-    if not pv_lines or not our_move or not primary_reply:
-        return None
-    # [SMP-ALT-GATE 2026-07] DL_1 の確信度が高い (top1-top2 > gap) なら alt 不要
-    if alt_min_gap > 0.0 and policy and len(policy) >= 2:
-        _g = (policy[0][1] or 0) - (policy[1][1] or 0)
-        if _g > alt_min_gap:
-            return None
-    pv = pv_lines.get(our_move)
-    # 1. 従来経路: pv[1] が primary と異なる (NNUE 採用で primary=NNUE PV[1] のとき)
-    if pv and len(pv) >= 2 and pv[1] and pv[1] != primary_reply:
-        if _RE_USI_MOVE_STRICT.fullmatch(pv[1]):
-            return pv[1]
-    # 2. fallback: 別 our_move の pv[1] を探索 (応手分布の多様性借用)。
-    #    iteration 順は dict 挿入順 (= DL_1 が MultiPV で出した強い順) で安定。
-    for _alt_mv, _alt_pv in pv_lines.items():
-        if _alt_mv == our_move:
-            continue
-        if (_alt_pv and len(_alt_pv) >= 2 and _alt_pv[1]
-                and _alt_pv[1] != primary_reply
-                and _RE_USI_MOVE_STRICT.fullmatch(_alt_pv[1])):
-            return _alt_pv[1]
-    return None
-
-
-def _override_ponder_core(final_move, pv_lines):
-    """[OVR-PONDER core] override 確定手の ponder を勝者エンジンの PV から導出する。
-
-    council / light council が NNUE 以外の手を採択 (override) した場合、
-    nnue の "bestmove X ponder Y" の Y は X (nnue 自手) への応手であり
-    final_move とは不整合になる。本関数は勝者票を出したエンジンの
-    pv_lines (move → PV 手列 dict) から final_move の PV[1] (= その
-    エンジンが最も予期する相手の応手) を取り出し、整合する ponder を返す。
-
-    棄権条件 (None を返す → ponder 無しで emit、従来挙動):
-      - final_move が空・resign・win
-      - pv_lines に final_move のエントリが無い (cache-hit 等で PV 不在)
-      - PV 長が 2 未満 (応手情報なし)
-      - PV[1] が USI 指し手として厳格パターンに合致しない (破損防御)
-
-    Returns: ponder_move (str) | None
-    """
-    if not final_move or final_move in ("resign", "win"):
-        return None
-    if not pv_lines:
-        return None
-    pv = pv_lines.get(final_move)
-    if not pv or len(pv) < 2:
-        return None
-    cand = pv[1]
-    if not isinstance(cand, str) or _RE_USI_MOVE_STRICT.fullmatch(cand) is None:
-        return None
-    return cand
 
 
 # [FIX-SFEN-MOVENO-OPTIONAL 2026-07-10] moveN 欄は任意。ShogiBoard.set / _split_position は
@@ -21401,7 +21101,6 @@ def _mon_snapshot_line(ctx, cpu_pct, gpu_ema=None):
 _mon_idle_cores = None    # システム実測アイドルコア数 EMA (_mon_loop が更新)
 _mon_avail_mb = None      # システム空き RAM MB EMA (_mon_loop が更新)
 _mon_gpu_util = None      # GPU 稼働率 % EMA (_mon_loop が更新)
-_mon_gpu_util_raw = None  # GPU 稼働率 % 直近生値 (ログ表示用)
 # [PHASE2 Step 3] _mon_vram_free_mb 撤去 (唯一の読み手 _dl_2_resource_gate_ok を削除)。
 
 def _mon_loop(ctx):
@@ -22284,6 +21983,30 @@ def _opponent_id_observe(ctx, position_cmd):
     except Exception as _oe:
         _flog(f"[OPP-ID] 観測失敗 (無視): {_oe}")
         return None
+
+
+# [撤去 2026-07-14] _CouncilDisagreement / _CouncilBoostResult / _council_apply_boost
+# (①②③④ 乗算 eff_s ブースト一式、約320行) を削除。boost は NEXT-5 で母関数 TA へ
+# 回帰済み (_u_ta_disagree_nudge → _time_dyn.ta_disagree_nudge →
+# _compute_go_time_dynamics)。統合後は呼出 0 の死蔵コードで、docstring だけが
+# 生きる M5 型の罠 (信じて呼ぶと二重ブースト) だったため撤去した。
+# 関連 cfg キー (disagree_* / score_stability_* / game_phase_surge_eff_s_boost)
+# は互換のため残置 — 読者は _u_ta_disagree_nudge と TA 系のみ。
+
+
+# ==================================================================
+# [PHASE2-REMOVAL §1A] ARB (ARB0=温 nnue_1 / ARB1=別 nnue_2 の searchmoves 自己裁定)
+#   + PREARB (ponder 先回り裁定) は機構ごと撤去。裁定は SV-Arbiter (judge) が担う。
+# ==================================================================
+
+
+
+@functools.lru_cache(maxsize=4)
+def _tracking_board_for(position_cmd: str) -> "ShogiBoard":
+    """position_cmd の history-tracking 盤面 (千日手/連続王手用) を構築してキャッシュ。
+    現局面 + mate-PV 等の look-ahead 局面を lru_cache(4) で同時保持し thrash を防ぐ。
+    返り値は read-only として共有 (consumer は clone 済)。"""
+    return ShogiBoard(sfen=position_cmd)      # track_history=True (既定)
 
 
 def _opponent_id_set_pending(ctx, position_cmd, final_move, nnue_pred, dl_pred):
@@ -25234,6 +24957,21 @@ def _u_finalize(st):
                            lock=_arbiter_sample_lock, fsync=False, os_write=True)
     except Exception as _ase:
         _flog(f"[arbiter-sample] {_ase!r}")
+    # [AUDIT-20261017] OPP-ID の予測ペア保存を再結線。観測側 (_opponent_id_observe) は
+    #   go 毎に pending を読むが、書く側 _opponent_id_set_pending が呼び出し元を失っており
+    #   相手系統の自動識別は一度もサンプルを得ていなかった。NNUE 予測 = 指す手が nnue_top の
+    #   ときの NNUE ponder、DL 予測 = 指す手に対する DL_1 PV の応手。
+    try:
+        _ov = st.verdict
+        _np = st.nnue_info.get("ponder") if (_ov and _ov == st.nnue_top) else None
+        _dp = None
+        if _ov:
+            _pv = _arb_pv_after_move(_ov, (st.dl1_pv_lines or {}).get(_ov))
+            _dp = _pv[0] if _pv else None
+        _opponent_id_set_pending(ctx, (st.position_cmd if v.ph else ctx.current_position),
+                                 _ov, _np, _dp)
+    except Exception as _oe:
+        _flog(f"[OPP-ID] pending 設定失敗 (無視): {_oe!r}")
     if v.ph:
         return _u_ph_finalize(st)   # [RF-1] 旧 _ponderhit_finalize の吸収先
     if not st.verdict:
@@ -25856,81 +25594,6 @@ def _zf_parse_tsumero_lines(_lines):
         _pv = _lines[1] if len(_lines) > 1 else ""
         return True, _threat_n, _pv
     return False, 0, ""
-
-
-def _zyfamate_tsumero(sfen, timeout_s=10.0, nodes=5000000, path=None):
-    """csa.exe tsumero: 詰めろ判定。(is_threat, threat_n, pv_csa) を返す。
-    [ZF-SERVE] 常駐サーバ優先、不可なら one-shot subprocess.run。"""
-    _path = path or _mate_solver_path
-    sfen = _zf_norm_sfen(sfen)
-    try:
-        _st, _lines = _zf_serve_request(
-            _path, f"tsumero {nodes} {timeout_s} {sfen}", timeout_s)
-        if _st == "timeout":
-            return False, 0, ""
-        if _st == "ok":
-            return _zf_parse_tsumero_lines(_lines)
-    except Exception as _e:
-        _dlog(f"[ZF-SERVE] tsumero error (one-shot fallback): {_e!r}")
-    try:
-        _r = subprocess.run(
-            [_path, "sfen-tsumero", sfen, str(nodes), str(timeout_s)],
-            capture_output=True, timeout=timeout_s + 2,
-            stdin=subprocess.DEVNULL,
-            creationflags=_ZF_CREATE_FLAGS,
-        )
-        _lines = (_r.stdout or b"").decode("utf-8", errors="replace").strip().splitlines()
-        return _zf_parse_tsumero_lines(_lines)
-    except Exception as _e:
-        _dlog(f"[ZYFAMATE] tsumero error: {_e!r}")
-        return False, 0, ""
-
-
-def _zf_parse_tesuki_lines(_lines):
-    """tesuki 出力行 → n_tesuki (int) / None。serve/one-shot 共用。"""
-    if not _lines:
-        return None
-    _first = _lines[0]
-    if not _first.startswith("tesuki "):
-        return None
-    _val = _first.split()[1]
-    if _val in ("-", "unknown"):
-        return None
-    try:
-        if _val.startswith(">"):
-            return int(_val[1:]) + 1
-        return int(_val)
-    except ValueError:
-        return None
-
-
-def _zyfamate_tesuki(sfen, maxn=3, timeout_s=3.0, nodes=2000000, path=None):
-    """csa.exe tesuki: n手すき判定。n_tesuki (int) を返す。None=判定不能。
-    [ZF-SERVE] 常駐サーバ優先、不可なら one-shot subprocess.run。
-    timeout_s は全体予算として C 側へそのまま渡す (新バイナリは time=全体予算)。"""
-    _path = path or _mate_solver_path
-    sfen = _zf_norm_sfen(sfen)
-    try:
-        _st, _lines = _zf_serve_request(
-            _path, f"tesuki {maxn} {nodes} {timeout_s} {sfen}", timeout_s)
-        if _st == "timeout":
-            return None
-        if _st == "ok":
-            return _zf_parse_tesuki_lines(_lines)
-    except Exception as _e:
-        _dlog(f"[ZF-SERVE] tesuki error (one-shot fallback): {_e!r}")
-    try:
-        _r = subprocess.run(
-            [_path, "sfen-tesuki", sfen, str(maxn), str(nodes), str(timeout_s)],
-            capture_output=True, timeout=timeout_s + 2,
-            stdin=subprocess.DEVNULL,
-            creationflags=_ZF_CREATE_FLAGS,
-        )
-        _lines = (_r.stdout or b"").decode("utf-8", errors="replace").strip().splitlines()
-        return _zf_parse_tesuki_lines(_lines)
-    except Exception as _e:
-        _dlog(f"[ZYFAMATE] tesuki error: {_e!r}")
-        return None
 
 
 def _mate_solver_active(ctx):
@@ -32427,19 +32090,6 @@ def sv_usi_to_label(mv: str) -> int:
     return (frm * 81 + to) * 2 + (1 if mv.endswith("+") else 0)
 
 
-def sv_label_to_usi(lab: int) -> str:
-    if lab >= 81 * 81 * 2:
-        lab -= 81 * 81 * 2
-        t, to = divmod(lab, 81)
-        f, r = 9 - to % 9, to // 9 + 1
-        return "%s*%d%s" % (sv_PC_SFEN[sv_HAND_ORDER[t]], f, chr(ord("a") + r - 1))
-    promo, ft = lab % 2, lab // 2
-    frm, to = divmod(ft, 81)
-    def _s(i):
-        return "%d%s" % (9 - i % 9, chr(ord("a") + i // 9))
-    return _s(frm) + _s(to) + ("+" if promo else "")
-
-
 # ====================== §2 棋譜パーサ (KIF / CSA / SFEN) ======================
 _sv_CSA_PC = {"FU": "FU", "KY": "KY", "KE": "KE", "GI": "GI", "KI": "KI", "KA": "KA",
            "HI": "HI", "OU": "OU", "TO": "TO", "NY": "NY", "NK": "NK", "NG": "NG",
@@ -32617,40 +32267,6 @@ def sv_parse_sfen_file(text: str):
     return out
 
 
-def sv_load_games(paths):
-    """ファイル/ディレクトリ群 → [(初期Board, moves, winner, per-pos score|None)] を yield。"""
-    files = []
-    for p in paths:
-        if os.path.isdir(p):
-            for ext in ("*.kif", "*.kifu", "*.csa", "*.sfen", "*.txt"):
-                files += glob.glob(os.path.join(p, "**", ext), recursive=True)
-        else:
-            files.append(p)
-    for fp in sorted(set(files)):
-        try:
-            raw = open(fp, "rb").read()
-            for enc in ("utf-8-sig", "cp932", "euc-jp"):
-                try:
-                    text = raw.decode(enc)
-                    break
-                except UnicodeDecodeError:
-                    continue
-            else:
-                continue
-            ext = os.path.splitext(fp)[1].lower()
-            if ext == ".csa":
-                b, mv, w = sv_parse_csa(text)
-                yield b, mv, w, None
-            elif ext in (".kif", ".kifu"):
-                b, mv, w = sv_parse_kif(text)
-                yield b, mv, w, None
-            else:
-                for b, mv, w, sc in sv_parse_sfen_file(text):
-                    yield b, mv, w, sc
-        except Exception as e:
-            print("[WARN] skip %s: %r" % (fp, e), file=sys.stderr)
-
-
 # ====================== §3 レンダラ (ドメインランダム化つき) ======================
 sv_IMG = 256
 # [WR-COMPAT 2026-07-05] 教師 cp → 勝率ラベルの変換傾き。エンジン本体の WR
@@ -32680,9 +32296,6 @@ sv_GRAY = False
 # 有効化は learn --gp-fuse 1 (既定 ON)。
 # ================================================================
 sv_GP_FUSE = True
-_SV_GP_HAND_W = (1, 3, 3, 5, 5, 8, 10)   # sv_HAND_ORDER 順 = _GP_HAND_VALUES と同値
-
-
 def sv_gp_features(sb):
     """SvBoard → GP 5特徴 (WHAND, PROMO, WCAMP, KING, EXPOSURE)。
 
@@ -35669,27 +35282,6 @@ def sv_cmd_train(a):
                     _w.join(timeout=2)
                 except Exception as _e:
                     _flog(f"[ignored] sv_cmd_train: {_e!r}")
-
-
-def sv_policy_mask(b: SvBoard) -> "np.ndarray":
-    """認識した盤面から方策ラベルの粗い可否マスクを作る (駒種の利きまでは見ない:
-    from が手番の駒 / to が自駒でない / 打は持ち駒あり+空マスのみ)。"""
-    m = np.zeros(sv_N_MOVE_LABELS, bool)
-    for frm, pid in enumerate(b.cells):
-        if pid == 0 or (pid - 1) // 14 != b.side:
-            continue
-        for to in range(81):
-            p2 = b.cells[to]
-            if p2 and (p2 - 1) // 14 == b.side:
-                continue
-            base = (frm * 81 + to) * 2
-            m[base] = m[base + 1] = True
-    for t, cnt in enumerate(b.hand[b.side]):
-        if cnt > 0:
-            for to in range(81):
-                if b.cells[to] == 0:
-                    m[81 * 81 * 2 + t * 81 + to] = True
-    return m
 
 
 def sv_cmd_learn(a):
@@ -54343,14 +53935,6 @@ def _game_phase_fit_unpack_features(features):
     return features[0], features[1], features[2], features[3], 0.0, 0, 0
 
 
-def _game_phase_fit_value(features, vec):
-    WHAND, PROMO, CAMP, KING, EXPOSURE, DEV, CONTACT = \
-        _game_phase_fit_unpack_features(features)
-    return _calc_state_phase(WHAND, PROMO, CAMP, KING, EXPOSURE,
-                             cfg=_game_phase_fit_make_view(vec),
-                             DEV=DEV, CONTACT=CONTACT)
-
-
 def _game_phase_fit_value_fn(vec):
     view = _game_phase_fit_make_view(vec)
 
@@ -56991,11 +56575,6 @@ _TEACHER_DEFAULT_PSV_DIR = (r"E:\New folder" if os.path.isdir(r"E:\New folder")
                             else r"C:\New folder")
 
 
-def _arb_kif_root():
-    """棋譜ルート: E:\\kif 優先、無ければ C:\\kif (フォールバック)。"""
-    return r"E:\kif" if os.path.isdir(r"E:\kif") else r"C:\kif"
-
-
 # ==================================================================
 # [FIT/TOURNAMENT] 準備パイプラインの 2 コマンド統括
 # ------------------------------------------------------------------
@@ -58848,9 +58427,9 @@ def _selftest_cfg_drift(rest=None):
 # 現在値を上限として固定。増えたら非0終了、減った場合は歓迎メッセージのみ。
 # 更新: WP3-6 削除等で数値が下がったら本 dict を新値に書き替えて ratchet を締める。
 _CONNECTIVITY_BASELINE = {
-    'unused_module_functions': 21,   # [GHOST-PURGE 2026-07-17] _dl_conviction_wait_s_core (caller 0) 実削除で 22→21 に締結
-    'unused_module_constants': 8,    # 参照0の module-level `_NAME = ...` [PHASE2 proxy 撤去で +1=8 / Step3 DL2: _mon_vram_free_mb 撤去で相殺し 8 維持 / Step 5B nnue_2 constant (_K_NNUE_2_HASH/_DEFAULT_nnue_2_PATH/_nnue_2_slowmover_user_set) 撤去で 8 維持 (退役分 = 参照ゼロにあらず、DEFAULTS/from_cfg で使用中だったため)]
-    'unused_function_arguments': 72, # 関数 body で参照0の引数 (callback は多め; _selftest_* の del rest 含む). [WP3-6 で 83→79 / WP3-1 ply 撤去 78 / STEP-SPLIT 77 / RF-1 ponderhit 統合 75 / WP11 UI 回路で 74 に締結 / SV-ARBITER で _selftest_render(rest) 追加 75 / PHASE2 §1A ARB 関数削除で 73 に締結 / Step 5B 実測 74 に更新 (2026-07-17 concurrent session 増分の観測差 +1; nnue_2 撤去は arg 追加無し) / [C-REMNANT 2026-07-17] precedent_info(current_ply) / _revive_dead_nnue_async(eff_s) 等の死蔵引数を実削除し 74→72 に締結]
+    'unused_module_functions': 3,    # [DEDUP 2026-10-17] 参照0の 22 定義を削除 + OPP-ID setter 再結線 (アイデアは docs/IDEAS.md に保存) 21→3。[GHOST-PURGE 2026-07-17] _dl_conviction_wait_s_core (caller 0) 実削除で 22→21 に締結
+    'unused_module_constants': 0,    # [DEDUP 2026-10-17] 8→0。参照0の module-level `_NAME = ...` [PHASE2 proxy 撤去で +1=8 / Step3 DL2: _mon_vram_free_mb 撤去で相殺し 8 維持 / Step 5B nnue_2 constant (_K_NNUE_2_HASH/_DEFAULT_nnue_2_PATH/_nnue_2_slowmover_user_set) 撤去で 8 維持 (退役分 = 参照ゼロにあらず、DEFAULTS/from_cfg で使用中だったため)]
+    'unused_function_arguments': 77, # [2026-10-17] main 時点で既に 77 (+5 は 10-02 版統合で流入: _sr_meta_line(rec) 等) — 締結値を実測へ。 関数 body で参照0の引数 (callback は多め; _selftest_* の del rest 含む). [WP3-6 で 83→79 / WP3-1 ply 撤去 78 / STEP-SPLIT 77 / RF-1 ponderhit 統合 75 / WP11 UI 回路で 74 に締結 / SV-ARBITER で _selftest_render(rest) 追加 75 / PHASE2 §1A ARB 関数削除で 73 に締結 / Step 5B 実測 74 に更新 (2026-07-17 concurrent session 増分の観測差 +1; nnue_2 撤去は arg 追加無し) / [C-REMNANT 2026-07-17] precedent_info(current_ply) / _revive_dead_nnue_async(eff_s) 等の死蔵引数を実削除し 74→72 に締結]
     'write_only_attributes': 23,     # obj.attr= のみあり obj.attr 読取 0. [WP3-6 で 31→25 / WP3-1 book_seed 読取復活で 24 に締結 / SV-ARBITER で 23 に締結 / PHASE2 Step0-2 で +1=24 / PHASE2 Step3 DL2: _time_dyn.dl_2_time_max_ms / dl_2_margin_min_ms write-only 撤去で 24 に締結 / Step 4D DL_3 撤去で 23 に締結 (game_progress.dl_3_rescue_pending)]
 }
 
@@ -60054,70 +59633,6 @@ def sv_arbiter_synth_main(rest):
         nn.close(); dl.close()
     print("[arbiter-synth] 完了: %d 局面 → %d 不一致サンプル → %s"
           % (len(plist), n_emit, a.out))
-
-
-def _arb_list_kif(root):
-    out = []
-    for dp, _dn, fn in os.walk(root):
-        for f in fn:
-            if f.lower().endswith((".kif", ".kifu", ".csa", ".sfen")):
-                out.append(os.path.join(dp, f))
-    return out
-
-
-def _arb_kif_positions(fpath):
-    """棋譜ファイル → USI position コマンド列 (各手の局面)。
-
-    [2026-07-17 fix] 旧実装は USI ログ形式 ('position ...' 行) しか読めず、実棋譜
-    (KIF/CSA) では 0 局面 = synth が空振りしていた (1,000局29秒0サンプルの正体)。
-    本体パーサ sv_parse_csa / sv_parse_kif (encoding 自動判定込み) へ委譲する。
-    初期局面は sfen で明示 (CSA の駒落ち/任意局面にも正しい)。定跡帯 (ply<8) は
-    不一致が定跡で吸収され教材価値が薄いため飛ばす。"""
-    try:
-        with open(fpath, "rb") as fh:
-            raw = fh.read()
-    except OSError:
-        return
-    text = None
-    for enc in ("utf-8-sig", "cp932", "euc-jp"):
-        try:
-            text = raw.decode(enc)
-            break
-        except UnicodeDecodeError:
-            continue
-    if text is None:
-        return
-    ext = os.path.splitext(fpath)[1].lower()
-    if ext not in (".csa", ".kif", ".kifu"):
-        # USI ログ / sfen 棋譜は従来どおり行パース
-        for line in text.splitlines():
-            line = line.strip()
-            if line.startswith(("position ", "startpos", "sfen ")):
-                toks = line.split()
-                if "moves" in toks:
-                    base = " ".join(toks[:toks.index("moves") + 1])
-                    mvs = toks[toks.index("moves") + 1:]
-                    for k in range(len(mvs) + 1):
-                        yield (("position " if not line.startswith("position") else "")
-                               + base + " " + " ".join(mvs[:k]))
-                else:
-                    yield ("position " if not line.startswith("position") else "") + line
-        return
-    try:
-        if ext == ".csa":
-            b0, mvs, _w = sv_parse_csa(text)
-        else:
-            b0, mvs, _w = sv_parse_kif(text)
-    except Exception as _pe:
-        _flog("[arbiter-synth] parse skip %s: %r" % (os.path.basename(fpath), _pe))
-        return
-    if not mvs:
-        return
-    base = "position sfen " + _svboard_to_sfen(b0) + " moves "
-    # (注: synth は互角局面集 txt 方式へ移行済み [2026-07-17] — 本関数は棋譜再生の
-    #  レガシー経路。GP を ply で近似する足切りは設計思想に反するため行わない。)
-    for k in range(8, len(mvs) + 1):
-        yield base + " ".join(mvs[:k])
 
 
 def sv_arbiter_label_main(rest):
