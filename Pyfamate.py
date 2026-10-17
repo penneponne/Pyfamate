@@ -23136,6 +23136,7 @@ class _USS:
     pv_mate_step: object = None      # 証明が立った PV 上の手数オフセット (2k)
     pv_mate_source: object = None    # "dl_pv" / "nnue_pv"
     pv_mate_override: bool = False
+    pv_mate_checked: bool = False    # [ROLES-20261017] PV-MATE が df-pn 検問を 1 回以上実行したか
     extra_stats: dict = dataclasses.field(default_factory=dict)  # _live_dl1_policy 等
 
 def _ucfg_int(key, default):
@@ -24274,8 +24275,13 @@ def _u_override(st):
     if v.name == "council":
         _u_council_overrides(st)
         _v_guarded = st.verdict
-        _u_override_conviction_mate(st)
     _u_override_pv_mate(st)   # [PV-MATE v2] DL_1 PV 上の df-pn 詰み検問
+    # [ROLES-20261017] conviction-mate (DL の「詰みあり」申告だけで DL 手を強制) と PV-MATE (DL PV 上を
+    #   df-pn で証明) は同じ役割 (DL が見た詰みを採る) の弱い版/強い版。旧: 申告版が先に走り、証明版の
+    #   結果に関係なく DL 手を採っていた。証明が実際に走ったら (証明成立でも不成立でも) 申告版は使わない
+    #   — 証明 > 申告。証明が走れない局面 (solver 無効・GP/予算ゲート外) だけ申告版で補う。
+    if v.name == "council" and not st.pv_mate_checked:
+        _u_override_conviction_mate(st)
     # [AUDIT-20261017] conviction-mate / PV-MATE は頓死ガードの後に手を差し替える。どちらも
     #   「相手が PV どおり応じれば」の条件付きで、差し替え先は頓死検査を受けていなかった。
     if v.name == "council" and st.verdict != _v_guarded:
@@ -24354,6 +24360,7 @@ def _u_override_pv_mate(st):
                     return   # 予算枯渇
                 _pos = _position_after_moves(ctx.current_position, _pv[:_n])
                 _go = _mate_go_cmd(ctx, int(min(_jt, cfg.pv_mate_join_timeout_s) * 1000))
+                st.pv_mate_checked = True
                 _res, _bm = _run_single_pv_mate_check(
                     ctx, _pos, _go, st.eff_s, _jt, f"pv-mate-dl1-{_n}")
                 if _res != "mate":
@@ -45286,6 +45293,24 @@ class ShogiBoard:
         """
         return self.repetition_count_after(usi_move) >= min_count
 
+    def perpetual_checker(self, unknown=None):
+        """[DEDUP-20261017] 現局面で千日手が成立しているとき、連続王手側 ("b"/"w") を返す。そうでなければ None。
+        判定 = 最終局面の初出から現在までの区間で、一方の手が全て王手 (_sprt_sennichite_verdict_core)。
+        王手履歴 (_hist_check) が履歴と揃っていない盤では unknown を返す。
+        is_perpetual_check_move / makebook (_mb_perpetual_checker) が共有する唯一の実装。"""
+        hist, flags = self._history, getattr(self, "_hist_check", None)
+        if flags is None or len(flags) != len(hist) - 1 or len(hist) < 2:
+            return unknown
+        if not self.is_sennichite():
+            return None
+        verdict, parity = _sprt_sennichite_verdict_core(hist, flags)
+        if verdict != "perpetual":
+            return None
+        n_moves = len(hist) - 1
+        start_side = self.side if n_moves % 2 == 0 else ("w" if self.side == "b" else "b")
+        first_mover = start_side
+        return first_mover if parity == 0 else ("w" if first_mover == "b" else "b")
+
     def is_perpetual_check_move(self, usi_move: str) -> bool:
         """usi_move が「連続王手の千日手」を成立させる手か。
 
@@ -45294,18 +45319,15 @@ class ShogiBoard:
         """
         if not (self.gives_check(usi_move) and self.would_be_sennichite(usi_move)):
             return False
-        # [AUDIT-20261017] 旧: 「この手が王手 + 千日手成立」だけで True → 普通の千日手 (引分け) を
-        #   最後に王手で完成させる手まで連続王手扱いで拒否していた。反復区間の自分の手が全て
-        #   王手のときだけ連続王手 (_sprt_sennichite_verdict_core と同じ判定)。
         try:
-            nb = self._after_usi(usi_move)
-            hist, flags = nb._history, getattr(nb, "_hist_check", None)
-            if flags is None or len(flags) != len(hist) - 1:
-                return True   # 王手履歴が無い盤 (旧挙動 = 安全側)
-            verdict, parity = _sprt_sennichite_verdict_core(hist, flags)
-            return verdict == "perpetual" and parity == (len(hist) - 2) % 2
+            _pc = self._after_usi(usi_move).perpetual_checker(unknown="?")
+            if _pc != "?":
+                return _pc == self.side
         except Exception:
-            return True
+            pass
+        # [AUDIT-20261017] 旧: 「この手が王手 + 千日手成立」だけで True (普通の千日手を王手で完成させる手も
+        #   拒否)。反復区間の自分の手が全て王手のときだけ連続王手。王手履歴が無い盤は旧挙動 (安全側)。
+        return True
 
     def nyugyoku_score(self, side: str):
         """side 側の入玉点数と敵陣内自駒数 (玉除く) を返す。(points, pieces_in_zone)。"""
@@ -49038,6 +49060,11 @@ def _book_score_from_info_line(line, best_value, best_depth):
     共通正本。score/mate にマッチしたときだけ上書きするので、呼出側の best_value 初期値
     (None or 0) はそのまま保存される。depth-only 行 (score 無) は depth も更新しない
     (原実装どおり: best_depth は score/mate 採用時のみ前進)。score は手番側 cp。"""
+    if isinstance(line, str):
+        # [AUDIT-20261017] overlay 版 _bestmove_by_search_legacy は readline() の生文字列を渡し、
+        #   `'str' object has no attribute 'depth'` で overlay makebook が初手で落ちていた
+        #   (B10/B12/M-4/K-1/M-6 指定時は必ずこの経路)。
+        line = _parse_usi_line(line)
     if line.depth is None or (line.multipv is not None and line.multipv != 1):
         return best_value, best_depth
     if "lowerbound" in line.split() or "upperbound" in line.split():
@@ -51508,24 +51535,17 @@ _MB_REJECTED_KNOBS = {
 
 
 def _mb_perpetual_checker(tempkif):
-    """[2026-10-16] 千日手が連続王手か。直近の同一局面2回の間（1周期）で、片側の手がすべて王手なら
-    その側（"b"/"w"）を返す（連続王手の千日手は王手した側の負け）。そうでなければ None。"""
+    """[2026-10-16] 千日手が連続王手か。連続王手の千日手は王手した側の負け → その側 ("b"/"w")、
+    そうでなければ None。[DEDUP-20261017] 判定は ShogiBoard.perpetual_checker に一本化 (旧: 独自実装で
+    「直近 1 周期」だけを見ており、規定 (同一局面の初出から 4 回目までの間、一方の手が全て王手) より
+    緩く、普通の千日手を王手側の負けとして book に記録し得た)。"""
     try:
         b = ShogiBoard(); b.set(tempkif[0])
-        keys = [b.sfen_key()]; movers = []; checks = []
         for m in tempkif[1:]:
             if m in ("resign", "win", "", "rep_draw"):
                 break
-            movers.append(b.side if getattr(b, "side", None) in ("b", "w") else ("b" if b.turn() == -1 else "w")); checks.append(bool(b.gives_check(m)))
-            b.push(m); keys.append(b.sfen_key())
-        last = keys[-1]; idx = [i for i, k in enumerate(keys) if k == last]
-        if len(idx) < 2:
-            return None
-        lo, hi = idx[-2], idx[-1]          # moves lo .. hi-1 make one cycle
-        for side in ("b", "w"):
-            mine = [checks[j] for j in range(lo, hi) if movers[j] == side]
-            if mine and all(mine):
-                return side
+            b.push(m)
+        return b.perpetual_checker()
     except Exception as _e:
         _flog(f"[makebook] perpetual check test failed: {_e!r}")
     return None
@@ -51545,6 +51565,49 @@ def _mb_parse_num(raw, default, *, to_int=True, lo=None, hi=None, scale=1.0):
     if hi is not None:
         v = min(hi, v)
     return v
+
+
+class _MbSettings:
+    """[DEDUP-20261017] makebook 設定値の解決。優先順: CLI key=value → 環境変数 MAKEBOOK_<KEY> →
+    設定ファイル (本流のみ) → input() (対話時; interactive_keys 指定時はそのキーだけ) → 既定値。
+    unattended=1 または非 TTY では input() を呼ばない。旧: 本流/overlay の両 CLI に同じ入れ子関数
+    (_mb_unattended / _mb_setting / _mb_setting_num) があり、設定ファイル対応だけが本流に入っていた。"""
+
+    def __init__(self, cli_kv, file_settings=None, interactive_keys=None):
+        self.cli_kv = cli_kv
+        self.file_settings = file_settings or {}
+        self.interactive_keys = interactive_keys
+        v = cli_kv.get("unattended", os.environ.get("MAKEBOOK_UNATTENDED",
+                                                     self.file_settings.get("unattended")))
+        if v is not None:
+            self.unattended = _norm_str(v) in ("1", "true", "yes", "on", "y")
+        else:
+            try:
+                self.unattended = not sys.stdin.isatty()
+            except Exception:
+                self.unattended = True
+
+    def get(self, key: str, prompt: str, default: str) -> str:
+        if key in self.cli_kv:
+            return self.cli_kv[key]
+        _env = os.environ.get("MAKEBOOK_" + key.upper())
+        if _env is not None:
+            return _env
+        if key in self.file_settings:
+            return self.file_settings[key]
+        if self.unattended:
+            return default
+        if self.interactive_keys is not None and (not prompt or key not in self.interactive_keys):
+            # 対話で質問するのは interactive_keys のみ (旧: 16 個超の質問で開始まで Enter 連打)。
+            return default
+        try:
+            ans = input(prompt)
+            return ans if ans != "" else default
+        except EOFError:
+            return default   # パイプ閉鎖等 → 既定値で継続 (無人運転へ degrade)
+
+    def num(self, key, prompt, default, **kw):
+        return _mb_parse_num(self.get(key, prompt, str(default)), default, **kw)
 
 
 def _makebook_cli(extra_args: list) -> None:
@@ -51623,52 +51686,17 @@ def _makebook_cli(extra_args: list) -> None:
         elif _config_explicit is not None:
             raise SystemExit("makebook: 設定ファイルが見つかりません: " + _config_path)
 
-    def _mb_unattended() -> bool:
-        # 明示フラグ優先。未指定なら stdin が非 TTY のとき無人とみなす。
-        v = _cli_kv.get("unattended", os.environ.get("MAKEBOOK_UNATTENDED", _file_settings.get("unattended")))
-        if v is not None:
-            return _norm_str(v) in ("1", "true", "yes", "on", "y")
-        try:
-            return not sys.stdin.isatty()
-        except Exception:
-            return True
-
-    _unattended = _mb_unattended()
-    if _unattended:
-        print("[makebook] 無人モード (unattended): input() を呼ばず "
-              "CLI/環境変数/既定値で実行します。")
-
     # 対話モードで実際に質問する設定キー (これ以外は既定値で即続行)。
     _MB_INTERACTIVE_KEYS = ("engine", "parallel", "basesfen", "readbook",
                             "think_s", "book_fix", "fv_scale")
-
-    def _mb_setting(key: str, prompt: str, default: str) -> str:
-        """CLI → 環境変数 → 設定ファイル → input() → 既定値。"""
-        if key in _cli_kv:
-            return _cli_kv[key]
-        _env = os.environ.get("MAKEBOOK_" + key.upper())
-        if _env is not None:
-            return _env
-        if key in _file_settings:
-            return _file_settings[key]
-        if _unattended:
-            return default
-        if not prompt or key not in _MB_INTERACTIVE_KEYS:
-            # 対話で質問するのは _MB_INTERACTIVE_KEYS のみ。他の設定は
-            # 既定値で即続行する (key=value / 環境変数 MAKEBOOK_<KEY> での
-            # 指定は従来どおり有効)。旧実装は 16 個超の質問 + 無言の
-            # input("") 待ちがあり、開始まで延々と Enter が必要だった。
-            return default
-        try:
-            ans = input(prompt)
-            return ans if ans != "" else default
-        except EOFError:
-            # 対話入力中に EOF (パイプ閉鎖等) → 既定値で継続 (無人運転へ degrade)。
-            return default
-
-    def _mb_setting_num(key, prompt, default, **kw):
-        """_mb_setting の数値版 (本体は両 makebook CLI 共通の _mb_parse_num)。"""
-        return _mb_parse_num(_mb_setting(key, prompt, str(default)), default, **kw)
+    # [DEDUP-20261017] 設定解決 (CLI → 環境変数 → 設定ファイル → input() → 既定) は
+    #   overlay 版と共通の _MbSettings。
+    _mbs = _MbSettings(_cli_kv, _file_settings, _MB_INTERACTIVE_KEYS)
+    _unattended = _mbs.unattended
+    if _unattended:
+        print("[makebook] 無人モード (unattended): input() を呼ばず "
+              "CLI/環境変数/既定値で実行します。")
+    _mb_setting, _mb_setting_num = _mbs.get, _mbs.num
 
     # ---- 省略オーバーレイのノブは優雅に拒否 (原本 Default-OFF 群) ----
     for _rk, _rwhy in _MB_REJECTED_KNOBS.items():
@@ -52736,40 +52764,15 @@ def _makebook_cli_overlay(extra_args: list) -> None:
             _k, _v = _a.split("=", 1)
             _cli_kv[_k.strip().lower()] = _v.strip()
 
-    def _mb_unattended() -> bool:
-        # 明示フラグ優先。未指定なら stdin が非 TTY のとき無人とみなす。
-        v = _cli_kv.get("unattended", os.environ.get("MAKEBOOK_UNATTENDED"))
-        if v is not None:
-            return _norm_str(v) in ("1", "true", "yes", "on", "y")
-        try:
-            return not sys.stdin.isatty()
-        except Exception:
-            return True
-
-    _unattended = _mb_unattended()
+    # [DEDUP-20261017] 設定解決は本流と共通の _MbSettings (設定ファイル無し・全キー対話可)。
+    _mbs = _MbSettings(_cli_kv)
+    _unattended = _mbs.unattended
     if _unattended:
         print("[makebook] 無人モード (unattended): input() を呼ばず "
               "CLI/環境変数/既定値で実行します。")
-
-    def _mb_setting(key: str, prompt: str, default: str) -> str:
-        """設定値を CLI(key=value) → 環境変数 → input() → 既定値 の順で解決する。"""
-        if key in _cli_kv:
-            return _cli_kv[key]
-        _env = os.environ.get("MAKEBOOK_" + key.upper())
-        if _env is not None:
-            return _env
-        if _unattended:
-            return default
-        try:
-            ans = input(prompt)
-            return ans if ans != "" else default
-        except EOFError:
-            # 対話入力中に EOF (パイプ閉鎖等) → 既定値で継続 (無人運転へ degrade)。
-            return default
-
-    def _mb_setting_num(key, prompt, default, **kw):
-        """_mb_setting の数値版 (本体は両 makebook CLI 共通の _mb_parse_num)。"""
-        return _mb_parse_num(_mb_setting(key, prompt, str(default)), default, **kw)
+    _mb_setting, _mb_setting_num = _mbs.get, _mbs.num
+    _ovl_max_games = _mb_setting_num("max_games", "", 0, lo=0)
+    _ovl_dead_child = 0
 
     # ---- 各種設定を解決 (CLI/環境変数/対話/既定) ----
 
@@ -53481,6 +53484,16 @@ def _makebook_cli_overlay(extra_args: list) -> None:
                     eng, byoyomi_ms, sfen, _byo_override, cache=_eval_cache)
                 _searched = True
 
+            # [AUDIT-20261017] 子が探索情報なし (depth 0) で resign/空を返すのは子の故障 (エンジン未設定・
+            #   init 失敗)。旧: それを 1 局として数え続け、無限に「連勝」空転した。3 回連続で停止。
+            if _searched and bestmove in ("resign", "") and not _dep:
+                _ovl_dead_child += 1
+                if _ovl_dead_child >= 3:
+                    print("[makebook] 子エンジンが探索せずに resign/空を %d 回連続で返しました — "
+                          "子の設定 (NNUE/DL パス) を確認してください。停止して書き出します" % _ovl_dead_child)
+                    raise KeyboardInterrupt
+            elif _searched:
+                _ovl_dead_child = 0
             # [#5 苦手応手掘り] 直前に指した「定跡の主張手」の claim 値を、いま
             # 実探索したこの局面の値で検証する。realized = -(この局面の手番側値)
             # が claim より bad_swing_cp 以上低ければ、その定跡手は best-response に
@@ -53665,6 +53678,11 @@ def _makebook_cli_overlay(extra_args: list) -> None:
             if end == 1:  # 終局処理
                 kif.append(" ".join(tempkif))
                 kif_total += 1
+                if _ovl_max_games and kif_total >= _ovl_max_games:
+                    # [AUDIT-20261017] 本流と同じ max_games 停止 (旧: overlay は未対応で、子が即終局する
+                    #   環境では無限に高速空転した)。KeyboardInterrupt と同じ保存フェーズへ。
+                    print("[makebook] max_games=%d に到達 — 停止して書き出します" % _ovl_max_games)
+                    raise KeyboardInterrupt
                 # [MB-SATURATION] 飽和検出
                 if _sat_window > 0:
                     _new_pos = sum(1 for _sf, _ in tempbook if _sf not in book or len(book.get(_sf, {})) <= 1)
