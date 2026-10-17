@@ -22090,7 +22090,11 @@ def _get_tracking_board(ctx):
 
 
 def _mate_move_accepted(ctx, mate_move, source_label):
-    """[単一検問所] mate solver (詰将棋エンジン) 由来の手を採用してよいか判定する。
+    """[単一検問所] 詰み主張に基づいて採る手が連続王手の千日手にならないか判定する。
+
+    [ZYF-GUARD 2026-10-17] Zyfamate が自分で答える初手 (根の詰み / MPON) の検問は Zyfamate 本体へ
+    移した (yfamate/Zyfamate#2)。ここに残る呼び出しは Zyfamate の初手ではない手 — DL の頭手
+    (PV-MATE / conviction-mate)、詰み PV キャッシュの後続手、千日手拒否の代替手 — だけ。
 
     これは「1 つのエンジン (mate solver) に対する 4 つの採用経路」を 1 関数に
     集約した唯一の検問所である。各経路 (現局面 mate 直接採用 / nnue-only PV
@@ -23916,10 +23920,11 @@ def _u_harvest_mate(st):
         # #OUTE_SENNICHITE 反則負け (即敗) になりうる。単一検問所を通し、
         # 拒否されたら None を返して通常の verdict (council/light/endgame の
         # 投票結果) へフォールバックさせる (他の mate 採用経路と同じ規律)。
+        # [ZYF-GUARD 2026-10-17] 連続王手の千日手の検問は Zyfamate 本体 (根の対局履歴で初手を除外,
+        #   yfamate/Zyfamate#2) が行う — Cyfamate も同じ Zyfamate を検問なしで使うため、検問は
+        #   Pyfamate 側から外して Zyfamate に一本化した。ソルバーには履歴付きの position を渡している。
         if mr.result == "mate" and mr.best_move not in (None, "", "resign", "win"):
-            if _mate_move_accepted(ctx, mr.best_move, "unify-mate"):
-                return mr.best_move
-            return None
+            return mr.best_move
     except Exception as _e:
         _flog(f"[ignored] _u_harvest_mate: {_e!r}")
     return None
@@ -24441,8 +24446,8 @@ _SENNICHITE_ALT_MAX_LOSS_CP = 150
 
 
 def _u_council_mate_ponder(st):
-    """[MPON] 相手番 df-pn 証明済み詰みを ponderhit 時に収穫 (原 ≈27834)。採用は
-    _mate_move_accepted (連続王手千日手) 検問を通す。consume-once。"""
+    """[MPON] 相手番 df-pn 証明済み詰みを ponderhit 時に収穫 (原 ≈27834)。consume-once。
+    [ZYF-GUARD 2026-10-17] 連続王手の千日手は Zyfamate が根の履歴 (予測局面の position) で初手から除外する。"""
     ctx = st.ctx
     if st.verdict in (None, "", "resign", "win"):
         return
@@ -24450,11 +24455,10 @@ def _u_council_mate_ponder(st):
     if (rec is not None and rec[0] == "mate"
             and rec[1] not in (None, "", "resign", "win")):
         mv = rec[1]
-        if _mate_move_accepted(ctx, mv, "mate-ponder-council"):
-            st.verdict = mv
-            st.ponder_move = None
-            _flog(f"[MPON] OVERRIDE (unify council): bestmove -> {mv} "
-                  "(相手番 df-pn 証明済み詰み)")
+        st.verdict = mv
+        st.ponder_move = None
+        _flog(f"[MPON] OVERRIDE (unify council): bestmove -> {mv} "
+              "(相手番 df-pn 証明済み詰み)")
 
 def _u_council_sennichite(st):
     """[千日手拒否] 採用手が同一局面 2 回目なら DL_2 top の非千日手へ差替 (原 ≈27879)。
@@ -44694,8 +44698,6 @@ class ShogiBoard:
                             continue  # と金は二歩にならない
                         if pc == ("P" if mover_is_sente else "p"):
                             return "nifu"
-                    if self._uchifuzume(usi_move):
-                        return "uchifuzume"   # [ZYFAMATE-PORT] 打ち歩詰め
                 # [FIX-CHECK-EVASION 2026-07-12] drop でも王手放置を検出する。
                 # 合駒 (王手ラインを遮る打ち) は apply_usi 後に王手解除されるため
                 # 正しく素通しし、解除しない打ちだけ "in_check" を返す。
@@ -45197,7 +45199,7 @@ class ShogiBoard:
 
     def _light_clone(self) -> "ShogiBoard":
         """[DEDUP-20261017] 履歴なしの軽量複製 (盤・持駒・手番・玉位置のみ)。gives_check /
-        _check_evasion_reason / _uchifuzume が同じ 14 行の複製コードを各自持っていた。"""
+        _check_evasion_reason が同じ 14 行の複製コードを各自持っていた。"""
         nb = ShogiBoard.__new__(ShogiBoard)
         nb.board      = self.board.copy()
         nb.sente_hand = self.sente_hand.copy()
@@ -45212,53 +45214,6 @@ class ShogiBoard:
         nb._hist_counter = {}
         nb._track_history = False
         return nb
-
-    def _uchifuzume(self, usi_move: str) -> bool:
-        """[ZYFAMATE-PORT 2026-10-17] 歩打ち usi_move が打ち歩詰め (反則) か。
-        Zyfamate (gen_checks / is_mated) と同じ定義: 歩打ちで王手 かつ 受け方に合法な応手が無い。
-        歩の王手は接触王手 1 枚なので応手は「玉が逃げる (歩を取るを含む)」か「玉以外で歩を取る」だけ
-        (合駒は無い)。利きは検証済みの _attacks_square、自玉の安全は _is_king_attacked で見る。"""
-        if not usi_move.startswith("P*"):
-            return False
-        nb = self._light_clone()
-        nb.apply_usi(usi_move)
-        dfd = "w" if self.side == "b" else "b"
-        if not nb._is_king_attacked(dfd):
-            return False
-        kp = nb._king_pos(dfd)
-        if kp is None:
-            return False
-        pc_col, pc_row = self._to_rc(usi_move[2:4])
-
-        def _sq(c, r):
-            return "%d%s" % (c, chr(ord("a") + r - 1))
-
-        def _owner_is_dfd(pc):
-            return pc[-1].isupper() == (dfd == "b")
-
-        def _escapes(mv):
-            t = nb._light_clone()
-            t.apply_usi(mv)
-            return not t._is_king_attacked(dfd)
-        kc, kr = kp
-        for dc in (-1, 0, 1):
-            for dr in (-1, 0, 1):
-                if dc == 0 and dr == 0:
-                    continue
-                c, r = kc + dc, kr + dr
-                if not (1 <= c <= 9 and 1 <= r <= 9):
-                    continue
-                occ = nb.board.get((c, r))
-                if occ and _owner_is_dfd(occ):
-                    continue
-                if _escapes(_sq(kc, kr) + _sq(c, r)):
-                    return False
-        for (c, r), pc in list(nb.board.items()):
-            if not _owner_is_dfd(pc) or pc.lstrip("+").upper() == "K":
-                continue
-            if nb._attacks_square(c, r, pc, pc_col, pc_row) and _escapes(_sq(c, r) + _sq(pc_col, pc_row)):
-                return False
-        return True
 
     def would_be_sennichite(self, usi_move: str) -> bool:
         """現手番が usi_move を指した結果、その局面が千日手 (4回目) になるか。
