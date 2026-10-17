@@ -229,6 +229,9 @@ _STATS_PATH = _SPSA_STATS_PATH_ENV if _SPSA_STATS_PATH_ENV else os.path.join(_BA
 # [SV-ARBITER §3.2] nnue≠dl 不一致局面の裁定教師サンプラ出力 (JSONL・1行1局面)。
 _ARBITER_SAMPLES_PATH = os.path.join(_BASE_DIR, "arbiter_samples.jsonl")
 _arbiter_sample_lock = threading.Lock()
+# [COUNCIL-V2] 対局中サンプルの対局キー (usinewgame ごとに更新)。arbiter-train の
+# train/val を対局単位で分けるため (旧: 対局キー無し → pos_hash 先頭 4 桁で近似)。
+_ARB_LIVE_GAME_ID = ["live-%d-%d" % (os.getpid(), int(time.time()))]
 # [STATS-UNIFIED] かつて per-move サイドカー (stats_live.jsonl) と gameover
 # まとめ書き (stats.txt) を棲み分けていたが廃止し、stats.txt 一本へ統合した。
 # diagnosis.txt (_flog) と同じ「その場で逐次追記 (flush+fsync)」方式に揃え、
@@ -24282,10 +24285,14 @@ def _council_ballot(ctx, *, dl_top, nnue_top,
         if _sm and _sm not in (nnue_top, dl_top):
             _cands.append(ArbCand(move=_sm, source="seed"))
         if _arb.ok and nnue_top and len(_cands) >= 2:
-            _scalars = {"gp": game_phase or 0.0, "eff_s": eff_s, "rem_ms": rem_ms,
-                        "move_count": move_count, "nnue_depth": nnue_depth or 0,
-                        "nnue_nodes": nnue_nodes or 0, "nnue_top": nnue_top,
-                        "position_cmd": position_cmd or ctx.current_position}
+            _pos = position_cmd or ctx.current_position
+            # [COUNCIL-V2] 特徴は学習行と同じ関数で作る (_arb_scalars_for_position)。
+            #   gp (child pull 込み) は τ の GP 連動にだけ使う。
+            _scalars = _arb_scalars_for_position(_pos, cfg)
+            _scalars.update({"gp": game_phase or 0.0, "eff_s": eff_s, "rem_ms": rem_ms,
+                             "nnue_depth": nnue_depth or 0,
+                             "nnue_nodes": nnue_nodes or 0, "nnue_top": nnue_top,
+                             "position_cmd": _pos})
             _dl_ms = max(0.001, float(getattr(cfg, "arbiter_deadline_ms", 30)) / 1000.0)
             _av = _arb.judge(ctx, _cands, _scalars, deadline_s=_dl_ms)
     except Exception as _ae:
@@ -25005,9 +25012,16 @@ def _u_finalize(st):
                      "nodes": st.nodes},
                 ],
                 "gp": st.gp, "eff_s": st.eff_s, "rem_ms": st.clock_rem_ms,
-                "move_count": st.move_count, "ply": st.move_count,
+                "move_count": st.move_count,
                 "label": getattr(v, "label", None),
+                # [COUNCIL-V2] 実戦の候補は学習分布として最も正しい行。label が読める版を刻み
+                #   (旧: oracle_ver 無し → label が黙って skip、synth の退避で巻き添え)、
+                #   特徴は実行時と同じ関数で記録する。
+                "game_id": _ARB_LIVE_GAME_ID[0],
+                "oracle_ver": _ARB_ORACLE_VER,
             }
+            if _pos:
+                _rec.update(_arb_scalars_for_position(_pos, ctx.cfg))
             _atomic_append(_ARBITER_SAMPLES_PATH,
                            json.dumps(_rec, ensure_ascii=False, default=str) + "\n",
                            lock=_arbiter_sample_lock, fsync=False, os_write=True)
@@ -27966,6 +27980,7 @@ def _locked_usinewgame(lock, eng, label: str) -> None:
 _usinewgame_last_t = [0.0]
 
 def _handle_usinewgame(ctx, line):
+    _ARB_LIVE_GAME_ID[0] = "live-%d-%d" % (os.getpid(), int(time.time() * 1000))
     # [P6-6] 7s 以内の二重 usinewgame (grid pre-setup + 本番) をスキップ。
     _now_ung = time.perf_counter()
     if _now_ung - _usinewgame_last_t[0] < 7.0 and _usinewgame_last_t[0] > 0:
@@ -35826,6 +35841,44 @@ def _arb_pv_list(pv):
         return []
 
 
+def _arb_pv_after_move(move, pv):
+    """[COUNCIL-V2] 候補手 move を指した後の局面から続く PV (相手の応手から)。
+
+    NNUE full_pv / オラクル pv は先頭が候補手そのもの。旧実装は root に候補手を
+    指した b1 へ PV 全体を再適用し、候補手を 2 回指していた (SvBoard は合法性を
+    検査しない: "7g7f" → pv "7g7f 3c3d" で 7f の歩が消え手番もずれる)。
+    先頭が move と一致するときだけ落とす。相手の応手が同じ USI 文字列になることは
+    無い (移動元は今空いた升 / 打ち先は今埋まった升)。"""
+    pv = _arb_pv_list(pv)
+    if pv and move and pv[0] == move:
+        return pv[1:]
+    return pv
+
+
+_ARB_OFFLINE_CFG = None
+
+
+def _arb_scalars_for_position(position_cmd, cfg=None):
+    """[COUNCIL-V2] 盤面だけで決まる裁定特徴 (gp_state / ply)。実行時 (_council_ballot) と
+    学習行 (arbiter-synth / _arb_shared_and_cands) が同じ値を得るための唯一の経路。
+    gp_state は child 合意 pull を含まない (オフラインでは child が無い)。"""
+    global _ARB_OFFLINE_CFG
+    out = {"gp_state": 0.0, "ply": 0}
+    try:
+        if cfg is None:
+            if _ARB_OFFLINE_CFG is None:
+                _ARB_OFFLINE_CFG = EngineConfig.from_cfg(_cfg)
+            cfg = _ARB_OFFLINE_CFG
+        out["gp_state"] = float(_calc_game_phase(position_cmd, cfg))
+    except Exception:
+        pass
+    try:
+        out["ply"] = int(_count_moves(position_cmd))
+    except Exception:
+        pass
+    return out
+
+
 def _svboard_from_position_cmd(pos):
     """USI position コマンド文字列 → SvBoard。set_sfen は startpos で trailing moves
     を無視する (L37054) ため、moves は自前で apply_usi する。パース不能なら None。"""
@@ -35875,7 +35928,7 @@ class ArbCand:
 @dataclasses.dataclass
 class ArbiterVerdict:
     move: str                 # 採用手 (棄権時は nnue_top)
-    p_win_pairwise: float     # 勝者の対 runner-up ペアワイズ勝率
+    p_win_pairwise: float     # 勝者 ≠ NNUE: P(勝者 > NNUE 手) / 勝者 = NNUE: 対他候補の最小ペア確率
     q_values: dict            # {move: q}  (Tier-T のみ。Tier-S は空)
     abstained: bool
     tier: str                 # 'scalar' | 'trunk'
@@ -35884,7 +35937,7 @@ class ArbiterVerdict:
 
 
 class SvArbiter:
-    """[SV-ARBITER §2.1/§2.2] 学習済み裁定ネットで council を置換する判定器。
+    """[SV-ARBITER §2.1/§2.2 → COUNCIL-V2 2026-10-17] 学習済み裁定ネットで council を置換する判定器。
 
     二層ランキング:
       Tier-S (scalar, 既定): スカラー特徴のみ → 純 numpy MLP。ONNX 呼び出しなし・
@@ -35892,19 +35945,32 @@ class SvArbiter:
       Tier-T (trunk): 追加で arbiter.onnx (平面トランク) から q=(1-λ)V(s1)+λV(sL)
         と root policy π を取り、[q_i,q_j,π_i,π_j] を連結して MLP に流す。
 
-    特徴レイアウト (学習と共有 — _shared_features/_cand_scalars/_pair_vec が唯一の
-    情報源。arbiter_head.npz はこのレイアウトで学習された重み):
-      shared(6) = [gp, tanh(eff_s/10), clip(rem_ratio,0,1), tanh(move_count/80),
-                   tanh(nnue_depth/30), log10(nnue_nodes+1)/8]
-      cand(4)   = [tanh(cp/1200), onehot(nnue), onehot(dl1), onehot(seed)]
-      pair-S(14)= shared(6) + cand_i(4) + cand_j(4)
-      pair-T(18)= pair-S(14) + [q_i, q_j, π_i, π_j]
+    特徴契約 v2 (FEAT_VER。学習と共有 — _shared_features/_cand_scalars/_pair_vec が
+    唯一の情報源。arbiter_head.npz の meta_feat_ver と一致しない head は読まない):
+      shared(5) = [gp_state, tanh(eff_s/10), tanh(ply/80), tanh(nnue_depth/30),
+                   log10(nnue_nodes+1)/8]
+      cand(5)   = [tanh(cp/1200), tanh(depth/30), onehot(nnue), onehot(dl1), onehot(seed)]
+      pair-S(15)= shared(5) + cand_i(5) + cand_j(5)
+      pair-T(19)= pair-S(15) + [q_i, q_j, π_i, π_j]
+    v1 からの変更理由 (v1 head は学習/実行の分布が食い違うため破棄):
+      - v1 の学習行 (arbiter-synth) は gp/rem_ms/move_count=None・nnue depth/nodes 未記録
+        = 学習時は常に 0、実行時は実値 → 実行時入力が常に学習分布外だった。
+      - rem_ms は学習データ側で再現できない (ラベルが持ち時間に依存しない) ので廃止。
+      - gp_state は child 合意 pull を含まない盤面 GP (_calc_game_phase(pos, cfg))。
+        学習/実行とも同じ関数で計算する。ply = _count_moves(pos)。
+      - 候補ごとの探索深さ (cp の信頼度) を追加。
     ペア logit を反対称化 l_ij=(f(i,j)-f(j,i))/2、score_i=Σ_j l_ij で Bradley-Terry。
+    覆し判定は「勝者 vs NNUE 手」のペア確率 (旧: 勝者 vs 次点。3 候補時に DL vs seed の
+    確率で NNUE を覆していた)。head の学習時に見ていない source (例: seed) は候補から外す。
 
     視点規約 (罠 §2.2-3): value 出力は sigmoid 後、board.side==1 で 1-v (→先手勝率、
     _SvInfer と同一)。裁定側でさらに root.side==1 なら 1-v (→我々手番勝率)。
     PV 長偶奇の cp 符号反転 (DL3代弁 L26xxx) は持ち込まない (二重反転事故)。
+    PV 末端は _arb_pv_after_move (候補手を 2 回指さない) で作る。
     """
+    FEAT_VER = 2
+    N_SHARED = 5
+    N_CAND = 5
     _SRC_ONEHOT = {"nnue": (1.0, 0.0, 0.0), "dl1": (0.0, 1.0, 0.0), "seed": (0.0, 0.0, 1.0)}
 
     def __init__(self):
@@ -35918,6 +35984,11 @@ class SvArbiter:
         self._out_idx = {}       # output name -> index
         self._trunk_ok = False
         self._np = None
+        self.sources = ("nnue", "dl1")   # head が学習時に見た source
+        self.lam = None                  # head 学習時の Tier-T λ (None = cfg)
+        self.tau = None                  # arbiter_tau.json (head 一致時のみ) の基準 τ
+        self.head_sha = None
+        self.gp_range = None             # head 学習行の gp_state 範囲 (1..99 %ile)
 
     # ── ロード ──────────────────────────────────────────────
     def load(self, cfg=None):
@@ -35934,6 +36005,7 @@ class SvArbiter:
             here = _svonnx_here()
             self._head_s, self._head_t = self._load_heads(
                 os.path.join(here, "arbiter_head.npz"))
+            self._load_tau(os.path.join(here, "arbiter_tau.json"))
             model = "arbiter.onnx"
             try:
                 if cfg is not None:
@@ -35941,7 +36013,7 @@ class SvArbiter:
             except Exception:
                 pass
             mpath = model if os.path.isabs(model) else os.path.join(here, model)
-            if os.path.isfile(mpath):
+            if os.path.isfile(mpath) and self._head_t is not None:
                 try:
                     r = _svonnx_load_session(mpath)
                     if r is not None:
@@ -35954,54 +36026,102 @@ class SvArbiter:
             # ok = Tier-S ヘッドが揃っていること (Tier-T トランクは任意)
             self.ok = self._head_s is not None
             if not self.ok:
-                _flog("[SvArbiter] arbiter_head.npz 不在/不正 — judge()=None "
-                      "(既存 council で稼働)")
+                _flog("[SvArbiter] arbiter_head.npz 不在/不正/旧契約 — judge()=None "
+                      "(NNUE 単騎 fallback)")
             else:
-                _flog("[SvArbiter] 有効化 (Tier-S=%s / Tier-T trunk=%s)"
-                      % (self._head_s is not None,
-                         self._trunk_ok and self._head_t is not None))
+                _flog("[SvArbiter] 有効化 (feat v%d, Tier-S=%s / Tier-T trunk=%s, sources=%s, tau=%s)"
+                      % (self.FEAT_VER, self._head_s is not None,
+                         self._trunk_ok and self._head_t is not None,
+                         ",".join(self.sources), self.tau))
             return self.ok
 
     def _load_heads(self, npz_path):
         if not os.path.isfile(npz_path):
             return None, None
         try:
-            d = self._np.load(npz_path)
+            import hashlib as _hl
+            with open(npz_path, "rb") as fh:
+                self.head_sha = _hl.sha256(fh.read()).hexdigest()
+            with self._np.load(npz_path) as _z:   # 実体化して即 close (Windows で再学習の os.replace を塞がない)
+                d = {k: _z[k] for k in _z.files}
+            ver = int(d["meta_feat_ver"]) if "meta_feat_ver" in d else 1
+            if ver != self.FEAT_VER:
+                _flog("[SvArbiter] arbiter_head.npz は特徴契約 v%d (現行 v%d) — 読まない。"
+                      " v1 は学習行の gp/rem/ply/depth/nodes が 0 固定で実行時入力が分布外。"
+                      " arbiter-synth → arbiter-label → arbiter-train で作り直す" % (ver, self.FEAT_VER))
+                return None, None
+            if "meta_sources" in d:
+                self.sources = tuple(str(d["meta_sources"]).split(","))
+            if "meta_lambda" in d:
+                self.lam = float(d["meta_lambda"])
+            if "meta_gp_lo" in d and "meta_gp_hi" in d:
+                self.gp_range = (float(d["meta_gp_lo"]), float(d["meta_gp_hi"]))
 
-            def _mlp(prefix):
+            def _mlp(prefix, din):
                 layers, i = [], 0
                 while ("%s_W%d" % (prefix, i)) in d:
                     layers.append((d["%s_W%d" % (prefix, i)].astype("float32"),
                                    d["%s_b%d" % (prefix, i)].astype("float32")))
                     i += 1
+                if layers and layers[0][0].shape[0] != din:
+                    _flog("[SvArbiter] head %s 入力次元 %d ≠ %d — 破棄"
+                          % (prefix, layers[0][0].shape[0], din))
+                    return None
                 return layers or None
 
-            return _mlp("s"), _mlp("t")
+            n_s = self.N_SHARED + 2 * self.N_CAND
+            return _mlp("s", n_s), _mlp("t", n_s + 4)
         except Exception as e:
             _flog("[SvArbiter] head load 失敗: %r" % e)
             return None, None
 
+    def _load_tau(self, path):
+        """arbiter-tau の較正結果。対象 head の sha256 が今の head と一致するときだけ使う
+        (旧実装は json を書くだけで実行時は誰も読まず、較正が効いていなかった)。"""
+        self.tau = None
+        if not (self.head_sha and os.path.isfile(path)):
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                j = json.load(fh)
+            if j.get("head_sha256") == self.head_sha:
+                self.tau = float(j["Arbiter_Override_Tau"])
+            else:
+                _flog("[SvArbiter] arbiter_tau.json は別 head 用 — cfg の τ を使う")
+        except Exception as e:
+            _flog("[SvArbiter] arbiter_tau.json 読込失敗: %r" % e)
+
     # ── 特徴 (学習と共有する唯一の実装) ─────────────────────
-    @staticmethod
-    def _shared_features(scalars):
+    @classmethod
+    def _shared_features(cls, scalars):
         import math as _m
-        gp = float(scalars.get("gp", 0.0) or 0.0)
-        eff_s = float(scalars.get("eff_s", 0.0) or 0.0)
-        rem_ms = float(scalars.get("rem_ms", 0.0) or 0.0)
-        rem = max(0.0, min(1.0, _m.log10(max(1.0, rem_ms)) / 6.0))  # rem_ms→[0,1] 対数正規化
-        mc = float(scalars.get("move_count", 0.0) or 0.0)
-        nd = float(scalars.get("nnue_depth", 0.0) or 0.0)
-        nn = float(scalars.get("nnue_nodes", 0.0) or 0.0)
-        return [gp, _m.tanh(eff_s / 10.0), rem,
-                _m.tanh(mc / 80.0), _m.tanh(nd / 30.0),
-                _m.log10(max(0.0, nn) + 1.0) / 8.0]
+
+        def _f(k):
+            try:
+                return float(scalars.get(k) or 0.0)
+            except Exception:
+                return 0.0
+        gp = _f("gp_state")
+        eff_s = _f("eff_s")
+        ply = _f("ply")
+        nd = _f("nnue_depth")
+        nn = _f("nnue_nodes")
+        return [gp, _m.tanh(eff_s / 10.0), _m.tanh(ply / 80.0),
+                _m.tanh(nd / 30.0), _m.log10(max(0.0, nn) + 1.0) / 8.0]
 
     @classmethod
     def _cand_scalars(cls, c):
         import math as _m
-        tcp = _m.tanh(float(c.cp) / 1200.0) if c.cp is not None else 0.0
+        try:
+            tcp = _m.tanh(float(c.cp) / 1200.0) if c.cp is not None else 0.0
+        except Exception:
+            tcp = 0.0
+        try:
+            tdp = _m.tanh(float(c.depth) / 30.0) if c.depth is not None else 0.0
+        except Exception:
+            tdp = 0.0
         oh = cls._SRC_ONEHOT.get(c.source, (0.0, 0.0, 0.0))
-        return [tcp, oh[0], oh[1], oh[2]]
+        return [tcp, tdp, oh[0], oh[1], oh[2]]
 
     def _pair_vec(self, shared, ci_s, cj_s, i, j, q_by, pi_by, use_trunk):
         v = list(shared) + list(ci_s) + list(cj_s)
@@ -36020,6 +36140,50 @@ class SvArbiter:
                 h = _np.maximum(h, 0.0)
         return float(h.reshape(-1)[0])
 
+    def rank(self, head, shared, cand_s, q_by=None, pi_by=None, use_trunk=False):
+        """全ペアの反対称 logit → (score[i], pw[i][j]=P(i が j より良い))。
+        judge / arbiter-tau / arbiter-eval / arbiter-collect が共有する唯一の順位付け。"""
+        import math as _m
+        q_by = q_by or {}
+        pi_by = pi_by or {}
+        n = len(cand_s)
+        score = [0.0] * n
+        pw = [[0.5] * n for _ in range(n)]
+        for i in range(n):
+            for j in range(i + 1, n):
+                fij = self._mlp_forward(head, self._pair_vec(shared, cand_s[i], cand_s[j],
+                                                             i, j, q_by, pi_by, use_trunk))
+                fji = self._mlp_forward(head, self._pair_vec(shared, cand_s[j], cand_s[i],
+                                                             j, i, q_by, pi_by, use_trunk))
+                lij = 0.5 * (fij - fji)
+                p = 1.0 / (1.0 + _m.exp(-max(-60.0, min(60.0, lij))))
+                pw[i][j], pw[j][i] = p, 1.0 - p
+                score[i] += lij
+                score[j] -= lij
+        return score, pw
+
+    @staticmethod
+    def decide(score, pw, base_idx, tau_eff):
+        """勝者 wi と覆し判定。勝者 ≠ base (NNUE) なら P(勝者 > base) > τ のときだけ覆す。
+        戻り: (採用 index, 勝者 index, p_vs_base, abstained)。"""
+        n = len(score)
+        wi = max(range(n), key=lambda k: score[k])
+        if base_idx is None or wi == base_idx:
+            others = [k for k in range(n) if k != wi]
+            p = min(pw[wi][k] for k in others) if others else 1.0
+            return wi, wi, p, False
+        p = pw[wi][base_idx]
+        if p <= tau_eff:
+            return base_idx, wi, p, True
+        return wi, wi, p, False
+
+    def tau_eff(self, cfg, gp):
+        base_tau = self.tau if self.tau is not None else float(
+            getattr(cfg, "arbiter_override_tau", 0.62) or 0.62)
+        slope = float(getattr(cfg, "arbiter_tau_gp_slope", 0.25) or 0.0)
+        onset = float(getattr(cfg, "arbiter_tau_gp_onset", 0.6) or 0.0)
+        return min(1.0, max(0.0, base_tau + slope * max(0.0, float(gp or 0.0) - onset)))
+
     # ── Tier-T トランク推論 (arbiter.onnx で q/π) ──────────
     def _compute_trunk(self, ctx, cands, scalars, q_by, pi_by, cfg, deadline_s, t0):
         import time as _time, math as _m
@@ -36031,7 +36195,7 @@ class SvArbiter:
         if root is None:
             return False
         root_side = int(root.side)
-        lam = float(getattr(cfg, "arbiter_lambda", 0.5) or 0.0)
+        lam = self.lam if self.lam is not None else float(getattr(cfg, "arbiter_lambda", 0.5) or 0.0)
         pv_cap = int(getattr(cfg, "arbiter_pv_cap", 12) or 12)
         boards = [root]
         root_idx = 0
@@ -36044,7 +36208,7 @@ class SvArbiter:
                 return False
             s1_idx[ci] = len(boards)
             boards.append(b1)
-            pv = _arb_pv_list(c.pv)
+            pv = _arb_pv_after_move(c.move, c.pv)
             if pv:
                 bl = b1.clone()
                 applied = 0
@@ -36098,13 +36262,31 @@ class SvArbiter:
 
     # ── 裁定 ───────────────────────────────────────────────
     def judge(self, ctx, cands, scalars, deadline_s=0.030):
-        import time as _time, math as _m
+        import time as _time
         t0 = _time.perf_counter()
         if not self.ok or not cands:
             return None
         try:
             cfg = getattr(ctx, "cfg", None)
             gp = float(scalars.get("gp", 0.0) or 0.0)
+            nnue_top = scalars.get("nnue_top")
+            # head が学習時に見ていない source は順位付けできない (学習分布外) → 外す。
+            cands = [c for c in cands if c.source in self.sources]
+            if len(cands) < 2:
+                mv = nnue_top or (cands[0].move if cands else None)
+                if mv is None:
+                    return None
+                return ArbiterVerdict(move=mv, p_win_pairwise=1.0, q_values={},
+                                      abstained=False, tier="scalar", tau_eff=0.0,
+                                      latency_ms=(_time.perf_counter() - t0) * 1000.0)
+            # 学習行の盤面 GP 範囲外 (例: 互角局面集 ply24/32 だけで学習した head に終盤局面)
+            # は外挿になる → NNUE を覆さない。
+            _gps = scalars.get("gp_state")
+            if (self.gp_range is not None and _gps is not None and nnue_top
+                    and not (self.gp_range[0] - 0.1 <= float(_gps) <= self.gp_range[1] + 0.1)):
+                return ArbiterVerdict(move=nnue_top, p_win_pairwise=0.5, q_values={},
+                                      abstained=True, tier="ood", tau_eff=1.0,
+                                      latency_ms=(_time.perf_counter() - t0) * 1000.0)
             tier = str(getattr(cfg, "arbiter_feature_tier", "scalar") or "scalar")
             gp_switch = float(getattr(cfg, "arbiter_tier_gp_switch", 0.0) or 0.0)
             if gp_switch > 0.0 and gp >= gp_switch:
@@ -36124,43 +36306,18 @@ class SvArbiter:
                         return None
             shared = self._shared_features(scalars)
             cand_s = [self._cand_scalars(c) for c in cands]
-            n = len(cands)
-
-            def _pl(i, j):
-                return self._mlp_forward(
-                    head, self._pair_vec(shared, cand_s[i], cand_s[j], i, j,
-                                         q_by, pi_by, use_trunk))
-
-            score = [0.0] * n
-            pw = [[0.5] * n for _ in range(n)]
-            for i in range(n):
-                for j in range(n):
-                    if i == j:
-                        continue
-                    lij = 0.5 * (_pl(i, j) - _pl(j, i))
-                    pw[i][j] = 1.0 / (1.0 + _m.exp(-max(-60.0, min(60.0, lij))))
-                    score[i] += lij
-                if (_time.perf_counter() - t0) > deadline_s:
-                    return None
-            wi = max(range(n), key=lambda k: score[k])
-            others = [k for k in range(n) if k != wi]
-            ru = max(others, key=lambda k: score[k]) if others else wi
-            p_win = pw[wi][ru] if others else 1.0
-            base_tau = float(getattr(cfg, "arbiter_override_tau", 0.62) or 0.62)
-            slope = float(getattr(cfg, "arbiter_tau_gp_slope", 0.25) or 0.0)
-            onset = float(getattr(cfg, "arbiter_tau_gp_onset", 0.6) or 0.0)
-            tau_eff = min(1.0, max(0.0, base_tau + slope * max(0.0, gp - onset)))
-            nnue_top = scalars.get("nnue_top")
-            winner_move = cands[wi].move
-            abstained = False
-            if nnue_top is not None and winner_move != nnue_top and p_win <= tau_eff:
-                winner_move = nnue_top
-                abstained = True
+            score, pw = self.rank(head, shared, cand_s, q_by, pi_by, use_trunk)
+            if (_time.perf_counter() - t0) > deadline_s:
+                return None
+            base_idx = next((k for k, c in enumerate(cands) if c.move == nnue_top), None)
+            tau_eff = self.tau_eff(cfg, gp)
+            pick, _wi, p_win, abstained = self.decide(score, pw, base_idx, tau_eff)
             latency_ms = (_time.perf_counter() - t0) * 1000.0
             if latency_ms > deadline_s * 1000.0:
                 return None
+            n = len(cands)
             q_out = {cands[k].move: q_by.get(k) for k in range(n)} if use_trunk else {}
-            return ArbiterVerdict(move=winner_move, p_win_pairwise=float(p_win),
+            return ArbiterVerdict(move=cands[pick].move, p_win_pairwise=float(p_win),
                                   q_values=q_out, abstained=abstained,
                                   tier=("trunk" if use_trunk else "scalar"),
                                   tau_eff=float(tau_eff), latency_ms=float(latency_ms))
@@ -58609,11 +58766,13 @@ def _teach_gp_counts(sb):
 # 全て frozen 委譲サブプロセス / システム Python 上で実行する (対局プロセスに torch を
 # import させない — 罠 §6-7)。torch は各 main 内で局所 import。データ契約:
 #   arbiter_samples.jsonl : sampler (§3.2) 出力 = {sfen,cands:[{move,source,pv,cp,depth,nodes}],
-#                           gp,eff_s,rem_ms,move_count,ply,...}
-#   arbiter_labeled.jsonl : label 出力 = sample + {y:勝者index, w:重み, bucket:'G'|'D',
-#                           wr:[WR_oracle...], sharp_true:float|None}
+#                           gp_state,ply,eff_s,game_id,oracle_ver,...}  (候補は eff_s 秒の探索結果)
+#   arbiter_labeled.jsonl : label 出力 = sample + {y:合意勝者index, w, bucket:'G'|'D',
+#                           wr_nn:[..], wr_dl:[..], wr:[合意..]}  (勝率は我々手番視点)
 #   arbiter.onnx          : trunk (value,gp,policy,sharp 名前付き) — _svonnx_export_ckpt(arbiter=True)
-#   arbiter_head.npz      : s_W{i}/s_b{i} (Tier-S, 14入力) + t_W{i}/t_b{i} (Tier-T, 18入力)
+#   arbiter_head.npz      : s_W{i}/s_b{i} (Tier-S, 15入力) + t_W{i}/t_b{i} (Tier-T, 19入力)
+#                           + meta_feat_ver / meta_sources / meta_lambda (COUNCIL-V2)
+#   arbiter_tau.json      : 基準 τ + head_sha256 (一致する head にだけ実行時適用)
 # 特徴レイアウトは SvArbiter._shared_features/_cand_scalars が唯一の情報源 (runtime と共有)。
 
 
@@ -58633,10 +58792,16 @@ def _arb_iter_jsonl(path):
 
 
 def _arb_shared_and_cands(sample):
-    """sample → (shared 特徴 list, [ArbCand,...])。runtime と同一レイアウト。"""
-    scal = {"gp": sample.get("gp", 0.0), "eff_s": sample.get("eff_s", 0.0),
-            "rem_ms": sample.get("rem_ms", 0.0), "move_count": sample.get("move_count", 0.0),
-            "nnue_depth": 0, "nnue_nodes": 0}
+    """sample → (shared 特徴 list, [ArbCand,...])。runtime と同一レイアウト (特徴契約 v2)。
+    gp_state / ply は行に無ければ sfen から _arb_scalars_for_position で計算する
+    (実行時 _council_ballot と同じ関数)。"""
+    pos = sample.get("sfen") or "startpos"
+    scal = {"eff_s": sample.get("eff_s", 0.0), "nnue_depth": 0, "nnue_nodes": 0}
+    if sample.get("gp_state") is not None and sample.get("ply") is not None:
+        scal["gp_state"] = sample.get("gp_state")
+        scal["ply"] = sample.get("ply")
+    else:
+        scal.update(_arb_scalars_for_position(pos))
     # nnue depth/nodes は候補側 (source=='nnue') から補完
     for c in sample.get("cands", []):
         if c.get("source") == "nnue":
@@ -58660,7 +58825,7 @@ def _arb_pair_np(np_, shared, cand_s_list, i, j, q=None, pi=None, use_t=False):
 
 def _arb_boards_for_sample(sample, pv_cap):
     """sample → (root SvBoard, [(cand_idx, s1 board, sL board|None, applied)])。
-    パース不能なら None。runtime _compute_trunk と同一構築。"""
+    パース不能なら None。runtime _compute_trunk と同一構築 (PV は _arb_pv_after_move)。"""
     root = _svboard_from_position_cmd(sample.get("sfen") or "startpos")
     if root is None:
         return None
@@ -58671,7 +58836,7 @@ def _arb_boards_for_sample(sample, pv_cap):
         except Exception:
             return None
         bl, applied = None, 0
-        pv = _arb_pv_list(c.get("pv"))
+        pv = _arb_pv_after_move(c.get("move"), c.get("pv"))
         if pv:
             bl = b1.clone()
             for mv in pv[:pv_cap]:
@@ -58685,39 +58850,177 @@ def _arb_boards_for_sample(sample, pv_cap):
     return root, per
 
 
+def _arb_consensus_wr(sample):
+    """候補ごとのオラクル勝率 (我々手番視点) の合意値。wr_nn / wr_dl の平均
+    (片方欠損なら残り)。旧行 (wr のみ = NNUE オラクル) は wr をそのまま使う。"""
+    n = len(sample.get("cands", []))
+    a = sample.get("wr_nn") if sample.get("wr_nn") is not None else sample.get("wr")
+    b = sample.get("wr_dl")
+    out = []
+    for k in range(n):
+        xs = [v[k] for v in (a, b)
+              if isinstance(v, (list, tuple)) and k < len(v) and v[k] is not None]
+        out.append(sum(xs) / len(xs) if xs else None)
+    return out
+
+
+def _arb_pair_targets(sample, sharpness=4.0):
+    """[COUNCIL-V2] 1 行 → 全候補ペア [(i, j, target P(i>j), weight)]。
+
+    旧実装は「候補 0 vs 1 の 1 ペア・y の hard label・w=|ΔWR| を 0.02..0.20 に clip」
+    だけを使い、(a) 3 候補行で y=2 (seed 勝ち) を「候補 1 の勝ち」と学習、(b) 第 2
+    オラクル (DL) の勝率を捨て、(c) 係争 (D) 行に確信行と同等の重み 0.15 を与えていた。
+    v2: 合意勝率から Bradley-Terry 整合の soft target
+        t_ij = σ(sharpness · (logit wr_i − logit wr_j))
+    を全ペアに付ける。重み: G (両オラクルの勝者一致) = 1、D (割れ) = 0.5。
+    勝率の無い旧行は y の hard label (y vs 他全候補) に縮退する。"""
+    import math as _m
+    n = len(sample.get("cands", []))
+    wr = _arb_consensus_wr(sample)
+    bw = 0.5 if sample.get("bucket") == "D" else 1.0
+    out = []
+
+    def _lg(p):
+        p = min(1.0 - 1e-4, max(1e-4, float(p)))
+        return _m.log(p / (1.0 - p))
+    if n >= 2 and all(v is not None for v in wr):
+        for i in range(n):
+            for j in range(i + 1, n):
+                z = sharpness * (_lg(wr[i]) - _lg(wr[j]))
+                out.append((i, j, 1.0 / (1.0 + _m.exp(-max(-60.0, min(60.0, z)))), bw))
+        return out
+    y = sample.get("y")
+    if y is None or not (0 <= int(y) < n):
+        return out
+    y = int(y)
+    w = float(sample.get("w", 0.1) or 0.1)
+    for k in range(n):
+        if k != y:
+            out.append((min(y, k), max(y, k), 1.0 if y < k else 0.0, w))
+    return out
+
+
+def _arb_group_key(r):
+    """train/val split の対局キー。game_id が無い行は sfen 全体 (旧: pos_hash 先頭 4 桁
+    = 別局面を 65536 群へ畳むだけで、同一対局の局面が train/val に跨っていた)。"""
+    return str(r.get("game_id") or r.get("sfen") or r.get("pos_hash") or "")
+
+
+def _arb_is_val(key, frac):
+    """キーのハッシュで決まる val 判定 (旧: ソート先頭 n_val 件 = 最初の互角局面集が丸ごと val)。"""
+    import hashlib as _hl
+    h = int(_hl.sha1(key.encode("utf-8")).hexdigest()[:8], 16)
+    return (h % 100000) < int(frac * 100000)
+
+
+def _arb_offline_metrics(arb, rows, cfg=None, tau=None, use_trunk=False, qpi=None):
+    """[COUNCIL-V2] 裁定の本来の目的 = 採用手の勝率。合意勝率 (wr) が全候補にある行で
+    regret = wr(最善) − wr(採用) の平均を、arbiter (τ 込み・実行時 decide と同一) /
+    NNUE 固定 / DL 固定 で並べる。順位一致率 top1 と、|ΔWR|≥0.02 のペア正答率も出す。"""
+    head = arb._head_t if use_trunk else arb._head_s
+    res = {"n": 0, "top1": 0, "pairs": 0, "pair_ok": 0,
+           "regret_arb": 0.0, "regret_nnue": 0.0, "regret_dl": 0.0, "override": 0}
+    for ri, r in enumerate(rows):
+        wr = _arb_consensus_wr(r)
+        if len(wr) < 2 or any(v is None for v in wr):
+            continue
+        shared, cands = _arb_shared_and_cands(r)
+        if any(c.source not in arb.sources for c in cands):
+            continue
+        cs = [SvArbiter._cand_scalars(c) for c in cands]
+        q, pi = (qpi[ri] if (use_trunk and qpi) else ({}, {}))
+        score, pw = arb.rank(head, shared, cs, q, pi, use_trunk)
+        base = next((k for k, c in enumerate(cands) if c.source == "nnue"), 0)
+        dl = next((k for k, c in enumerate(cands) if c.source == "dl1"), None)
+        gp = r.get("gp_state") if r.get("gp_state") is not None else shared[0]
+        t_eff = (arb.tau_eff(cfg, gp) if tau is None else tau)
+        pick, wi, _p, _ab = SvArbiter.decide(score, pw, base, t_eff)
+        best = max(range(len(wr)), key=lambda k: wr[k])
+        res["n"] += 1
+        res["top1"] += int(wi == best)
+        res["override"] += int(pick != base)
+        res["regret_arb"] += wr[best] - wr[pick]
+        res["regret_nnue"] += wr[best] - wr[base]
+        res["regret_dl"] += wr[best] - wr[dl if dl is not None else base]
+        for i in range(len(wr)):
+            for j in range(i + 1, len(wr)):
+                if abs(wr[i] - wr[j]) >= 0.02:
+                    res["pairs"] += 1
+                    res["pair_ok"] += int((pw[i][j] > 0.5) == (wr[i] > wr[j]))
+    n = max(1, res["n"])
+    for k in ("regret_arb", "regret_nnue", "regret_dl"):
+        res[k] = res[k] / n
+    res["top1_rate"] = res["top1"] / n
+    res["override_rate"] = res["override"] / n
+    res["pair_acc"] = res["pair_ok"] / max(1, res["pairs"])
+    return res
+
+
+def _arb_fmt_metrics(tag, m):
+    return ("[%s] N=%d top1=%.3f pair_acc=%.3f (pairs=%d) override=%.3f | "
+            "mean WR regret: arbiter=%.4f nnue=%.4f dl=%.4f"
+            % (tag, m["n"], m["top1_rate"], m["pair_acc"], m["pairs"], m["override_rate"],
+               m["regret_arb"], m["regret_nnue"], m["regret_dl"]))
+
+
+def _arb_from_layers(np_, head_s, head_t=None, sources=("nnue", "dl1"), lam=None):
+    """学習中の numpy 重みから実行時と同一の SvArbiter を組む (評価経路を 1 本にする)。"""
+    arb = SvArbiter()
+    arb._np = np_
+    arb._loaded = True
+    arb._head_s, arb._head_t = head_s, head_t
+    arb.sources = tuple(sources)
+    arb.lam = lam
+    arb.ok = head_s is not None
+    return arb
+
+
 def sv_arbiter_train_main(rest):
-    """[SV-ARBITER §3.4] arbiter-train: labeled JSONL からトランク微調整 + ランキング
-    ヘッド (arb_head_s/arb_head_t) を並行学習し、arbiter.onnx + arbiter_head.npz を出力。
-    損失 L = 1.0*L_rank(Bradley-Terry) + 0.5*L_val(WR蒸留) + 0.25*L_pol(CE)。トランクは
-    lr/10、arb_head はフル lr。held-out で Δ(trunk)=一致率(T)-一致率(S) を報告する。"""
+    """[SV-ARBITER §3.4 → COUNCIL-V2] arbiter-train: labeled JSONL → arbiter_head.npz
+    (+ 任意で arbiter.onnx)。
+
+    Tier-S: 全行・全候補ペアの特徴を一度に行列化し、soft Bradley-Terry 損失
+      (_arb_pair_targets) をミニバッチで学習 (旧: 1 行 1 ペアずつ逐次・y の hard label)。
+    Tier-T: base トランク (vision checkpoint) がある時だけ。1 行ずつトランクを通し
+      L = L_rank(全ペア soft BT) + 0.5 L_val(合意勝率蒸留) + 0.25 L_pol(最善手 CE)。
+      base が無い時は旧実装のようにランダム初期化トランクで学習しない (Tier-T 不出力)。
+    評価は実行時と同一の SvArbiter.rank/decide で、val の WR regret を NNUE 固定と比べる。
+    出力 npz に特徴契約 (meta_feat_ver)・学習時 source・λ を刻む。"""
     import argparse
     import torch
     import torch.nn as nn
     ap = argparse.ArgumentParser(prog="arbiter-train")
     ap.add_argument("--data", default=os.path.join(_BASE_DIR, "arbiter_labeled.jsonl"))
     ap.add_argument("--base", default=os.path.join(_svonnx_here(), "model.infer.pt"),
-                    help="トランク凍結初期値 (vision checkpoint)")
+                    help="Tier-T トランク初期値 (vision checkpoint)。無ければ Tier-S のみ")
     ap.add_argument("--out", default=os.path.join(_svonnx_here(), "arbiter"))
-    ap.add_argument("--epochs", type=int, default=8)
+    ap.add_argument("--epochs", type=int, default=8, help="Tier-T エポック")
+    ap.add_argument("--head-epochs", type=int, default=300, help="Tier-S エポック")
+    ap.add_argument("--head-batch", type=int, default=512)
     ap.add_argument("--lr", type=float, default=1e-3)
+    ap.add_argument("--lambda", dest="lam", type=float, default=0.5,
+                    help="Tier-T q の PV 末端混合 λ (npz に刻み実行時も同値)")
+    ap.add_argument("--target-sharpness", type=float, default=4.0,
+                    help="soft target σ(k·Δlogit WR) の k")
     ap.add_argument("--pv-cap", type=int, default=12)
     ap.add_argument("--ch", type=int, default=64)
     ap.add_argument("--blocks", type=int, default=5)
     ap.add_argument("--val-frac", type=float, default=0.1)
+    ap.add_argument("--no-trunk", action="store_true", help="Tier-S のみ学習")
+    ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--batch", type=int, default=0,
-                    help="勾配蓄積バッチ (0=auto: VRAM>=8GB→32, else 16)")
+                    help="Tier-T 勾配蓄積バッチ (0=auto: VRAM>=8GB→32, else 16)")
     a = ap.parse_args(rest)
+    torch.manual_seed(a.seed)
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     _np = _arb_ensure_np()
     _grad_accum = a.batch
     if _grad_accum <= 0:
-        try:
-            _vram_gb = torch.cuda.get_device_properties(0).total_mem / (1 << 30) if dev == "cuda" else 0
+        try:   # 属性名は total_memory (旧 total_mem は AttributeError → 常に 16 だった)
+            _vram_gb = torch.cuda.get_device_properties(0).total_memory / (1 << 30) if dev == "cuda" else 0
         except Exception:
             _vram_gb = 0
         _grad_accum = 32 if _vram_gb >= 8 else 16
-    # [ARB-PERF 2026-07-17] tatara 知見: TF32 matmul + cudnn autotune (入力形状固定) +
-    # autocast fp16 (trunk forward) + GradScaler。学習数学は不変 — 演算精度経路のみ。
     _amp = (dev == "cuda")
     if _amp:
         torch.backends.cudnn.benchmark = True
@@ -58732,260 +59035,309 @@ def sv_arbiter_train_main(rest):
         _scaler = torch.cuda.amp.GradScaler(enabled=_amp)
 
     # ── データ (対局単位 split でリーク防止) ──
-    rows = [r for r in _arb_iter_jsonl(a.data) if r.get("y") is not None
-            and len(r.get("cands", [])) >= 2]
+    rows = [r for r in _arb_iter_jsonl(a.data) if len(r.get("cands", [])) >= 2
+            and _arb_pair_targets(r, a.target_sharpness)]
     if not rows:
         print("[arbiter-train] 教師 0 行 — %s を先に生成 (arbiter-label)" % a.data); return
-    # 対局キー: game_id あれば使用、無ければ pos_hash 前半で近似
-    def _gkey(r):
-        return r.get("game_id") or (r.get("pos_hash") or "")[:4]
-    keys = sorted({_gkey(r) for r in rows})
-    n_val = max(1, int(len(keys) * a.val_frac))
-    val_keys = set(keys[:n_val])
-    tr = [r for r in rows if _gkey(r) not in val_keys]
-    va = [r for r in rows if _gkey(r) in val_keys]
-    print("[arbiter-train] train=%d val=%d (games=%d, val_games=%d) batch=%d"
-          % (len(tr), len(va), len(keys), len(val_keys), _grad_accum))
+    tr = [r for r in rows if not _arb_is_val(_arb_group_key(r), a.val_frac)]
+    va = [r for r in rows if _arb_is_val(_arb_group_key(r), a.val_frac)]
+    if not tr:
+        tr, va = va, []
+    sources = sorted({c.get("source", "nnue") for r in tr for c in r.get("cands", [])},
+                     key=lambda s: ("nnue", "dl1", "seed").index(s) if s in ("nnue", "dl1", "seed") else 9)
+    print("[arbiter-train] train=%d val=%d (groups=%d) sources=%s dev=%s"
+          % (len(tr), len(va), len({_arb_group_key(r) for r in rows}), ",".join(sources), dev),
+          flush=True)
 
-    # ── モデル: トランク (v3, arb=True) + ranking heads ──
-    trunk = _sv_build_model(ch=a.ch, blocks=a.blocks, ver=3, in_ch=sv_N_PLANES, arb=True)
-    if os.path.isfile(a.base):
-        try:
-            _ck = torch.load(a.base, map_location="cpu", weights_only=False)
-            _sd = (_ck.get("ema") or _ck.get("model") or _ck) if isinstance(_ck, dict) else _ck
-            trunk.load_state_dict(_sd, strict=False)   # sharp_head は新規 = strict False
-            print("[arbiter-train] base trunk loaded: %s" % a.base)
-        except Exception as e:
-            print("[arbiter-train] base load 失敗 (ランダム初期化で継続): %r" % e)
-    trunk = trunk.to(dev)
+    n_s = SvArbiter.N_SHARED + 2 * SvArbiter.N_CAND
 
     def _mlp(din):
         return nn.Sequential(nn.Linear(din, 64), nn.ReLU(True),
                              nn.Linear(64, 64), nn.ReLU(True), nn.Linear(64, 1))
-    head_s = _mlp(14).to(dev)   # Tier-S: shared6+cand4+cand4
-    head_t = _mlp(18).to(dev)   # Tier-T: +q_i,q_j,pi_i,pi_j
-    _pgroups = [{"params": trunk.parameters(), "lr": a.lr / 10.0},
-                {"params": list(head_s.parameters()) + list(head_t.parameters()), "lr": a.lr}]
-    try:   # [ARB-PERF] fused AdamW (CUDA カーネル融合。非対応 torch は通常版へ)
-        opt = torch.optim.AdamW(_pgroups, weight_decay=1e-4, fused=_amp)
-    except (TypeError, RuntimeError):
-        opt = torch.optim.AdamW(_pgroups, weight_decay=1e-4)
 
-    def _pair_logit(head, shared, cand_s, i, j, q, pi, use_t):
-        fi = torch.tensor(_arb_pair_np(_np, shared, cand_s, i, j, q, pi, use_t), device=dev)
-        fj = torch.tensor(_arb_pair_np(_np, shared, cand_s, j, i, q, pi, use_t), device=dev)
-        return 0.5 * (head(fi) - head(fj)).squeeze(-1)   # 反対称 logit (runtime と一致)
+    def _layers(head):
+        return [(m.weight.detach().cpu().numpy().T.astype("float32"),
+                 m.bias.detach().cpu().numpy().astype("float32"))
+                for m in head if isinstance(m, nn.Linear)]
 
-    def _trunk_qpi(sample):
-        """トランク eval 経路 (認識をスキップし平面直結) で s1v(微分可能・L_val 用) と
-        q/π(detach float・head_t 特徴用) と policy logits(L_pol 用) を得る。
-        ランキング loss は q/π を detach で受ける (トランクは L_val/L_pol 蒸留で微調整)。"""
-        bl = _arb_boards_for_sample(sample, a.pv_cap)
-        if bl is None:
-            return None
-        root, per = bl
-        boards = [root] + [x[1] for x in per] + [x[2] for x in per if x[2] is not None]
-        planes = torch.tensor(sv_encode_planes(
-            [b.cells for b in boards], [b.hand[0] + b.hand[1] for b in boards],
-            [b.side for b in boards]), device=dev)
-        with torch.autocast("cuda", dtype=torch.float16, enabled=_amp):
-            f = trunk.body(trunk.stem(planes))        # 平面直結 (認識部を通さない)
-            val = trunk.value_head(trunk.value_conv(f).flatten(1)).squeeze(1)
-            mv = trunk.move_head(f).flatten(2).permute(0, 2, 1).reshape(planes.shape[0], -1)
-            dr = trunk.drop_head(f).flatten(2).reshape(planes.shape[0], -1)
-            pol_logits = torch.cat([mv, dr], dim=1)
-        val = val.float(); pol_logits = pol_logits.float()   # 下流の loss 数学は fp32 のまま
-        pol = torch.softmax(pol_logits, dim=1)
-        root_side = int(root.side)
-
-        def _our(k):
-            v = torch.sigmoid(val[k])
-            if int(boards[k].side) == 1:
-                v = 1.0 - v
-            if root_side == 1:
-                v = 1.0 - v
-            return v
-        idx = 1
-        q, pi, s1v = {}, {}, {}
-        sl_ptr = 1 + len(per)
-        for (ci, b1, bl2, applied) in per:
-            v1 = _our(idx); idx += 1
-            s1v[ci] = v1                              # tensor (L_val 用)
-            if bl2 is not None:
-                vL = _our(sl_ptr); sl_ptr += 1
-                lam = 0.5 * min(1.0, applied / 8.0)
-                q[ci] = float(((1.0 - lam) * v1 + lam * vL).item())
-            else:
-                q[ci] = float(v1.item())
-            try:
-                lab = sv_usi_to_label(sample["cands"][ci]["move"])
-                pi[ci] = float(pol[0, lab].item()) if 0 <= lab < pol.shape[1] else 0.0
-            except Exception:
-                pi[ci] = 0.0
-        return q, pi, s1v, pol_logits
-
-    def _run(rows_, train=True):
-        agree_s = agree_t = tot = 0
-        loss_sum = 0.0
-        if train:
-            opt.zero_grad()
-        for _si, r in enumerate(rows_):
+    # ── Tier-S: 全ペア行列化 → ミニバッチ soft BT ──
+    def _pairs_matrix(rows_):
+        xi, xj, t, w = [], [], [], []
+        for r in rows_:
             shared, cands = _arb_shared_and_cands(r)
-            cand_s = [SvArbiter._cand_scalars(c) for c in cands]
-            y = int(r["y"]); w = float(r.get("w", 0.1))
-            i, j = 0, 1   # 教師は 2 候補ペア (nnue vs dl)
-            yt = torch.tensor(1.0 if y == i else 0.0, device=dev)
-            # Tier-S
-            ls = _pair_logit(head_s, shared, cand_s, i, j, None, None, False)
-            L_rank_s = w * nn.functional.binary_cross_entropy_with_logits(ls, yt)
-            # Tier-T + trunk distill
-            qp = _trunk_qpi(r)
-            L = L_rank_s
-            if qp is not None:
-                q, pi, s1v, pol_logits = qp
-                lt = _pair_logit(head_t, shared, cand_s, i, j, q, pi, True)
-                L_rank_t = w * nn.functional.binary_cross_entropy_with_logits(lt, yt)
-                # L_val: WR_oracle 蒸留 (bucket G のみ確度高 — w で調整済)
-                L_val = torch.tensor(0.0, device=dev)
-                wr = r.get("wr")
-                if isinstance(wr, (list, tuple)) and len(wr) >= 2:
-                    for ci in (i, j):
-                        if ci < len(wr) and wr[ci] is not None and ci in s1v:
-                            L_val = L_val + (s1v[ci] - float(wr[ci])) ** 2
-                # L_pol: oracle 勝者手の CE (root policy)
-                L_pol = torch.tensor(0.0, device=dev)
-                try:
-                    lab = sv_usi_to_label(cands[y].move)
-                    L_pol = -torch.log_softmax(pol_logits, dim=1)[0, lab]
-                except Exception:
-                    pass
-                L = 1.0 * (L_rank_s + L_rank_t) + 0.5 * L_val + 0.25 * L_pol
-                agree_t += int((lt.item() > 0) == (y == i))
-            agree_s += int((ls.item() > 0) == (y == i))
-            tot += 1
-            loss_sum += float(L.item())
-            if train:
-                _scaler.scale(L / _grad_accum).backward()
-                if (_si + 1) % _grad_accum == 0:
-                    _scaler.step(opt)
-                    _scaler.update()
-                    opt.zero_grad()
-        if train and len(rows_) % _grad_accum != 0:
-            _scaler.step(opt)
-            _scaler.update()
-        return (agree_s / max(1, tot), agree_t / max(1, tot), loss_sum / max(1, tot))
+            cs = [SvArbiter._cand_scalars(c) for c in cands]
+            for (i, j, tij, wij) in _arb_pair_targets(r, a.target_sharpness):
+                xi.append(_arb_pair_np(_np, shared, cs, i, j))
+                xj.append(_arb_pair_np(_np, shared, cs, j, i))
+                t.append(tij); w.append(wij)
+        if not t:
+            return None
+        return (torch.tensor(_np.stack(xi)), torch.tensor(_np.stack(xj)),
+                torch.tensor(t, dtype=torch.float32), torch.tensor(w, dtype=torch.float32))
+
+    head_s = _mlp(n_s).to(dev)
+    opt_s = torch.optim.AdamW(head_s.parameters(), lr=a.lr, weight_decay=1e-4)
+    Ptr = _pairs_matrix(tr)
+    Pva = _pairs_matrix(va) if va else None
+    Xi, Xj, T, W = [x.to(dev) for x in Ptr]
+    n_pairs = T.shape[0]
+
+    def _bt_loss(head, xi, xj, t, w):
+        l = 0.5 * (head(xi) - head(xj)).squeeze(-1)
+        return (w * nn.functional.binary_cross_entropy_with_logits(l, t, reduction="none")).sum() / w.sum()
 
     import time as _time
-    for ep in range(a.epochs):
-        _ep0 = _time.perf_counter()
-        trunk.train(); head_s.train(); head_t.train()
-        tr_s, tr_t, tl = _run(tr, train=True)
-        _sps = len(tr) / max(1e-9, _time.perf_counter() - _ep0)
-        trunk.eval(); head_s.eval(); head_t.eval()
-        with torch.no_grad():
-            va_s, va_t, vl = _run(va, train=False)
-        # [ARB-PERF] スループット実測を成果物に残す (tatara の perf 規律)
-        print("[arbiter-train] ep%d train_loss=%.4f (%.0f samples/s%s) | "
-              "val agree S=%.3f T=%.3f Δ(trunk)=%+.3f"
-              % (ep, tl, _sps, " amp" if _amp else "", va_s, va_t, va_t - va_s), flush=True)
+    _t0 = _time.perf_counter()
+    for ep in range(a.head_epochs):
+        head_s.train()
+        perm = torch.randperm(n_pairs, device=dev)
+        for k in range(0, n_pairs, a.head_batch):
+            idx = perm[k:k + a.head_batch]
+            loss = _bt_loss(head_s, Xi[idx], Xj[idx], T[idx], W[idx])
+            opt_s.zero_grad(); loss.backward(); opt_s.step()
+        if ep % max(1, a.head_epochs // 6) == 0 or ep == a.head_epochs - 1:
+            head_s.eval()
+            with torch.no_grad():
+                tl = float(_bt_loss(head_s, Xi, Xj, T, W))
+                vl = (float(_bt_loss(head_s, *[x.to(dev) for x in Pva])) if Pva is not None else float("nan"))
+            print("[arbiter-train] Tier-S ep%d pairs=%d train_bt=%.4f val_bt=%.4f (%.1fs)"
+                  % (ep, n_pairs, tl, vl, _time.perf_counter() - _t0), flush=True)
+    layers_s = _layers(head_s)
+    arb_s = _arb_from_layers(_np, layers_s, None, sources)
+    for tag, rs in (("train", tr), ("val", va)):
+        if rs:
+            print(_arb_fmt_metrics("arbiter-train Tier-S " + tag, _arb_offline_metrics(arb_s, rs)),
+                  flush=True)
 
-    # ── 出力: arbiter_head.npz (numpy) + checkpoint + arbiter.onnx ──
-    def _dump(head, prefix, npz):
-        i = 0
-        for m in head:
-            if isinstance(m, nn.Linear):
-                npz["%s_W%d" % (prefix, i)] = m.weight.detach().cpu().numpy().T.astype("float32")
-                npz["%s_b%d" % (prefix, i)] = m.bias.detach().cpu().numpy().astype("float32")
-                i += 1
-    npz = {}
-    _dump(head_s, "s", npz); _dump(head_t, "t", npz)
+    # ── Tier-T (base トランクがある時だけ) ──
+    layers_t = None
+    trunk = None
+    if not a.no_trunk:
+        trunk = _sv_build_model(ch=a.ch, blocks=a.blocks, ver=3, in_ch=sv_N_PLANES, arb=True)
+        if not os.path.isfile(a.base):
+            print("[arbiter-train] base trunk 不在 (%s) — Tier-T は学習しない" % a.base)
+            trunk = None
+        else:
+            try:
+                _ck = torch.load(a.base, map_location="cpu", weights_only=False)
+                _sd = (_ck.get("ema") or _ck.get("model") or _ck) if isinstance(_ck, dict) else _ck
+                trunk.load_state_dict(_sd, strict=False)   # sharp_head は新規 = strict False
+                print("[arbiter-train] base trunk loaded: %s" % a.base)
+            except Exception as e:
+                print("[arbiter-train] base load 失敗 — Tier-T は学習しない: %r" % e)
+                trunk = None
+    if trunk is not None:
+        trunk = trunk.to(dev)
+        head_t = _mlp(n_s + 4).to(dev)
+        _pgroups = [{"params": trunk.parameters(), "lr": a.lr / 10.0},
+                    {"params": list(head_t.parameters()), "lr": a.lr}]
+        try:   # [ARB-PERF] fused AdamW (CUDA カーネル融合。非対応 torch は通常版へ)
+            opt = torch.optim.AdamW(_pgroups, weight_decay=1e-4, fused=_amp)
+        except (TypeError, RuntimeError):
+            opt = torch.optim.AdamW(_pgroups, weight_decay=1e-4)
+
+        def _trunk_qpi(sample):
+            """トランク (平面直結) で s1v (微分可能・L_val 用)、q/π (detach・head_t 特徴)、
+            root policy logits (L_pol 用)。PV 末端は _arb_boards_for_sample (実行時と同一)。"""
+            bl = _arb_boards_for_sample(sample, a.pv_cap)
+            if bl is None:
+                return None
+            root, per = bl
+            boards = [root] + [x[1] for x in per] + [x[2] for x in per if x[2] is not None]
+            planes = torch.tensor(sv_encode_planes(
+                [b.cells for b in boards], [b.hand[0] + b.hand[1] for b in boards],
+                [b.side for b in boards]), device=dev)
+            with torch.autocast("cuda", dtype=torch.float16, enabled=_amp):
+                f = trunk.body(trunk.stem(planes))
+                val = trunk.value_head(trunk.value_conv(f).flatten(1)).squeeze(1)
+                mv = trunk.move_head(f).flatten(2).permute(0, 2, 1).reshape(planes.shape[0], -1)
+                dr = trunk.drop_head(f).flatten(2).reshape(planes.shape[0], -1)
+                pol_logits = torch.cat([mv, dr], dim=1)
+            val = val.float(); pol_logits = pol_logits.float()
+            pol = torch.softmax(pol_logits, dim=1)
+            root_side = int(root.side)
+
+            def _our(k):
+                v = torch.sigmoid(val[k])
+                if int(boards[k].side) == 1:
+                    v = 1.0 - v
+                if root_side == 1:
+                    v = 1.0 - v
+                return v
+            idx = 1
+            q, pi, s1v = {}, {}, {}
+            sl_ptr = 1 + len(per)
+            for (ci, b1, bl2, applied) in per:
+                v1 = _our(idx); idx += 1
+                s1v[ci] = v1
+                if bl2 is not None:
+                    vL = _our(sl_ptr); sl_ptr += 1
+                    lam = a.lam * min(1.0, applied / 8.0)
+                    q[ci] = float(((1.0 - lam) * v1 + lam * vL).item())
+                else:
+                    q[ci] = float(v1.item())
+                try:
+                    lab = sv_usi_to_label(sample["cands"][ci]["move"])
+                    pi[ci] = float(pol[0, lab].item()) if 0 <= lab < pol.shape[1] else 0.0
+                except Exception:
+                    pi[ci] = 0.0
+            return q, pi, s1v, pol_logits
+
+        def _run_t(rows_, train=True):
+            loss_sum, tot = 0.0, 0
+            qpi_all = []
+            if train:
+                opt.zero_grad()
+            for _si, r in enumerate(rows_):
+                shared, cands = _arb_shared_and_cands(r)
+                cs = [SvArbiter._cand_scalars(c) for c in cands]
+                qp = _trunk_qpi(r)
+                if qp is None:
+                    qpi_all.append(({}, {}))
+                    continue
+                q, pi, s1v, pol_logits = qp
+                qpi_all.append((q, pi))
+                L = torch.tensor(0.0, device=dev)
+                tg = _arb_pair_targets(r, a.target_sharpness)
+                for (i, j, tij, wij) in tg:
+                    fi = torch.tensor(_arb_pair_np(_np, shared, cs, i, j, q, pi, True), device=dev)
+                    fj = torch.tensor(_arb_pair_np(_np, shared, cs, j, i, q, pi, True), device=dev)
+                    lt = 0.5 * (head_t(fi) - head_t(fj)).squeeze(-1)
+                    L = L + wij * nn.functional.binary_cross_entropy_with_logits(
+                        lt, torch.tensor(tij, device=dev)) / max(1, len(tg))
+                wr = _arb_consensus_wr(r)
+                for ci, v in enumerate(wr):
+                    if v is not None and ci in s1v:
+                        L = L + 0.5 * (s1v[ci] - float(v)) ** 2
+                if all(v is not None for v in wr) and wr:
+                    try:
+                        best = max(range(len(wr)), key=lambda k: wr[k])
+                        lab = sv_usi_to_label(cands[best].move)
+                        L = L + 0.25 * (-torch.log_softmax(pol_logits, dim=1)[0, lab])
+                    except Exception:
+                        pass
+                tot += 1
+                loss_sum += float(L.item())
+                if train:
+                    _scaler.scale(L / _grad_accum).backward()
+                    if tot % _grad_accum == 0:
+                        _scaler.step(opt); _scaler.update(); opt.zero_grad()
+            if train and tot % _grad_accum != 0:
+                _scaler.step(opt); _scaler.update(); opt.zero_grad()
+            return loss_sum / max(1, tot), qpi_all
+
+        for ep in range(a.epochs):
+            _ep0 = _time.perf_counter()
+            trunk.train(); head_t.train()
+            tl, _ = _run_t(tr, train=True)
+            trunk.eval(); head_t.eval()
+            with torch.no_grad():
+                vl, qpi_va = _run_t(va, train=False) if va else (float("nan"), [])
+            layers_t = _layers(head_t)
+            arb_t = _arb_from_layers(_np, layers_s, layers_t, sources, a.lam)
+            msg = ("[arbiter-train] Tier-T ep%d train_loss=%.4f val_loss=%.4f (%.0f samples/s%s)"
+                   % (ep, tl, vl, len(tr) / max(1e-9, _time.perf_counter() - _ep0),
+                      " amp" if _amp else ""))
+            print(msg, flush=True)
+            if va:
+                print(_arb_fmt_metrics("arbiter-train Tier-T val",
+                                       _arb_offline_metrics(arb_t, va, use_trunk=True, qpi=qpi_va)),
+                      flush=True)
+
+    # ── 出力: arbiter_head.npz (numpy, 特徴契約 meta 付き) + checkpoint + arbiter.onnx ──
+    npz = {"meta_feat_ver": _np.asarray(SvArbiter.FEAT_VER),
+           "meta_sources": _np.asarray(",".join(sources)),
+           "meta_lambda": _np.asarray(float(a.lam)),
+           "meta_n_train": _np.asarray(len(tr))}
+    _gps = sorted(float(_arb_shared_and_cands(r)[0][0]) for r in tr)
+    if _gps:
+        npz["meta_gp_lo"] = _np.asarray(_gps[int(0.01 * (len(_gps) - 1))])
+        npz["meta_gp_hi"] = _np.asarray(_gps[int(0.99 * (len(_gps) - 1))])
+    for k, (Wk, bk) in enumerate(layers_s):
+        npz["s_W%d" % k], npz["s_b%d" % k] = Wk, bk
+    for k, (Wk, bk) in enumerate(layers_t or []):
+        npz["t_W%d" % k], npz["t_b%d" % k] = Wk, bk
     _tmp = a.out + "_head.tmp"
     _np.savez(_tmp, **npz)               # savez は拡張子 .npz を付与 → _tmp + ".npz"
     os.replace(_tmp + ".npz", os.path.join(_svonnx_here(), "arbiter_head.npz"))
-    d = {"model": trunk.state_dict(),
-         "arch": {"ch": a.ch, "blocks": a.blocks, "ver": 3, "in_ch": sv_N_PLANES, "arb": True}}
-    torch.save(d, a.out + ".pt.tmp"); os.replace(a.out + ".pt.tmp", a.out + ".pt")
-    try:
-        _svonnx_export_ckpt(a.out + ".pt", out=os.path.join(_svonnx_here(), "arbiter.onnx"),
-                            verify=True, arbiter=True)
-        print("[arbiter-train] arbiter.onnx + arbiter_head.npz 出力完了")
-    except Exception as e:
-        print("[arbiter-train] onnx export 失敗: %r" % e)
+    print("[arbiter-train] arbiter_head.npz 出力 (feat v%d, Tier-T=%s) — τ は arbiter-tau で較正"
+          % (SvArbiter.FEAT_VER, layers_t is not None), flush=True)
+    if trunk is not None:
+        d = {"model": trunk.state_dict(),
+             "arch": {"ch": a.ch, "blocks": a.blocks, "ver": 3, "in_ch": sv_N_PLANES, "arb": True}}
+        torch.save(d, a.out + ".pt.tmp"); os.replace(a.out + ".pt.tmp", a.out + ".pt")
+        try:
+            _svonnx_export_ckpt(a.out + ".pt", out=os.path.join(_svonnx_here(), "arbiter.onnx"),
+                                verify=True, arbiter=True)
+            print("[arbiter-train] arbiter.onnx 出力完了")
+        except Exception as e:
+            print("[arbiter-train] onnx export 失敗: %r" % e)
+
+
+def _arb_load_for_offline(tag):
+    arb = _sv_arbiter_get()
+    if not arb.load():
+        print("[%s] arbiter_head.npz 不在 / 旧特徴契約 — arbiter-train を先に" % tag)
+        return None
+    return arb
 
 
 def sv_arbiter_tau_main(rest):
-    """[SV-ARBITER §3.4] arbiter-tau: 検証集合で regret(τ)=Σw·[誤override]+Σw·[逸失override]
-    を最小化する Override_Tau を選び、τ を stdout + arbiter_tau.json へ出力する。
-    arbiter_head.npz (Tier-S) で候補ペアの P を評価する (トランク不要の高速較正)。"""
+    """[SV-ARBITER §3.4 → COUNCIL-V2] arbiter-tau: 基準 τ を「採用手の平均 WR regret 最小」で
+    選ぶ。判定は実行時と同一 (SvArbiter.rank/decide、勝者 vs NNUE、GP 連動 slope 込み)。
+    結果は arbiter_tau.json に head の sha256 と一緒に書き、実行時 load がそれを読む
+    (旧: json を書くだけで実行時は未使用 / 誤 override 件数の重み付き和で評価)。
+    --data は train に使っていない行 (val) を渡すこと。"""
     import argparse
     ap = argparse.ArgumentParser(prog="arbiter-tau")
     ap.add_argument("--data", default=os.path.join(_BASE_DIR, "arbiter_labeled.jsonl"))
+    ap.add_argument("--val-only", action="store_true",
+                    help="arbiter-train と同じ split の val 行だけ使う")
+    ap.add_argument("--val-frac", type=float, default=0.1)
     a = ap.parse_args(rest)
-    arb = _sv_arbiter_get()
-    if not arb.load():
-        print("[arbiter-tau] arbiter_head.npz 不在 — arbiter-train を先に"); return
-    _np = arb._np
-    rows = [r for r in _arb_iter_jsonl(a.data) if r.get("y") is not None
-            and len(r.get("cands", [])) >= 2]
-    if not rows:
-        print("[arbiter-tau] 教師 0 行"); return
-    # 各 row の (dl勝率 P, dl が正解か, w) を集計 (i=nnue,j=dl と仮定: source で判定)
-    samples = []
-    for r in rows:
-        shared, cands = _arb_shared_and_cands(r)
-        cs = [SvArbiter._cand_scalars(c) for c in cands]
-        # dl 候補 index
-        dl_i = next((k for k, c in enumerate(cands) if c.source == "dl1"), 1)
-        nn_i = next((k for k, c in enumerate(cands) if c.source == "nnue"), 0)
-        lij = 0.5 * (arb._mlp_forward(arb._head_s, arb._pair_vec(shared, cs[dl_i], cs[nn_i], dl_i, nn_i, {}, {}, False))
-                     - arb._mlp_forward(arb._head_s, arb._pair_vec(shared, cs[nn_i], cs[dl_i], nn_i, dl_i, {}, {}, False)))
-        p_dl = 1.0 / (1.0 + _np.exp(-max(-60.0, min(60.0, lij))))
-        samples.append((float(p_dl), int(r["y"] == dl_i), float(r.get("w", 0.1))))
-    best_tau, best_regret = 0.62, 1e18
+    arb = _arb_load_for_offline("arbiter-tau")
+    if arb is None:
+        return
+    rows = [r for r in _arb_iter_jsonl(a.data) if len(r.get("cands", [])) >= 2]
+    if a.val_only:
+        rows = [r for r in rows if _arb_is_val(_arb_group_key(r), a.val_frac)]
+    cfg = EngineConfig.from_cfg(_cfg)
+    best = None
     for t in [x / 100.0 for x in range(40, 96)]:
-        regret = 0.0
-        for p_dl, dl_correct, w in samples:
-            override = p_dl > t
-            if override and not dl_correct:
-                regret += w        # 誤 override
-            elif (not override) and dl_correct:
-                regret += w        # 逸失 override
-        if regret < best_regret:
-            best_regret, best_tau = regret, t
-    print("[arbiter-tau] best Override_Tau=%.2f (regret=%.3f, N=%d)"
-          % (best_tau, best_regret, len(samples)))
+        _save = arb.tau
+        arb.tau = t
+        m = _arb_offline_metrics(arb, rows, cfg=cfg)
+        arb.tau = _save
+        if m["n"] == 0:
+            print("[arbiter-tau] 合意勝率付きの行が 0 — arbiter-label (v3) を先に"); return
+        if best is None or m["regret_arb"] < best[1]["regret_arb"] - 1e-12:
+            best = (t, m)
+    t, m = best
+    print("[arbiter-tau] best Override_Tau=%.2f" % t)
+    print(_arb_fmt_metrics("arbiter-tau", m))
     with open(os.path.join(_svonnx_here(), "arbiter_tau.json"), "w", encoding="utf-8") as w:
-        json.dump({"Arbiter_Override_Tau": best_tau, "regret": best_regret,
-                   "n": len(samples)}, w)
+        json.dump({"Arbiter_Override_Tau": t, "head_sha256": arb.head_sha,
+                   "regret_arb": m["regret_arb"], "regret_nnue": m["regret_nnue"],
+                   "n": m["n"]}, w)
 
 
 def sv_arbiter_eval_main(rest):
-    """[SV-ARBITER §7] arbiter-eval: held-out 不一致集合でのオラクル一致率 / P(DL正解|disputed)
-    / Δ(trunk) をレポート一発出力 (回帰トレンド監視用)。"""
+    """[SV-ARBITER §7 → COUNCIL-V2] arbiter-eval: 実行時と同一判定での WR regret / top1 /
+    ペア正答率を bucket 別に出す (回帰トレンド監視用)。"""
     import argparse
     ap = argparse.ArgumentParser(prog="arbiter-eval")
     ap.add_argument("--data", default=os.path.join(_BASE_DIR, "arbiter_labeled.jsonl"))
     a = ap.parse_args(rest)
-    arb = _sv_arbiter_get()
-    if not arb.load():
-        print("[arbiter-eval] arbiter_head.npz 不在"); return
-    rows = [r for r in _arb_iter_jsonl(a.data) if r.get("y") is not None
-            and len(r.get("cands", [])) >= 2]
-    n = agree = dl_correct_disputed = disputed = 0
-    for r in rows:
-        shared, cands = _arb_shared_and_cands(r)
-        cs = [SvArbiter._cand_scalars(c) for c in cands]
-        y = int(r["y"])
-        lij = 0.5 * (arb._mlp_forward(arb._head_s, arb._pair_vec(shared, cs[0], cs[1], 0, 1, {}, {}, False))
-                     - arb._mlp_forward(arb._head_s, arb._pair_vec(shared, cs[1], cs[0], 1, 0, {}, {}, False)))
-        pred = 0 if lij > 0 else 1
-        agree += int(pred == y); n += 1
-        if r.get("bucket") == "D":
-            disputed += 1
-            dl_i = next((k for k, c in enumerate(cands) if c.source == "dl1"), 1)
-            dl_correct_disputed += int(y == dl_i)
-    print("[arbiter-eval] N=%d  Tier-S一致率=%.3f  disputed=%d  P(DL正解|disputed)=%.3f"
-          % (n, agree / max(1, n), disputed, dl_correct_disputed / max(1, disputed)))
+    arb = _arb_load_for_offline("arbiter-eval")
+    if arb is None:
+        return
+    rows = [r for r in _arb_iter_jsonl(a.data) if len(r.get("cands", [])) >= 2]
+    cfg = EngineConfig.from_cfg(_cfg)
+    print(_arb_fmt_metrics("arbiter-eval all", _arb_offline_metrics(arb, rows, cfg=cfg)))
+    for b in ("G", "D"):
+        rb = [r for r in rows if r.get("bucket") == b]
+        if rb:
+            print(_arb_fmt_metrics("arbiter-eval bucket " + b, _arb_offline_metrics(arb, rb, cfg=cfg)))
 
 
 # ── オフライン・データ生成 (USI エンジン駆動 / kif リプレイ) ─────────────────
@@ -59053,7 +59405,9 @@ class _ArbUsi:
                         sc = -_MATE_CP if val.startswith("-") else _MATE_CP
                     else:
                         continue
-                    ent = (sc, toks[toks.index("pv") + 1:])
+                    ent = (sc, toks[toks.index("pv") + 1:],
+                           int(toks[toks.index("depth") + 1]) if "depth" in toks else None,
+                           int(toks[toks.index("nodes") + 1]) if "nodes" in toks else None)
                     if toks[i + 3] in ("lowerbound", "upperbound"):
                         bound = ent
                     else:
@@ -59062,8 +59416,11 @@ class _ArbUsi:
                     pass
             elif ln.startswith("bestmove"):
                 bm = ln.split()[1]
+                # [COUNCIL-V2] 採用行の depth/nodes を残す (裁定特徴 nnue_depth/nodes・候補 depth)。
+                self.last_depth = self.last_nodes = None
                 for ent in (exact, bound):
                     if ent is not None and ent[1] and ent[1][0] == bm:
+                        self.last_depth, self.last_nodes = ent[2], ent[3]
                         return bm, ent[0], ent[1]
                 return bm, None, []
 
@@ -59098,7 +59455,10 @@ class _ArbUsi:
 
 # [ARB-ORACLE-V2 2026-09-15] synth/label 行の版。v1 (刻印なし) は _ArbUsi の旧パーサで
 # DL 候補の pv/cp と label の DL オラクル値が MultiPV 最下位行に汚染されている → 再生成対象。
-_ARB_ORACLE_VER = 2
+# [COUNCIL-V2 2026-10-17] v3: synth 候補を eff_s 秒の探索で作り gp_state/ply/depth/nodes を記録、
+# label は両オラクル勝率 (wr_nn/wr_dl) と合意勝率を記録。v2 行は gp/ply/depth/nodes 欠損
+# (= 学習時 0 固定・実行時実値) で特徴契約 v2 の学習に使えない → 退避して再生成。
+_ARB_ORACLE_VER = 3
 
 
 def _arb_count_current(path):
@@ -59149,6 +59509,12 @@ def _arb_analyse_pair(nn, dl, pos, nn_ms, dl_ms):
         if isinstance(res.get(tag), Exception):
             raise res[tag]
     return res["nn"], res["dl"]
+
+
+def _arb_cand_rec(move, source, pv, cp, eng):
+    """[COUNCIL-V2] synth 候補 1 件 (探索した engine の depth/nodes 付き)。"""
+    return {"move": move, "source": source, "pv": pv, "cp": cp,
+            "depth": getattr(eng, "last_depth", None), "nodes": getattr(eng, "last_nodes", None)}
 
 
 # [ARB-PAIRS 2026-07-17] ペア多重化時に 1 本の NNUE オラクルへ最低限残すスレッド数。
@@ -59245,7 +59611,7 @@ def _arb_engine_paths():
 def sv_arbiter_synth_main(rest):
     """[SV-ARBITER §3.2②] arbiter-synth: **互角局面集 (txt)** の各局面で NNUE / DL を
     並列短探索し、nnue_top≠dl_top の不一致局面だけ arbiter_samples.jsonl へ追記する。
-    eff_s は代表値グリッドで複製。
+    [COUNCIL-V2] eff_s グリッドの各値で実際に eff 秒探索した候補を記録する。
 
     [2026-07-17 ユーザー裁定] 棋譜再生は廃止 — 局面ソースは互角局面集
     (相対パスの start_sfens_ply32.txt / start_sfens_ply24.txt、両方あれば連結)。
@@ -59257,8 +59623,10 @@ def sv_arbiter_synth_main(rest):
     ap.add_argument("--sfens", default="",
                     help="互角局面集 txt またはそれを含むフォルダ "
                          "(既定: start_sfens_ply32.txt / start_sfens_ply24.txt)")
-    ap.add_argument("--nnue-movetime-ms", type=int, default=500)
-    ap.add_argument("--dl-movetime-ms", type=int, default=500)
+    ap.add_argument("--eff-grid", default="1,3,8",
+                    help="[COUNCIL-V2] 思考窓 eff_s [秒] のグリッド。各 eff で NNUE/DL を eff 秒"
+                         "探索した結果を候補にする (旧: 500ms 探索 1 回を eff 3 値へ複製 = eff は"
+                         "ラベルと無関係なノイズ特徴だった)")
     ap.add_argument("--out", default=_ARBITER_SAMPLES_PATH)
     ap.add_argument("--max-positions", type=int, default=0, help="0=全局面 (固定 seed 抽出)")
     a = ap.parse_args(rest)
@@ -59319,14 +59687,14 @@ def sv_arbiter_synth_main(rest):
     _arb_quarantine_stale(a.out, "arbiter-synth")
     nn = _ArbUsi(nn_exe, options=_nn_opts)
     dl = _ArbUsi(dl_exe, options=_dl_opts)
-    eff_grid = [1.0, 3.0, 8.0]
+    eff_grid = [float(x) for x in str(a.eff_grid).split(",") if x.strip()] or [1.0]
     n_emit = 0
     try:
         import time as _time
         print("[arbiter-synth] 互角局面集 %d 局面 (%s)" % (len(plist), ", ".join(
             os.path.basename(s) for s in srcs)), flush=True)
-        print("[arbiter-synth] oracle: nnue=%s (%d ms) / dl=%s (%d ms)"
-              % (nn_exe, a.nnue_movetime_ms, dl_exe, a.dl_movetime_ms), flush=True)
+        print("[arbiter-synth] candidates: nnue=%s / dl=%s, eff grid %s s"
+              % (nn_exe, dl_exe, eff_grid), flush=True)
         _t0 = _time.perf_counter()
         _beat = _t0
         for pi, pos in enumerate(plist):
@@ -59339,22 +59707,23 @@ def sv_arbiter_synth_main(rest):
                 print(_msg, flush=True)
                 _flog(_msg)
                 _beat = _now
-            try:
-                (nmv, ncp, npv), (dmv, dcp, dpv) = _arb_analyse_pair(
-                    nn, dl, pos, a.nnue_movetime_ms, a.dl_movetime_ms)
-            except Exception as e:
-                _flog("[arbiter-synth] analyse: %r" % e); continue
-            if not nmv or not dmv or nmv == dmv:
-                continue
             # 互角局面集 = 独立局面群 → game key は局面単位 (train の対局 split 退化防止)
             _gid = psrc[pi] + "/" + _pos_hash8(pos)
+            _bs = _arb_scalars_for_position(pos)
             for eff in eff_grid:
+                _ms = max(50, int(eff * 1000))
+                try:
+                    (nmv, ncp, npv), (dmv, dcp, dpv) = _arb_analyse_pair(nn, dl, pos, _ms, _ms)
+                except Exception as e:
+                    _flog("[arbiter-synth] analyse: %r" % e); continue
+                if not nmv or not dmv or nmv == dmv:
+                    continue
                 rec = {"sfen": pos, "pos_hash": _pos_hash8(pos),
                        "game_id": _gid,
-                       "cands": [{"move": nmv, "source": "nnue", "pv": npv, "cp": ncp},
-                                 {"move": dmv, "source": "dl1", "pv": dpv, "cp": dcp}],
-                       "gp": None, "eff_s": eff, "rem_ms": None,
-                       "move_count": None, "ply": None, "oracle_ver": _ARB_ORACLE_VER}
+                       "cands": [_arb_cand_rec(nmv, "nnue", npv, ncp, nn),
+                                 _arb_cand_rec(dmv, "dl1", dpv, dcp, dl)],
+                       "gp_state": _bs["gp_state"], "ply": _bs["ply"], "eff_s": eff,
+                       "oracle_ver": _ARB_ORACLE_VER}
                 _atomic_append(a.out, json.dumps(rec, ensure_ascii=False, default=str) + "\n",
                                lock=_arbiter_sample_lock, fsync=False, os_write=True)
                 n_emit += 1
@@ -59482,6 +59851,8 @@ def sv_arbiter_label_main(rest):
     #    1 サンプル実効 ≈ 60秒 — 予算内で終わるだけ処理する。0 = 無制限 (全量)。
     import time as _time
     _seen = set()
+    _lab_cfg = EngineConfig.from_cfg(_cfg)
+    _lab_cache = {}   # (sfen, move) → (cp_nnue_oracle, cp_dl_oracle)  [COUNCIL-V2]
     for _lr in _arb_iter_jsonl(a.out):
         _lk = (_lr.get("pos_hash"), _lr.get("eff_s"))
         if _lk[0]:
@@ -59557,6 +59928,13 @@ def sv_arbiter_label_main(rest):
             base = _svboard_from_position_cmd(r.get("sfen") or "startpos")
             if base is None:
                 continue
+            _gp = r.get("gp_state")
+            if _gp is None:
+                _gp = _arb_scalars_for_position(r.get("sfen") or "startpos")["gp_state"]
+            # [COUNCIL-V2] cp→WR はオラクルごとの系列 (nnue / dl) の slope で変換する
+            #   (旧: NNUE オラクルの cp にも DL 用 _SR_WR_SLOPE を当てていた)。
+            _sl_n, _a_n = _win_rate_params_for_phase(_gp, "nnue", _lab_cfg)
+            _sl_d, _a_d = _win_rate_params_for_phase(_gp, "dl", _lab_cfg)
             wr_nn, wr_dl = [], []
             for c in cands:
                 try:
@@ -59564,30 +59942,40 @@ def sv_arbiter_label_main(rest):
                 except Exception:
                     wr_nn.append(None); wr_dl.append(None); continue
                 pcmd = "position sfen " + b.to_sfen()
-                try:
-                    (_, cp_n, _), (_, cp_d, _) = _arb_analyse_pair(
-                        nn, dl, pcmd, a.oracle_movetime_ms, a.dl_movetime_ms)
-                except Exception:
-                    cp_n = cp_d = None
+                # [COUNCIL-V2] 同じ (局面, 手) の評価は eff グリッドの別行でも同じ → 1 回だけ探索。
+                _ck = (r.get("sfen"), c["move"])
+                with _w_lock:
+                    _hit = _lab_cache.get(_ck)
+                if _hit is not None:
+                    cp_n, cp_d = _hit
+                else:
+                    try:
+                        (_, cp_n, _), (_, cp_d, _) = _arb_analyse_pair(
+                            nn, dl, pcmd, a.oracle_movetime_ms, a.dl_movetime_ms)
+                    except Exception:
+                        cp_n = cp_d = None
+                    if cp_n is not None or cp_d is not None:
+                        with _w_lock:
+                            _lab_cache[_ck] = (cp_n, cp_d)
                 # s1(c) は相手番 → 我々視点 WR は 1 - wr(相手)
-                wr_nn.append(1.0 - _cp_to_winrate(cp_n, _SR_WR_SLOPE) if cp_n is not None else None)
-                wr_dl.append(1.0 - _cp_to_winrate(cp_d, _SR_WR_SLOPE) if cp_d is not None else None)
+                wr_nn.append(1.0 - _cp_to_winrate(cp_n, _sl_n, a=_a_n) if cp_n is not None else None)
+                wr_dl.append(1.0 - _cp_to_winrate(cp_d, _sl_d, a=_a_d) if cp_d is not None else None)
             # bucket 判定: 両オラクルの勝者一致?
             y_nn, y_dl = _argmax(wr_nn), _argmax(wr_dl)
-            if y_nn is None or y_dl is None:
+            if y_nn is None and y_dl is None:
                 continue
-            if y_nn == y_dl:
-                bucket, y = "G", y_nn
-                # [ARB-ORACLE-V2] `or 0.5` は wr=0.0 (被詰み) を 0.5 に化かしていた — None のみ補完。
-                dwr = abs((0.5 if wr_nn[y] is None else wr_nn[y])
-                          - (0.5 if wr_nn[1 - y] is None else wr_nn[1 - y]))
-                if dwr < 0.02:
-                    continue   # ノイズ破棄
-                wgt = max(0.02, min(0.20, dwr))
-                _inc = "G"
-            else:
-                bucket, y, wgt = "D", y_dl, 0.15; _inc = "D"   # 係争は playout で確定推奨
-            out = dict(r, y=int(y), w=float(wgt), bucket=bucket, wr=wr_nn)
+            _cons = _arb_consensus_wr({"cands": cands, "wr_nn": wr_nn, "wr_dl": wr_dl})
+            y = _argmax(_cons)
+            if y is None:
+                continue
+            # [COUNCIL-V2] 低差行も捨てない (soft target ≈ 0.5 で勾配は小さく、捨てると
+            #   resume で毎回再ラベルされていた)。D = オラクル割れ → 学習重み 0.5。
+            bucket = "G" if (y_nn == y_dl) else "D"
+            _inc = bucket
+            _srt = sorted((v for v in _cons if v is not None), reverse=True)
+            wgt = (_srt[0] - _srt[1]) if len(_srt) >= 2 else 0.0
+            out = dict(r, y=int(y), w=float(wgt), bucket=bucket,
+                       wr=_cons, wr_nn=wr_nn, wr_dl=wr_dl)
             _line = json.dumps(out, ensure_ascii=False, default=str) + "\n"
             with _w_lock:
                 # 書込と件数更新は同一ロック下 (jsonl の行が混ざるのを防ぐ)。
@@ -59686,9 +60074,9 @@ def sv_arbiter_collect_main(rest):
     ap.add_argument("--out", default=os.path.join(_BASE_DIR, "arbiter_dagger.jsonl"))
     ap.add_argument("--top", type=int, default=5000)
     a = ap.parse_args(rest)
-    arb = _sv_arbiter_get()
-    if not arb.load():
-        print("[arbiter-collect] arbiter_head.npz 不在"); return
+    arb = _arb_load_for_offline("arbiter-collect")
+    if arb is None:
+        return
     _np = arb._np
     scored = []
     for r in _arb_iter_jsonl(a.data):
@@ -59696,10 +60084,14 @@ def sv_arbiter_collect_main(rest):
         if len(cands) < 2:
             continue
         shared, cs_cands = _arb_shared_and_cands(r)
+        if any(c.source not in arb.sources for c in cs_cands):
+            continue
         cs = [SvArbiter._cand_scalars(c) for c in cs_cands]
-        lij = 0.5 * (arb._mlp_forward(arb._head_s, arb._pair_vec(shared, cs[0], cs[1], 0, 1, {}, {}, False))
-                     - arb._mlp_forward(arb._head_s, arb._pair_vec(shared, cs[1], cs[0], 1, 0, {}, {}, False)))
-        p = 1.0 / (1.0 + _np.exp(-max(-60.0, min(60.0, lij))))
+        # [COUNCIL-V2] 実行時と同じ順位付け。不確かさ = 勝者 vs NNUE 手の判定確率。
+        score, pw = arb.rank(arb._head_s, shared, cs)
+        base = next((k for k, c in enumerate(cs_cands) if c.source == "nnue"), 0)
+        wi = max(range(len(score)), key=lambda k: score[k])
+        p = pw[wi][base] if wi != base else min(pw[wi][k] for k in range(len(score)) if k != wi)
         ent = -(p * _np.log(p + 1e-9) + (1 - p) * _np.log(1 - p + 1e-9))
         scored.append((float(ent), r))
     scored.sort(key=lambda x: x[0], reverse=True)
