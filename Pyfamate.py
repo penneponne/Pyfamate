@@ -1689,6 +1689,19 @@ def _sr_multipv_lines(policy, ja):
     return out
 
 
+def _sr_move_ja(b, smk, mv):
+    """[DEDUP-20261017] 描画用の手 → 日本語表記 (▲/△ 付き)。旧: _sr_linger_split と別の描画関数に
+    同一の入れ子 _ja があった。
+    [FIX-SR-JA-RENDER-GUARD 2026-07-10] 描画盤そのものに対する帰属チェック: ingestion 側のガードと
+    描画盤 (pos 文字列からの再構築) は別オブジェクトで、すり抜け経路があった ([SR-JA] piece=EMPTY
+    ダンプの根因)。検証盤 ≡ 描画盤の位置で最終防衛し、不一致は生 USI のまま返す。"""
+    if not mv or mv in ("resign", "win"):
+        return mv or "—"
+    if b is not None and not _bestmove_is_for_board(mv, b):
+        return mv
+    return smk + (_sr_usi_to_ja(b, mv) if b is not None else mv)
+
+
 def _sr_linger_split(hold_rec, hold_pos, hold_policy, cur_side=None):
     """[VOICE-LINGER-INLINE 2026-07-09] 残留表示を 2 ブロックへ分離して返す:
       head = DL₁/DL₂ の残留声 + 予想最善手 + 指しやすさ (声の直後に差し込む)
@@ -1709,17 +1722,7 @@ def _sr_linger_split(hold_rec, hold_pos, hold_policy, cur_side=None):
                 and getattr(b, "side", "b") != cur_side)
 
     def _ja(mv):
-        if not mv or mv in ("resign", "win"):
-            return mv or "—"
-        # [FIX-SR-JA-RENDER-GUARD 2026-07-10] 描画盤そのものに対する帰属
-        # チェック。ingestion 側のガード (_board/_board_pre 基準) と描画盤
-        # (pos 文字列からの再構築) は別オブジェクトで、タグ一致バイパスや
-        # rec voice 手などすり抜け経路があった ([SR-JA] piece=EMPTY ダンプの
-        # 根因, 2026-07-10 監査)。検証盤 ≡ 描画盤の位置で最終防衛する。
-        # 不一致は生 USI のまま返す (PV 側の切り詰めセンチネルと同じ規約)。
-        if b is not None and not _bestmove_is_for_board(mv, b):
-            return mv
-        return _smk + (_sr_usi_to_ja(b, mv) if b is not None else mv)
+        return _sr_move_ja(b, _smk, mv)
 
     _rec = hold_rec if isinstance(hold_rec, dict) else {}
     head = []
@@ -1767,15 +1770,7 @@ def _sr_render_think(rec, pos, policy=None, pv=None, clock=None,
 
     _smk = ("▲" if getattr(b, "side", "b") == "b" else "△") if b is not None else ""
     def _ja(mv):
-        if not mv or mv in ("resign", "win"):
-            return mv or "—"
-        # [FIX-SR-JA-RENDER-GUARD 2026-07-10] 描画盤そのものに対する帰属
-        # チェック (詳細は _sr_linger_split 側の同タグコメント参照)。voices /
-        # MultiPV / pred 行の全経路をここ 1 箇所で最終防衛し、[SR-JA]
-        # piece=EMPTY ダンプ (17:19:42 / 17:21:38 実測) を抑止する。
-        if b is not None and not _bestmove_is_for_board(mv, b):
-            return mv
-        return _smk + (_sr_usi_to_ja(b, mv) if b is not None else mv)
+        return _sr_move_ja(b, _smk, mv)
 
     def _fmt_wr(v):
         return ("%3.0f%%" % (v * 100)) if isinstance(v, (int, float)) else ""
@@ -17138,6 +17133,37 @@ def _parse_usi_line(ln: str) -> UsiLine:
     return o
 
 
+class _DlInfoAcc:
+    """[DEDUP-20261017] DL 子の info 行 → (手→最終スコア, 手→最深 PV, 手→最深 depth,
+    手→[(depth, score)]) の集計。_run_dl_1_search と _harvest_one_dl_ponder が同じ
+    ループを別々に持っていた (片方だけ直すと発散する)。スコアは cp、mate は ±_MATE_CP。"""
+
+    __slots__ = ("moves_scores", "pv_lines", "depth_best", "score_hist")
+
+    def __init__(self):
+        self.moves_scores, self.pv_lines, self.depth_best, self.score_hist = {}, {}, {}, {}
+
+    def add(self, line, extended=True):
+        """1 行を取り込む。PV の無い行は無視。戻り値 = root move | None。"""
+        if line.pv is None:
+            return None
+        _pv_toks = line.pv.split()
+        if not _pv_toks:
+            return None
+        score = line.score_cp if line.score_cp is not None else 0
+        if line.mate is not None:
+            score = _mate_sign_score(line.mate)
+        root_move = _pv_toks[0]
+        self.moves_scores[root_move] = score
+        if extended:
+            depth = line.depth if line.depth is not None else 0
+            self.score_hist.setdefault(root_move, []).append((depth, score))
+            if depth > self.depth_best.get(root_move, -1):
+                self.depth_best[root_move] = depth
+                self.pv_lines[root_move] = _pv_toks
+        return root_move
+
+
 def _drain_until_outstanding(eng, allowed, timeout_s, label, send_stop=True):
     """[AUDIT-20261017] 未回収 bestmove の残骸を読み捨て、未応答 go を allowed 個以下にする。
 
@@ -17232,10 +17258,9 @@ def _run_dl_1_search(dl_1, position_cmd, n, nodes, timeout,
     nodes = _dyn_dl_nodes(int(nodes))
     dl_1.send(f"go nodes {nodes}")
 
-    moves_scores  = {}
-    pv_lines      = {}
-    depth_best    = {}
-    score_hist    = {}
+    _acc = _DlInfoAcc()
+    moves_scores, pv_lines = _acc.moves_scores, _acc.pv_lines
+    depth_best, score_hist = _acc.depth_best, _acc.score_hist
     mate_detected = False
     _got_bestmove = False
     _early_stop_sent = False   # one-shot early-stop send flag
@@ -17289,30 +17314,8 @@ def _run_dl_1_search(dl_1, position_cmd, n, nodes, timeout,
                         _flog(f"[ignored] {__file__}:3261: {_fe}")
 
         # [WO-5f] UsiLine.pv は info 行の pv フィールド (multipv 有無不問)。
-        if line.pv is None:
+        if _acc.add(line, collect_extended) is None:
             continue
-
-        # Score (cp takes precedence; mate score overrides if also present)
-        score = line.score_cp if line.score_cp is not None else 0
-        if _mate_n is not None:
-            score = _mate_sign_score(_mate_n)
-
-        # Root move — first PV token
-        _pv_toks = line.pv.split()
-        if not _pv_toks:
-            continue
-        root_move = _pv_toks[0]
-        if collect_extended:
-            pv_moves = _pv_toks
-
-        moves_scores[root_move] = score
-
-        if collect_extended:
-            depth = line.depth if line.depth is not None else 0
-            score_hist.setdefault(root_move, []).append((depth, score))
-            if depth > depth_best.get(root_move, -1):
-                depth_best[root_move] = depth
-                pv_lines[root_move]   = pv_moves
         # [MULTIPV-LIVE-STREAM] 途中経過の policy スナップショットを throttle して流す。
         if live_policy_cb is not None:
             _now_lp = time.perf_counter()
@@ -22100,28 +22103,6 @@ def _opponent_id_set_pending(ctx, position_cmd, final_move, nnue_pred, dl_pred):
           f"dl予測={dl_pred} (不一致サンプル候補)")
 
 
-# [撤去 2026-07-14] _CouncilDisagreement / _CouncilBoostResult / _council_apply_boost
-# (①②③④ 乗算 eff_s ブースト一式、約320行) を削除。boost は NEXT-5 で母関数 TA へ
-# 回帰済み (_u_ta_disagree_nudge → _time_dyn.ta_disagree_nudge →
-# _compute_go_time_dynamics)。統合後は呼出 0 の死蔵コードで、docstring だけが
-# 生きる M5 型の罠 (信じて呼ぶと二重ブースト) だったため撤去した。
-# 関連 cfg キー (disagree_* / score_stability_* / game_phase_surge_eff_s_boost)
-# は互換のため残置 — 読者は _u_ta_disagree_nudge と TA 系のみ。
-
-
-# ==================================================================
-# [PHASE2-REMOVAL §1A] ARB (ARB0=温 nnue_1 / ARB1=別 nnue_2 の searchmoves 自己裁定)
-#   + PREARB (ponder 先回り裁定) は機構ごと撤去。裁定は SV-Arbiter (judge) が担う。
-# ==================================================================
-
-
-
-@functools.lru_cache(maxsize=4)
-def _tracking_board_for(position_cmd: str) -> "ShogiBoard":
-    """position_cmd の history-tracking 盤面 (千日手/連続王手用) を構築してキャッシュ。
-    現局面 + mate-PV 等の look-ahead 局面を lru_cache(4) で同時保持し thrash を防ぐ。
-    返り値は read-only として共有 (consumer は clone 済)。"""
-    return ShogiBoard(sfen=position_cmd)      # track_history=True (既定)
 
 
 def _get_tracking_board(ctx):
@@ -30137,10 +30118,8 @@ def _harvest_one_dl_ponder(eng, n, timeout_s, label, *, cfg=None):
     if cfg is None:
         cfg = EngineConfig.from_cfg(_cfg)
 
-    moves_scores  = {}
-    pv_lines      = {}
-    depth_best    = {}
-    score_hist    = {}
+    _acc = _DlInfoAcc()
+    moves_scores, depth_best, score_hist = _acc.moves_scores, _acc.depth_best, _acc.score_hist
     mate_detected = False
     _got_bestmove = False
     # [AUDIT-20261017] 読むべきは最新の go ponder の bestmove 1 個だけ。それより前の
@@ -30161,22 +30140,7 @@ def _harvest_one_dl_ponder(eng, n, timeout_s, label, *, cfg=None):
         if _mate_n is not None and _mate_n > 0:
             mate_detected = True
         # [WO-5f] UsiLine.pv は info 行の pv フィールド (multipv 有無不問)。
-        if line.pv is None:
-            continue
-        score = line.score_cp if line.score_cp is not None else 0
-        if _mate_n is not None:
-            score = _mate_sign_score(_mate_n)
-        _pv_toks = line.pv.split()
-        if not _pv_toks:
-            continue
-        root_move = _pv_toks[0]
-        pv_moves  = _pv_toks
-        moves_scores[root_move] = score
-        depth = line.depth if line.depth is not None else 0
-        score_hist.setdefault(root_move, []).append((depth, score))
-        if depth > depth_best.get(root_move, -1):
-            depth_best[root_move] = depth
-            pv_lines[root_move]   = pv_moves
+        _acc.add(line)
 
     if not _got_bestmove:
         _flog(f"[DL-HARVEST/{label}] bestmove 未着 ({timeout_s:.2f}s) — 収穫断念 "
@@ -51473,59 +51437,9 @@ def _makebook_review_loss(eng, base, history, loseturn, budget_ms=1000,
 
 
 def _makebook_load_seed_jsonl(path):
-    """[施策4] シード JSONL (優先キュー持ち越しファイル) を読む。
-
-    各行は {"sfen": book キー, "ply", "verdict", "loss_cp", "move",
-    "alt_move", "side", "ts"}。壊れた行・
-    sfen 欠落行は読み飛ばす (対局プロセスと書き込みが競合しても育成を
-    止めない寛容パース)。ファイル無し/読めない場合は []。優先度キューへの
-    投入と .consumed 退避は makebook 側の呼出元で行う。
-
-    [B8-OFFSET] Windows では対局プロセスが append でファイルを開いている
-    瞬間に os.replace (退避) が PermissionError で失敗しうる。失敗時に
-    シードが残留すると次回起動で同じ行が再投入され、「常習局面ほど掘られる」
-    の枠を超えた無制限の重複インフレになる。対策: 消費済みバイト位置を
-    <path>.offset サイドカーへ記録し、ロード時にそこまで seek して飛ばす。
-    退避成功時はサイドカーごと削除 (呼出元)。退避中の append (offset 以降の
-    行) は次回ロードで正しく拾われる。
-
-    Returns: (records, consumed_offset) — consumed_offset は退避失敗時に
-    呼出元がサイドカーへ書く「今回読み終えたバイト位置」。
-    """
-    records = []
-    _start = 0
-    try:
-        with open(path + ".offset", encoding="utf-8") as _of:
-            _start = max(0, int(_of.read().strip() or 0))
-    except (OSError, ValueError):
-        _start = 0
-    _end = _start
-    try:
-        with open(path, encoding="utf-8") as f:
-            try:
-                _size = os.fstat(f.fileno()).st_size
-            except OSError:
-                _size = None
-            if _size is not None and _start > _size:
-                # ファイルが作り直された (退避成功後の新規 append 等)。
-                # stale offset で全行を飛ばさないよう先頭へ戻す。
-                _start = 0
-            if _start:
-                f.seek(_start)
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    d = json.loads(line)
-                except ValueError:
-                    continue
-                if isinstance(d, dict) and d.get("sfen"):
-                    records.append(d)
-            _end = f.tell()
-    except OSError:
-        return [], _start
-    return records, _end
+    """[施策4] シード JSONL (優先キュー持ち越しファイル) を読む。[DEDUP-20261017] 書式・寛容パースは
+    _makebook_load_blunder_seeds と同一 (本体が完全一致の重複だった) — そちらへ委譲。"""
+    return _makebook_load_blunder_seeds(path)
 
 
 # ====================================================================
@@ -51615,6 +51529,22 @@ def _mb_perpetual_checker(tempkif):
     except Exception as _e:
         _flog(f"[makebook] perpetual check test failed: {_e!r}")
     return None
+
+
+def _mb_parse_num(raw, default, *, to_int=True, lo=None, hi=None, scale=1.0):
+    """[DEDUP-20261017] makebook 設定値の数値化 (try/int(float())/clamp)。旧: 両 CLI に同一の
+    入れ子関数 _mb_setting_num が 1 つずつあった。"""
+    try:
+        v = float(str(raw).strip()) * scale
+    except (ValueError, TypeError):
+        v = float(default) * scale
+    if to_int:
+        v = int(v)
+    if lo is not None:
+        v = max(lo, v)
+    if hi is not None:
+        v = min(hi, v)
+    return v
 
 
 def _makebook_cli(extra_args: list) -> None:
@@ -51736,21 +51666,9 @@ def _makebook_cli(extra_args: list) -> None:
             # 対話入力中に EOF (パイプ閉鎖等) → 既定値で継続 (無人運転へ degrade)。
             return default
 
-    def _mb_setting_num(key, prompt, default, *, to_int=True,
-                        lo=None, hi=None, scale=1.0):
-        """_mb_setting の数値版。try/int(float())/except を集約。"""
-        raw = _mb_setting(key, prompt, str(default)).strip()
-        try:
-            v = float(raw) * scale
-        except (ValueError, TypeError):
-            v = float(default) * scale
-        if to_int:
-            v = int(v)
-        if lo is not None:
-            v = max(lo, v)
-        if hi is not None:
-            v = min(hi, v)
-        return v
+    def _mb_setting_num(key, prompt, default, **kw):
+        """_mb_setting の数値版 (本体は両 makebook CLI 共通の _mb_parse_num)。"""
+        return _mb_parse_num(_mb_setting(key, prompt, str(default)), default, **kw)
 
     # ---- 省略オーバーレイのノブは優雅に拒否 (原本 Default-OFF 群) ----
     for _rk, _rwhy in _MB_REJECTED_KNOBS.items():
@@ -52849,21 +52767,9 @@ def _makebook_cli_overlay(extra_args: list) -> None:
             # 対話入力中に EOF (パイプ閉鎖等) → 既定値で継続 (無人運転へ degrade)。
             return default
 
-    def _mb_setting_num(key, prompt, default, *, to_int=True,
-                        lo=None, hi=None, scale=1.0):
-        """_mb_setting の数値版。try/int(float())/except を集約。"""
-        raw = _mb_setting(key, prompt, str(default)).strip()
-        try:
-            v = float(raw) * scale
-        except (ValueError, TypeError):
-            v = float(default) * scale
-        if to_int:
-            v = int(v)
-        if lo is not None:
-            v = max(lo, v)
-        if hi is not None:
-            v = min(hi, v)
-        return v
+    def _mb_setting_num(key, prompt, default, **kw):
+        """_mb_setting の数値版 (本体は両 makebook CLI 共通の _mb_parse_num)。"""
+        return _mb_parse_num(_mb_setting(key, prompt, str(default)), default, **kw)
 
     # ---- 各種設定を解決 (CLI/環境変数/対話/既定) ----
 
